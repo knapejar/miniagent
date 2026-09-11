@@ -1,0 +1,1 @@
+Vytvor slozku notes a v ni 3 soubory a.md, b.md, c.md, kazdy s jednim radkem textu. Pak napis merge.py, ktery je slouci do all.md v poradi podle jmena, kazdy oddeleny radkem "---". Spust ho a vypis obsah all.md.

@@ -1,0 +1,1 @@
+Vytvor slozku proj. V ni vytvor data.csv se sloupci name,score a peti radky dat. Pak napis stats.py, ktery precte data.csv, spocita prumer sloupce score a vypise ho zaokrouhleny na 2 desetinna mista ve formatu "prumer: X.XX". Spust ho a rekni mi vysledek.

@@ -1,0 +1,10 @@
+[
+  {
+    "when": "^usage:|invalid (option|choice)|unknown option",
+    "say": "That flag was rejected. Run the command with --help and read the real options instead of guessing another one."
+  },
+  {
+    "when": "unknown tool '",
+    "say": "Use one of the listed tools. Everything else goes through sh."
+  }
+]

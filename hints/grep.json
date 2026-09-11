@@ -1,0 +1,10 @@
+[
+  {
+    "when": "no matches \\(\\d+ files searched\\)",
+    "say": "Nothing matched. Widen the pattern or drop the glob - the default searches the whole working directory."
+  },
+  {
+    "when": "error: bad regular expression",
+    "say": "That is not valid regex. Escape the special characters, or search for a plain substring."
+  }
+]

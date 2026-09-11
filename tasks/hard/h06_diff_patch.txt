@@ -1,0 +1,44 @@
+GOAL: implement diff and patch from scratch and prove they round trip.
+
+Create mydiff.py. You MUST NOT import difflib.
+
+Implement:
+1. lcs(a, b) -> longest common subsequence of two lists of lines
+2. diff(a, b) -> list of hunks, each (start_a, len_a, start_b, len_b, lines) where
+   lines are prefixed with ' ', '-' or '+'
+3. to_unified(a, b, context=3) -> unified diff text with @@ -x,y +u,v @@ headers
+4. apply_patch(text, patch) -> patched text. A hunk whose context does not match
+   raises PatchError(Exception).
+
+Create test_mydiff.py with AT LEAST 35 asserts covering:
+- lcs on: identical lists, disjoint lists, one empty, a real case where the answer
+  is known by hand
+- diff of: insert only, delete only, replace in the middle, change at the very
+  first line, change at the very last line, no change at all (empty diff)
+- unified format: correct @@ header numbers for at least 3 cases, correct context
+  size when hunks are close together and when they are far apart
+- round trip: for 20 generated pairs (use random with seed 12345, lists of 30
+  lines built from a small alphabet), assert apply_patch(a, to_unified(a,b)) == b
+- PatchError raised when the patch is applied to the wrong original text
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_mydiff.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_mydiff.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

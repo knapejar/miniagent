@@ -1,0 +1,1 @@
+Napis v JavaScriptu soubor rev.js, ktery vezme prvni argument z prikazove radky a vypise ho pozpatku. Spust ho pres node s argumentem "Sparkx2.5" a rekni mi presny vystup.

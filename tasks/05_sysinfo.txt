@@ -1,0 +1,1 @@
+Zjisti a strucne mi shrn: verzi Windows, nazev CPU, kolik ma stroj RAM v GB a jakou verzi ma nainstalovany python a node. Pouzij k tomu prikazovou radku.

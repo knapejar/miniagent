@@ -1,0 +1,1 @@
+V souboru broken.py je chyba. Vytvor ho s timto obsahem (presne):\n\ndef avg(xs):\n    return sum(xs) / len(x)\n\nprint(avg([1, 2, 3, 4]))\n\nPak ho spust, precti chybovou hlasku, oprav ji pomoci nastroje edit a spust znovu, dokud nevypise spravny vysledek. Rekni mi, co bylo spatne a jaky je vysledek.

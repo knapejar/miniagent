@@ -1,0 +1,62 @@
+[
+  {
+    "when": "remote: Repository not found|Could not resolve to a Repository",
+    "say": "That repository does not exist on the remote yet. Create it and push in one step: gh repo create NAME --private --source . --push"
+  },
+  {
+    "when": "accepts 0 arg\\(s\\), received 1[\\s\\S]*auth switch|auth switch[\\s\\S]*accepts 0 arg",
+    "say": "gh auth switch takes flags, not a name: gh auth switch --hostname github.com --user NAME. Check gh auth status first to see which accounts exist."
+  },
+  {
+    "when": "GH013|push protection|secret scanning|Repository rule violations",
+    "say": "The push was refused because a secret was found in a commit. Do not force it through - remove the file from history or add it to .gitignore and commit again."
+  },
+  {
+    "when": "unknown flag: --\\w+|unknown command \\\"[^\\\"]+\\\" for",
+    "say": "That flag or subcommand does not exist in this version. Run the command with --help and use what it actually lists instead of trying another guess."
+  },
+  {
+    "when": "'grep' is not recognized",
+    "say": "grep is not a Windows command. You have a grep TOOL for searching file contents - use it. In sh, the equivalent is findstr."
+  },
+  {
+    "when": "'(ls|cat|rm|mv|touch|which|head|tail|sed|awk)' is not recognized",
+    "say": "That is a Unix command and this is cmd.exe. Windows equivalents: dir, type, del, move, where, findstr. Or run it through powershell."
+  },
+  {
+    "when": "FINDSTR: Bad command line",
+    "say": "findstr does not understand that pattern. It takes plain strings, not grep syntax: findstr \"word\" file. Use the grep tool for regular expressions."
+  },
+  {
+    "when": "failed to parse jq expression",
+    "say": "cmd.exe does not treat ' as a quote, so the jq expression arrived broken. Use double quotes, or drop --jq and read the raw JSON."
+  },
+  {
+    "when": "error: remote \\w+ already exists",
+    "say": "Use git remote set-url origin URL to change it, instead of adding it again."
+  },
+  {
+    "when": "fatal: not a git repository",
+    "say": "This directory is not a git repository. git init first, or cd to the right one."
+  },
+  {
+    "when": "Authentication failed for|could not read Username",
+    "say": "Git has no usable credentials. Run gh auth status to see the accounts, gh auth switch --hostname github.com --user NAME to pick one, then gh auth setup-git so git uses it."
+  },
+  {
+    "when": "'\\w[\\w.-]*' is not recognized as an internal or external command",
+    "say": "That program is not on PATH. Check with: where NAME. If you meant to run text or a sentence, that is not a shell command."
+  },
+  {
+    "when": "is not recognized as the name of a cmdlet",
+    "say": "That is not a PowerShell cmdlet either. Verify the name with Get-Command before calling it again."
+  },
+  {
+    "when": "The system cannot find the path specified",
+    "say": "The path does not exist. List the parent with dir /b before using it."
+  },
+  {
+    "when": "Access is denied",
+    "say": "Denied by the OS. A file may be in use or the action needs an elevated shell - it will not succeed by retrying."
+  }
+]

@@ -1,0 +1,47 @@
+GOAL: implement an expression interpreter and make a test suite pass.
+
+Create calc.py. You MUST NOT use eval, exec or compile anywhere.
+
+Implement:
+1. tokenize(src) -> list of tokens (numbers, names, operators, parentheses, commas)
+2. evaluate(src, env=None) -> number. Support:
+   - + - * / % and ^ (right associative), unary minus, parentheses
+   - correct precedence: ^ > unary- > * / % > + -
+   - integer and float literals; integer division stays exact for ints (7/2 == 3.5)
+   - variables from env, and assignment "x = expr" which stores into env and
+     returns the value
+   - functions min, max, abs, sqrt, pow with 1 or 2 args
+   - multiple statements separated by ';', returns the value of the last one
+3. Errors raise CalcError(Exception): division by zero, unknown variable,
+   unknown function, wrong arg count, unbalanced parentheses, trailing garbage.
+
+Create test_calc.py with AT LEAST 50 asserts covering:
+- precedence: 2+3*4 == 14, (2+3)*4 == 20, 2^3^2 == 512, -2^2 == -4, 10-2-3 == 5
+- unary minus: -5+3 == -2, --5 == 5, 3*-2 == -6
+- modulo and division: 7%3 == 1, 7/2 == 3.5, 2^0.5 close to 1.41421
+- variables: "x = 5; x*2" == 10, env passed in, assignment returns value
+- functions: min(3,1) == 1, max(2,9) == 9, abs(-4) == 4, sqrt(16) == 4, pow(2,10) == 1024
+- nesting: min(2+3, max(1, 2)*4) == 4
+- every error case above with try/except
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_calc.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_calc.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

@@ -1,0 +1,46 @@
+GOAL: implement a JSON parser and serializer from scratch, with a passing test suite.
+
+Create myjson.py. You MUST NOT import the json module anywhere.
+
+Implement:
+1. loads(s) -> Python object. Support: null/true/false, integers, floats
+   (including 1e5, -2.5E-3, 0.0), strings with escapes \" \\ \/ \n \t \r \b \f
+   and \uXXXX, arrays, objects, arbitrary nesting, and whitespace anywhere between
+   tokens.
+2. dumps(obj) -> str. Compact output, no spaces. Keys in insertion order. Escape
+   control characters, quotes and backslashes correctly.
+3. On malformed input raise JsonError(ValueError) with a message containing the
+   0-based index of the offending character.
+
+Create test_myjson.py with AT LEAST 60 asserts covering:
+- scalars: null, true, false, 0, -0, 42, -7, 3.14, 1e3, -2.5E-3
+- strings: empty, spaces, all escapes above, \u0041 -> A, unicode text
+- arrays: [], [1], [1,2,3], nested [[1,[2,[3]]]], mixed types
+- objects: {}, one key, several keys, nested objects, object inside array
+- whitespace: newlines/tabs/spaces around every token
+- round trip: loads(dumps(x)) == x for at least 10 different values
+- errors: use try/except to assert JsonError is raised for '{', '[1,', '{"a"}',
+  'tru', '"unterminated', '01', '{"a":}' - and that the reported index is correct
+  for at least 3 of them
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_myjson.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_myjson.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

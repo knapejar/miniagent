@@ -1,0 +1,51 @@
+GOAL: implement a dependency aware task scheduler and make a test suite pass.
+
+Create scheduler.py.
+
+Implement:
+1. add(name, deps=(), duration=1, priority=0) building a task graph.
+   Adding a duplicate name or depending on an unknown task raises SchedError.
+2. topo() -> a valid topological order. Ties broken by higher priority first,
+   then by name, so the result is deterministic.
+3. cycle() -> None or the list of task names forming one cycle.
+   topo() on a cyclic graph raises SchedError.
+4. waves() -> list of lists, each wave containing the tasks that can run in
+   parallel once the previous waves are done.
+5. critical_path() -> (total_duration, [names]) using the durations.
+6. run(workers=N) -> list of (time, name) start events, simulating N parallel
+   workers that always start the highest priority runnable task first, and a
+   total makespan. No task starts before all of its dependencies have finished.
+
+Create test_scheduler.py with AT LEAST 35 asserts covering:
+- a linear chain of 5, a diamond, a wide fan out of 8, and a 12 task mixed graph
+- topo() determinism: the same graph built in a different insertion order gives
+  the same result
+- priority and name tie breaking
+- cycles: a 2 cycle, a 3 cycle, and a cycle reachable only through 4 hops
+- waves() sizes and membership for the diamond and the 12 task graph
+- critical_path on a graph where the longest path is not the one with most tasks
+- run() with 1, 2 and 4 workers: makespan values, and an assert that for every
+  started task all of its dependencies finished earlier
+- every SchedError case above
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_scheduler.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_scheduler.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

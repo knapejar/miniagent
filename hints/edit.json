@@ -1,0 +1,10 @@
+[
+  {
+    "when": "'old' not found in file",
+    "say": "The text you tried to replace is not in the file, character for character. Read the exact lines first and copy them, including indentation."
+  },
+  {
+    "when": "'old' and 'new' are identical",
+    "say": "Both sides of the edit are the same, so there is nothing to change. Decide what the new text should be."
+  }
+]

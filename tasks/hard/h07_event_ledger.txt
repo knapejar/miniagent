@@ -1,0 +1,48 @@
+GOAL: implement an event-sourced ledger with invariants and make a test suite pass.
+
+Create ledger.py.
+
+Implement:
+1. Events as plain dicts: {"type": "open", "acc": "A", "t": 1},
+   {"type":"deposit","acc":"A","amount":100,"t":2},
+   {"type":"withdraw",...}, {"type":"transfer","frm":"A","to":"B","amount":50,"t":4}
+2. class Ledger with apply(event), balance(acc, at=None), history(acc),
+   total() and accounts().
+3. Rules, each raising LedgerError(Exception): unknown account, opening an account
+   twice, non-positive amount, withdrawal or transfer that would make a balance
+   negative, an event whose t is not strictly greater than the previous event.
+4. replay(events) -> Ledger, and snapshot()/restore(snap) such that a Ledger
+   restored from a snapshot answers every query identically.
+5. balance(acc, at=T) returns the balance as of time T, ignoring later events.
+
+Create test_ledger.py with AT LEAST 40 asserts covering:
+- opening, deposits, withdrawals, transfers, and balances after each
+- total() invariant: the sum of all balances equals total deposits minus total
+  withdrawals, checked after every step of a 20 event scenario
+- historical queries: balance at 5 different past times on a 20 event history
+- history(acc) returning only the events touching that account, in order
+- every error rule above, using try/except
+- replay of a 20 event list equals the incrementally built ledger
+- snapshot -> restore -> all queries identical, including after more events
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_ledger.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_ledger.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

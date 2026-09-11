@@ -1,0 +1,18 @@
+[
+  {
+    "when": "fetch failed.*404|HTTP Error 404",
+    "say": "That address does not exist. Get real URLs from websearch, or from browse with mode=links on a page you already have."
+  },
+  {
+    "when": "fetch failed.*(403|401)",
+    "say": "The site refuses automated access. Try another source for the same fact rather than the same page again."
+  },
+  {
+    "when": "\\(page has no text\\)",
+    "say": "This page carries no readable text. Try mode=links, or a different page."
+  },
+  {
+    "when": "\\[part \\d+/([2-9]|\\d\\d+)\\]",
+    "say": "There are more parts. Read on with part=N, or narrow it with find=REGEX."
+  }
+]

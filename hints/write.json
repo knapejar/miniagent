@@ -1,0 +1,10 @@
+[
+  {
+    "when": "SYNTAX ERROR",
+    "say": "The file you just wrote does not parse. Fix it now - every later step builds on a broken file."
+  },
+  {
+    "when": "refusing to overwrite",
+    "say": "Writing empty content over a file that has content is almost always an accident, often a reply that got cut off. Send the full content."
+  }
+]

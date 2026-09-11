@@ -1,0 +1,10 @@
+[
+  {
+    "when": "Invalid argument.*https?://|No such file.*https?://",
+    "say": "read opens local files. For a web address use browse."
+  },
+  {
+    "when": "error: \\[Errno 2\\]|No such file or directory",
+    "say": "That file does not exist. Confirm the name with dir /b or the grep tool before reading it again."
+  }
+]

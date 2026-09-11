@@ -1,0 +1,59 @@
+use_default_settings: true
+
+server:
+  secret_key: "change-me-run-python-c-import-secrets-print-secrets-token_hex-32"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+outgoing:
+  # A dead engine must not hold up the whole query; the default general set
+  # (brave, duckduckgo, google cse) is routinely rate limited from a home IP.
+  request_timeout: 5.0
+  max_request_timeout: 8.0
+  pool_connections: 100
+
+engines:
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: marginalia
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: mwmbl
+    disabled: false
+  - name: crowdview
+    disabled: false
+  - name: right dao
+    disabled: false
+  - name: hugging face
+    disabled: false
+  - name: arxiv
+    disabled: false
+  - name: openstreetmap
+    disabled: true
+  - name: currency
+    disabled: true
+
+ui:
+  static_use_hash: true

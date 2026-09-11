@@ -1,0 +1,50 @@
+GOAL: implement an assembler and a virtual machine, then run real programs on it.
+
+Create vm.py containing both.
+
+Instruction set (stack machine with 16 memory slots):
+  PUSH n, POP, DUP, SWAP, ADD, SUB, MUL, DIV, MOD, NEG,
+  EQ, LT, GT (push 1 or 0), JMP label, JZ label, JNZ label,
+  LOAD i, STORE i, PRINT, CALL label, RET, HALT
+1. assemble(src) -> list of instructions. Source is one instruction per line,
+   labels are written as "name:" on their own line or before an instruction,
+   ';' starts a comment, blank lines ignored. Unknown mnemonic or unknown label
+   raises AsmError(ValueError).
+2. run(program, max_steps=100000) -> list of printed values. Stack underflow,
+   division by zero or exceeding max_steps raises VmError(Exception).
+
+Then write three assembly programs as .asm files and run them through your VM:
+  fact.asm      - prints factorial of 10 (3628800)
+  fib.asm       - prints the first 15 Fibonacci numbers
+  gcd.asm       - prints gcd(1071, 462) which is 21
+
+Create test_vm.py with AT LEAST 40 asserts covering:
+- each arithmetic and comparison instruction in isolation
+- LOAD/STORE round trip, DUP, SWAP, NEG
+- jumps: a countdown loop, JZ taken and not taken
+- CALL/RET including one nested call
+- the three .asm programs producing exactly the expected output lists
+- AsmError for a bad mnemonic and for a jump to a missing label
+- VmError for stack underflow, division by zero and an infinite loop
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_vm.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_vm.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.

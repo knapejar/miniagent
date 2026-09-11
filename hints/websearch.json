@@ -1,0 +1,6 @@
+[
+  {
+    "when": "search failed",
+    "say": "Every search provider failed. A local SearXNG is the reliable one: check it with docker ps, start it with docker start searxng."
+  }
+]

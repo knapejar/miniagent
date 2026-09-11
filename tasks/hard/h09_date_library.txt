@@ -1,0 +1,49 @@
+GOAL: implement a date library from scratch and make a test suite pass.
+
+Create mydate.py. You MUST NOT import datetime, time or calendar.
+
+Implement class Date(year, month, day) with:
+1. validation raising DateError(ValueError) for impossible dates, including
+   2023-02-29 but not 2024-02-29
+2. is_leap(year) using the full Gregorian rule (1900 no, 2000 yes, 2024 yes)
+3. to_ordinal() and from_ordinal(n) - days since 0001-01-01, round tripping
+4. add_days(n) for positive and negative n, crossing month and year boundaries
+5. add_months(n) clamping the day (Jan 31 + 1 month = Feb 28 or 29)
+6. weekday() returning 0 for Monday through 6 for Sunday
+7. diff_days(other), comparison operators, and __str__ giving YYYY-MM-DD
+8. parse(s) accepting YYYY-MM-DD and DD.MM.YYYY, raising DateError otherwise
+9. format(fmt) supporting %Y %m %d %B %A (English month and day names)
+
+Create test_mydate.py with AT LEAST 50 asserts covering:
+- leap years: 1900, 2000, 2023, 2024, 2100
+- month lengths for all 12 months in a leap and a non leap year
+- add_days across: month end, year end, a leap day, and a negative jump of 400 days
+- add_months: Jan 31 +1, Mar 31 -1, Dec 15 +13, and a 24 month jump
+- weekday for at least 6 known dates including 2000-01-01 (Saturday) and
+  1970-01-01 (Thursday)
+- ordinal round trip for 10 dates spread over 500 years
+- diff_days both directions, and comparisons ==, <, >
+- parse of both formats and DateError for "2023-13-01", "31/12/2023", "abc"
+- format producing "2024-03-09", "March", "Saturday"
+The last line of the test file must print ALL OK.
+
+FIRST STEP: call the plan tool with a short checklist of the features listed
+above, then do NOT plan the whole implementation up front. Immediately create a
+minimal version of the main file that handles only the FIRST item in the list above,
+plus a test file with 3 asserts for it, and run it. Then add ONE feature at a time,
+running the tests after every change. Think briefly between steps.
+
+RULES
+- Work in SMALL steps: implement ONE function or ONE group of tests at a time,
+  then immediately run `python test_mydate.py` and fix what fails.
+- After EVERY change run the WHOLE test file, not just the test you just added.
+  If something that passed before now fails, your last edit caused it: undo that
+  edit before you add anything new.
+- Do NOT restructure code that already works. Add new handling alongside it.
+- Whenever a feature starts passing, record it in the plan as DONE so you know not
+  to touch it again. The plan survives context cropping; the conversation does not.
+- Use the edit tool for fixes. NEVER rewrite a whole file to change a few lines.
+- Do not weaken or delete an assert to make the suite pass. Fix the code instead.
+- Re-read the file with the read tool if you are unsure what is currently in it.
+- DONE only when `python test_mydate.py` prints ALL OK as its last line.
+Then reply with a short summary of what you built and which bugs you had to fix.
