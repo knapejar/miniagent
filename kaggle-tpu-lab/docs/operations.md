@@ -57,7 +57,7 @@ USERPROFILE=$(cygpath -w /tmp/ktl-home) HOME=/tmp/ktl-home KAGGLE_USERNAME=<you>
 | Client | Point it at | Notes |
 |---|---|---|
 | anything OpenAI-compatible | `http://127.0.0.1:8080/v1` (proxy), any key | or a tunnel URL + the API key from the banner |
-| Claude Code | `tools\claude-qwen.cmd` (proxy on :8080) | the proxy maps `output_config.effort` `high -> medium`, `max -> xhigh`; a raw tunnel returns HTTP 400 for `high` |
+| Claude Code | `qwen38-27b	ools\claude-qwen.cmd` (proxy on :8080) | the proxy maps `output_config.effort` `high -> medium`, `max -> xhigh`; a raw tunnel returns HTTP 400 for `high` |
 | miniagent | `python miniagent.py --kaggle` (repo root, one level up) | reads structured `tool_calls` (see below) |
 | another PC | tunnel URL + API key, or copy `~/.kaggle-tpu-lab.json` there and run `launch.py proxy` | pinggy URLs rotate hourly; cloudflared URLs live until the kernel restarts its tunnel |
 
@@ -74,7 +74,7 @@ step on a 16k context shows ~25 tok/s although decode runs at ~100 tok/s. Lower
 `/effort`, a smaller `--ctx`, and one client at a time help; prefix caching needs a newer
 vllm-tpu.
 
-`tools/bench_endpoint.py [base_url]` measures TTFT, decode, prefill and 4-stream
+`qwen38-27b/tools/bench_endpoint.py [base_url]` measures TTFT, decode, prefill and 4-stream
 concurrency through any endpoint. Numbers from 2026-09-15 through the proxy and a
 cloudflared tunnel:
 

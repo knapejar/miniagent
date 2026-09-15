@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-kaggle-tpu-lab launcher — serve Qwen3.8-27B on a free Kaggle TPU from your terminal.
+kaggle-tpu-lab launcher — serve a model on a free Kaggle TPU from your terminal.
 
-    python launch.py serve                 # push the kernel and watch it come up
+    python launch.py serve                          # Qwen3.8-27B: push the kernel and watch it come up
+    python launch.py serve --model glm53-flash      # GLM-5.3-Flash
     python launch.py serve --reasoning-effort medium --mtp 3
     python launch.py status                # one-shot status + recent events
     python launch.py shell                 # command channel: over any live tunnel, ntfy as fallback
@@ -19,8 +20,10 @@ Requires the Kaggle CLI, authenticated:  pip install kaggle   (see README).
 Only the Python standard library is used here.
 """
 import argparse
+import base64
 import http.client
 import http.server
+import io
 import json
 import os
 import re
@@ -28,6 +31,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.parse
@@ -36,7 +40,8 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
+KERNEL_SRC = HERE / "qwen38-27b" / "kernel" / "serve_qwen38.py"
+CONTROL_SRC = HERE / "common" / "ktl_control.py"      # front server, tunnels, SSH, /ktl/cmd (GLM kernel)
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 KEY_DIR = Path.home() / ".kaggle-tpu-lab"            # SSH key + local cloudflared binary
 SSH_KEY = KEY_DIR / "id_ed25519"
@@ -46,6 +51,17 @@ CMD_WAIT_S = 330   # the kernel lets a shell command run up to 300 s
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 NTFY = "https://ntfy.sh"
+GLM_DATASETS = ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2",
+                "rahim3/glm53-flash-fp8-1", "rahim3/glm53-flash-fp8-2", "rahim3/glm53-flash-fp8-3", "rahim3/glm53-flash-fp8-4"]
+
+# One entry per model folder: the kernel script, the default kernel name, and what gets embedded into it
+# (our own engine package, the shared control module).
+MODELS = {
+    "qwen38-27b": {"kernel": KERNEL_SRC, "slug": "qwen38-tpu-serve", "model_name": "qwen3.8-27b", "minutes": 22},
+    "glm53-flash": {"kernel": HERE / "glm53-flash" / "kernel" / "serve_glm53.py", "slug": "glm53-tpu-serve",
+                    "model_name": "glm-5.3-flash", "engine": HERE / "glm53-flash" / "engine" / "glm53",
+                    "control": CONTROL_SRC, "minutes": 25},
+}
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
@@ -59,8 +75,12 @@ PHASE_TEXT = {
     "weights-download":   "Downloading weights from Hugging Face (~5 min)...",
     "weights-downloaded": "Weights downloaded.",
     "server-launch":      "Starting vLLM — loading 55 GB of weights, then TPU graph compile...",
+    "loading":            "Loading the weights onto the chips (~9 min)...",
+    "loaded":             None,
+    "warmed":             None,
     "tunnel-url":         None,
     "tunnel-check":       None,
+    "ssh-channel":        None,
     "tunnel-restart":     None,
     "tunnel-failed":      None,
     "hold":               None,
@@ -160,12 +180,41 @@ def ensure_ssh_key():
     return pub.read_text().strip()
 
 
-def push_kernel(user, slug, code_file, cfg, tpu=True, datasets=()):
-    src = KERNEL_SRC.read_text(encoding="utf-8")
+def package_b64(files, arc_dir=None):
+    """Python files as a base64 tar.gz, embedded into a kernel script."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for f in files:
+            tf.add(f, arcname=f"{arc_dir}/{f.name}" if arc_dir else f.name)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def engine_b64(pkg_dir):
+    """The engine package (its .py files) as a base64 tar.gz, embedded into the kernel script."""
+    return package_b64(sorted(pkg_dir.glob("*.py")), pkg_dir.name)
+
+
+def build_kernel(model, cfg):
+    """The self-contained kernel script: config, engine and control module embedded."""
+    model = MODELS[model] if isinstance(model, str) else model
+    src = model["kernel"].read_text(encoding="utf-8")
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
                      lambda _: f"CFG = {cfg!r}", src, count=1, flags=re.M)
     if n != 1:
-        sys.exit("kernel/serve_qwen38.py is missing the __LAUNCHER_CONFIG__ line")
+        sys.exit(f"{model['kernel']} is missing the __LAUNCHER_CONFIG__ line")
+    for key, marker, make in (("engine", "ENGINE_B64", engine_b64),
+                              ("control", "CONTROL_B64", lambda f: package_b64([f]))):
+        if model.get(key):
+            blob = make(model[key])
+            src, n = re.subn(rf'^{marker} = ""  # __{key.upper()}__.*$', lambda _: f'{marker} = "{blob}"',
+                             src, count=1, flags=re.M)
+            if n != 1:
+                sys.exit(f"{model['kernel']} is missing the __{key.upper()}__ line")
+    return src
+
+
+def push_kernel(user, slug, code_file, cfg, tpu=True, datasets=(), model="qwen38-27b"):
+    src = build_kernel(model, cfg)
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / code_file).write_text(src, encoding="utf-8")
@@ -196,7 +245,8 @@ def push_kernel(user, slug, code_file, cfg, tpu=True, datasets=()):
 def save_state(kernel, cfg):
     STATE_FILE.write_text(json.dumps({"kernel": kernel, "topic": cfg["ntfy_topic"],
                                       "cmd_topic": cfg.get("ntfy_cmd_topic", ""),
-                                      "api_key": cfg.get("api_key", ""), "tunnels": {}}))
+                                      "api_key": cfg.get("api_key", ""), "tunnels": {},
+                                      "model": cfg.get("served_model_name", "")}))
 
 
 def remember_tunnels(tunnels):
@@ -226,30 +276,53 @@ def channel_hint(cfg):
 def cmd_serve(args):
     check_auth()
     user = kaggle_username(args.user)
-    slug = args.slug
+    model = MODELS[args.model]
+    slug = args.slug or model["slug"]
     cfg = {
         **channel_cfg(args),
-        "max_model_len": args.max_model_len,
-        "max_num_seqs": args.max_num_seqs,
-        "mtp_tokens": args.mtp,
-        "reasoning_effort_default": args.reasoning_effort,
+        "served_model_name": model["model_name"],
         "keepalive_min": args.keepalive_min,
         "debug_hold_min": args.debug_hold_min,
-        "weights_dataset": args.weights_dataset,
     }
-    if args.no_tools:
-        cfg["tool_call_parser"] = ""
-    if args.text_only:
-        cfg["text_only"] = True
-    if args.verbose:
-        cfg["verbose"] = True
-    if args.fast_start:
-        cfg["fast_start"] = True
+    if args.model == "qwen38-27b":
+        cfg.update({
+            "max_model_len": args.max_model_len,
+            "max_num_seqs": args.max_num_seqs,
+            "mtp_tokens": args.mtp,
+            "reasoning_effort_default": args.reasoning_effort,
+            "weights_dataset": args.weights_dataset,
+        })
+        if args.no_tools:
+            cfg["tool_call_parser"] = ""
+        if args.text_only:
+            cfg["text_only"] = True
+        if args.verbose:
+            cfg["verbose"] = True
+        if args.fast_start:
+            cfg["fast_start"] = True
+        if args.no_async_scheduling:
+            cfg["async_scheduling"] = False
+        datasets = [args.weights_dataset, ENV_DATASET]
+    else:
+        cfg["api_key"] = "glm-" + secrets.token_hex(16)
+        cfg.update({
+            "max_len": args.max_len,
+            "streams": args.streams,
+            "reasoning_effort_default": args.reasoning_effort
+            if args.reasoning_effort in ("low", "medium", "high") else "low",
+            "vision": not args.text_only,
+        })
+        if args.serve_dataset:
+            cfg["serve_dataset"] = args.serve_dataset
+            datasets = GLM_DATASETS[:2] + [args.serve_dataset]           # experts + the serve dataset; no FP8 mounts
+        else:
+            cfg["serve_dataset"] = ""
+            datasets = GLM_DATASETS
 
-    push_kernel(user, slug, "serve_qwen38.py", cfg, datasets=[args.weights_dataset, ENV_DATASET])
+    push_kernel(user, slug, model["kernel"].name, cfg, datasets=datasets, model=args.model)
     save_state(f"{user}/{slug}", cfg)
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
-        "datasets; the endpoint is usually live ~22 min after the kernel starts.")
+        f"datasets; the endpoint is usually live ~{model['minutes']} min after the kernel starts.")
     channel_hint(cfg)
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
@@ -260,7 +333,7 @@ def cmd_nettest(args):
     check_auth()
     user = kaggle_username(args.user)
     cfg = {**channel_cfg(args), "net_test": True, "keepalive_min": args.minutes}
-    push_kernel(user, args.slug, "nettest.py", cfg, tpu=False)
+    push_kernel(user, args.slug, "nettest.py", cfg, tpu=False, model=args.model)
     save_state(f"{user}/{args.slug}", cfg)
     say("Pushed a CPU kernel: dummy server + tunnels + command channel, no TPU queue.")
     channel_hint(cfg)
@@ -295,8 +368,20 @@ def render_event(ev):
     if phase == "tunnel-restart" and ev.get("name") and ev.get("endpoint"):
         remember_tunnels({ev["name"]: re.sub(r"/v1$", "", ev["endpoint"])})
     if phase == "compiling":
-        say(f"Loading / compiling... {ev.get('elapsed_s', 0) // 60} min elapsed "
-            "(typically ~20 min with the env dataset, ~35 min without)")
+        if "what" in ev:
+            say(f"Compiled {ev['what']} in {ev.get('secs', 0)} s")
+        else:
+            say(f"Loading / compiling... {ev.get('elapsed_s', 0) // 60} min elapsed "
+                "(typically ~20 min with the env dataset, ~35 min without)")
+    elif phase == "loaded":
+        say(f"Weights on the chips after {ev.get('minutes', '?')} min (HBM {ev.get('hbm_gb', '?')} GB per chip); "
+            "warming up...")
+    elif phase == "warmed":
+        say(f"Warm-up done in {ev.get('minutes', '?')} min; opening the server...")
+    elif phase == "ssh-channel":
+        for name, t in (ev.get("tunnels") or {}).items():
+            if name.endswith("-ssh"):
+                say(f"   {name:<15} {t.get('url')}  -> {t.get('status')}")
     elif phase == "cache-restored":
         if ev.get("covers_this_config", True):
             say("XLA compile cache restored for this exact config — fast start.")
@@ -331,6 +416,10 @@ def render_event(ev):
     elif phase == "server-restart":
         say(f"vLLM crashed (rc {ev.get('rc')}) — restarting it in the same TPU session "
             f"({ev.get('restart')}/{ev.get('of')}), ~20 min. `python launch.py cmd log 80` shows why.")
+        if ev.get("cause"):
+            say(f"Root cause: {ev['cause']}")
+        if ev.get("hint"):
+            say(f"Hint: {ev['hint']}")
     elif phase == "serving":
         say(f"Server is HEALTHY after {ev.get('startup_secs', 0) // 60} min.")
     elif phase == "benchmark":
@@ -343,23 +432,39 @@ def render_event(ev):
         print(f"  API key  : {ev['api_key']}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
-        print("""
+        base = ev["endpoint"] if str(ev["endpoint"]).endswith("/v1") else f"{ev['endpoint']}/v1"
+        print(f"""
 Try it:
-  curl $BASE/chat/completions -H "Authorization: Bearer $KEY" \\
-    -H "Content-Type: application/json" -d '{
-      "model": "qwen3.8-27b",
-      "messages": [{"role": "user", "content": "Hello!"}],
-      "chat_template_kwargs": {"reasoning_effort": "low"}
-    }'
+  curl {base}/chat/completions -H "Authorization: Bearer $KEY" \\
+    -H "Content-Type: application/json" -d '{{
+      "model": "{ev['model']}",
+      "messages": [{{"role": "user", "content": "Hello!"}}],
+      "chat_template_kwargs": {{"reasoning_effort": "low"}}
+    }}'
 
-See the README for hooking this into Claude Code, Codex CLI, opencode, etc.
+See the model folder's README for hooking this into Claude Code, Codex CLI, opencode, etc.
+Stable local endpoint for any client: `python launch.py proxy` -> http://127.0.0.1:8080/v1
 """)
         say(f"The kernel keeps serving for up to {ev.get('keepalive_min', '?')} min. "
             "Ctrl-C here does NOT stop it; use `python launch.py stop`.")
     elif phase == "heartbeat":
         say(f"Still serving ({ev.get('up_min', '?')} min up) — {ev.get('endpoint', '')}")
+    elif phase == "stopped" and (ev.get("cause") or ev.get("hint") or ev.get("tail")):
+        say("Server exited unexpectedly." + (f" Root cause: {ev['cause']}" if ev.get("cause") else ""))
+        if ev.get("hint"):
+            say(f"Hint: {ev['hint']}")
+        if ev.get("tail"):
+            print("--- server error ---")
+            print(ev["tail"])
     elif phase == "failed":
         say(f"FAILED at step {ev.get('step', '?')}.")
+        if ev.get("step") == "no-tpu":
+            say("Kaggle started this session without a TPU attached. Nothing in the kernel can fix that: "
+                "run `python launch.py stop`, then `serve` again.")
+        if ev.get("cause"):
+            say(f"Root cause: {ev['cause']}")
+        if ev.get("hint"):
+            say(f"Hint: {ev['hint']}")
         if ev.get("tail"):
             print("--- last server output ---")
             print(ev["tail"])
@@ -572,9 +677,9 @@ TUNNEL_PREF = ("ngrok", "cloudflared", "pinggy")
 EFFORT_MAP = {"high": "medium", "max": "xhigh", "minimal": "low", "none": "low"}
 
 
-def adapt_body(path, body):
+def adapt_body(path, body, model=""):
     """Make requests from Anthropic-API clients acceptable to vLLM + Qwen3.8."""
-    if not body or not path.startswith("/v1/messages"):
+    if not body or not path.startswith("/v1/messages") or model.startswith("glm"):
         return body
     try:
         data = json.loads(body)
@@ -623,7 +728,8 @@ def cmd_proxy(args):
             say(f"proxy {self.command} {self.path} " + (fmt % a if "%" in fmt else ""))
 
         def forward(self):
-            body = adapt_body(self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            body = adapt_body(self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0)),
+                              st.get("model", ""))
             headers = {k: v for k, v in self.headers.items() if k.lower() not in hop}
             headers["Authorization"] = f"Bearer {st['api_key']}"
             headers["ngrok-skip-browser-warning"] = "1"
@@ -790,7 +896,14 @@ def main():
 
     s = sub.add_parser("serve", help="push the serving kernel and watch it come up")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
-    s.add_argument("--slug", default="qwen38-tpu-serve", help="kernel name")
+    s.add_argument("--model", default="qwen38-27b", choices=sorted(MODELS),
+                   help="which recipe (model folder) to serve")
+    s.add_argument("--slug", default=None, help="kernel name (default: the model's)")
+    s.add_argument("--max-len", type=int, default=262144, help="glm53-flash: context capacity (a multiple of 32)")
+    s.add_argument("--streams", type=int, default=4, help="glm53-flash: requests decoded together")
+    s.add_argument("--serve-dataset", default="rahim3/glm53-flash-serve",
+                   help="glm53-flash: dataset with base/ + jax_cache/ (replaces the FP8 mounts, shorter warm-up); "
+                        "'' = FP8 mounts, cold")
     s.add_argument("--max-model-len", type=int, default=262144,
                    help="context length (default: native 262k; use 131072 with "
                         "--max-num-seqs 16 for max multi-stream throughput)")
@@ -800,16 +913,21 @@ def main():
                         "lossless by the bundled GDN state-rollback patch "
                         "(verified 12/12 greedy exact-match)")
     s.add_argument("--reasoning-effort", default="xhigh",
-                   choices=["xhigh", "medium", "low"],
-                   help="server-side default; clients can still override per request")
+                   choices=["xhigh", "high", "medium", "low"],
+                   help="server-side default; clients can still override per request "
+                        "(qwen38-27b: xhigh | medium | low; glm53-flash: low | medium | high, default low)")
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",
-                   help="skip the vision tower: ~8 min faster start, image inputs "
+                   help="skip the vision tower (Qwen: ~8 min faster start; GLM: ~1 min); image inputs "
                         "then error out")
+    s.add_argument("--no-async-scheduling", action="store_true",
+                   help="qwen38-27b: pass --no-async-scheduling to vLLM. Needed when clients use JSON mode / "
+                        "structured outputs with MTP on (vllm-tpu 0.28.0 otherwise exits with AttributeError: "
+                        "__delitem__); costs some throughput")
     s.add_argument("--verbose", action="store_true",
                    help="show every vLLM log line in the kernel log")
     s.add_argument("--debug-hold-min", type=int, default=30,
@@ -825,6 +943,8 @@ def main():
                        "the command channel against a dummy HTTP server")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
     s.add_argument("--slug", default="ktl-nettest")
+    s.add_argument("--model", default="qwen38-27b", choices=sorted(MODELS),
+                   help="whose kernel to test (its control plane, no model)")
     s.add_argument("--minutes", type=int, default=20, help="how long the test session stays up")
     add_tunnel_args(s)
     s.set_defaults(fn=cmd_nettest)

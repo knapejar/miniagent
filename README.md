@@ -20,14 +20,14 @@ See [Qwen3.8 on a Kaggle TPU](#qwen38-on-a-kaggle-tpu).
 | `miniagent.py`, `agent/`, `ui/`, `hints/`, `tests/` | the agent (runs on your PC, standard library only) — [Layout](#layout) |
 | `tasks/`, `verify/` | benchmark tasks and their checkers |
 | `searxng/` | settings for a local SearXNG (web search) |
-| [`kaggle-tpu-lab/`](kaggle-tpu-lab/) | the model side: Qwen3.8-27B on a Kaggle TPU — kernel, `launch.py` (serve / proxy / cmd / ssh / stop), notebook, patches, [operations runbook](kaggle-tpu-lab/docs/operations.md). Merged with its history from `knapejar/kaggle-tpu-lab` (a fork of [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab)) |
-| `miniagent-kaggle.cmd`, `kaggle-tpu-lab/tools/claude-qwen.cmd` | shortcuts: miniagent / Claude Code on the Kaggle model |
+| [`kaggle-tpu-lab/`](kaggle-tpu-lab/) | the model side on a free Kaggle TPU: **Qwen3.8-27B** (vllm-tpu, `qwen38-27b/`) and **GLM-5.3-Flash** (own JAX engine, `glm53-flash/`); `launch.py serve [--model glm53-flash]` / proxy / cmd / ssh / stop, the shared control plane `common/ktl_control.py`, [operations runbook](kaggle-tpu-lab/docs/operations.md). Merged with its history from `knapejar/kaggle-tpu-lab` and upstream [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab) |
+| `miniagent-kaggle.cmd`, `kaggle-tpu-lab/qwen38-27b/tools/claude-qwen.cmd` | shortcuts: miniagent / Claude Code on the Kaggle model |
 
-The same kernel also runs under **DeployMan** (a separate local tool for launching services
-on free-tier machines): its `services/qwen38-api/` carries a copy of
-`kaggle-tpu-lab/kernel/serve_qwen38.py` plus a `run.py` wrapper, and adds a queue-time
-history (`deployman stats`) and an SSH tunnel that is up from the kernel's first seconds.
-Change the kernel here, then copy it there.
+The same kernels also run under **DeployMan** (a separate local tool for launching services
+on free-tier machines) as `services/qwen38-api/` and `services/glm53-api/`: a copy of the
+kernel built with `python kaggle-tpu-lab/tools/build_kernel.py <model> <file>` plus a shared
+`run.py`, with a queue-time history (`deployman stats`) and an SSH tunnel that is up from the
+kernel's first seconds. Change a kernel here, then rebuild it there.
 
 ```
   ▐▛███▜▌   miniagent 0.2.0
