@@ -170,11 +170,20 @@ def _scrape(url, engine_host, limit, data=None):
     return results if len(results) >= MIN_RESULTS else []
 
 
+def searxng_base():
+    """Where SearXNG listens, or None when MINIAGENT_SEARX=off. The kaggle
+    profile turns it off when the model's proxy holds the same port (8080)."""
+    base = os.getenv("MINIAGENT_SEARX", "http://127.0.0.1:8080")
+    return None if base.strip().lower() in ("", "off", "none", "0") else base
+
+
 def searxng(query, limit):
     """A SearXNG running on localhost. It aggregates ~20 engines, rotates them
     and absorbs their blocks, so it is the only keyless route that survives an
     agent making several searches in a row."""
-    base = os.getenv("MINIAGENT_SEARX", "http://127.0.0.1:8080")
+    base = searxng_base()
+    if not base:
+        return []
     url = base.rstrip("/") + "/search?" + urllib.parse.urlencode(
         {"q": query, "format": "json"})
     raw, _ = get(url, headers={"Accept": "application/json"}, timeout=SEARCH_TIMEOUT)
@@ -242,8 +251,9 @@ def search(query, limit=6):
         providers.append(("brave", lambda: brave(query, limit, os.environ["BRAVE_API_KEY"])))
     if os.getenv("TAVILY_API_KEY"):
         providers.append(("tavily", lambda: tavily(query, limit, os.environ["TAVILY_API_KEY"])))
-    providers += [("searxng", lambda: searxng(query, limit)),
-                  ("brave-html", lambda: brave_html(query, limit)),
+    if searxng_base():
+        providers.append(("searxng", lambda: searxng(query, limit)))
+    providers += [("brave-html", lambda: brave_html(query, limit)),
                   ("duckduckgo", lambda: duckduckgo(query, limit)),
                   ("duckduckgo-html", lambda: duckduckgo_html(query, limit)),
                   ("mojeek", lambda: mojeek(query, limit)),

@@ -10,7 +10,7 @@ import sys
 import threading
 import os
 
-from agent.config import parse_args
+from agent.config import EFFORTS, parse_args
 from agent.llm import LLMClient
 from agent.loop import AgentLoop
 from agent.metrics import Metrics
@@ -31,7 +31,8 @@ HELP = """  commands
     /hints [tool]      hints loaded for each tool (hints/*.json)
     /context           what is currently taking up the context
     /cwd [path]        show or change the working directory
-    /effort <level>    default | none | low | medium | high
+    /effort <level>    default | none | low | medium | high | xhigh
+    /kaggle            re-check the Kaggle model and start its proxy (--kaggle)
     /approve <mode>    auto | all | none
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
@@ -63,6 +64,12 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
     finally:
         watcher.stop()
     return snapshot
+
+
+def connect_kaggle(cfg, renderer):
+    """Point cfg at Qwen3.8 on the Kaggle TPU (agent/kaggle.py)."""
+    from agent import kaggle
+    return kaggle.setup(cfg, say=lambda text: print("  " + renderer.s.dim(text)))
 
 
 def handle_command(line, cfg, session, renderer, trace, last):
@@ -129,7 +136,7 @@ def handle_command(line, cfg, session, renderer, trace, last):
                 print("  " + s.red("not a directory: " + path))
         print("  " + session.cwd)
     elif cmd == "/effort":
-        if arg in ("default", "none", "low", "medium", "high"):
+        if arg in EFFORTS:
             cfg.effort = arg
         print("  " + s.dim("reasoning: %s" % cfg.effort))
     elif cmd == "/approve":
@@ -145,6 +152,12 @@ def handle_command(line, cfg, session, renderer, trace, last):
         kept = "the plan is kept" if session.plan_text else "nothing kept"
         print("  " + s.dim("dropped %d messages; %s (/clear all drops the plan too)"
                            % (dropped, kept)))
+    elif cmd == "/kaggle":
+        if cfg.profile != "kaggle":
+            print("  " + s.dim("start miniagent with --kaggle to use the Kaggle model"))
+        elif connect_kaggle(cfg, renderer):
+            print("  " + s.green("ready") + s.dim("  %s   context %d   @ %s"
+                                                  % (cfg.model, cfg.ctx, cfg.url)))
     elif cmd == "/trace":
         print("  " + (trace.path or "tracing is off"))
     else:
@@ -155,6 +168,13 @@ def handle_command(line, cfg, session, renderer, trace, last):
 def main(argv=None):
     ansi.setup_stdio()
     cfg, task = parse_args(argv)
+
+    if cfg.profile == "kaggle":
+        try:
+            connect_kaggle(cfg, Renderer(cfg, Metrics()))
+        except KeyboardInterrupt:
+            print()
+            return 130
 
     tools = default_tools()
     session = Session(cfg, tools)

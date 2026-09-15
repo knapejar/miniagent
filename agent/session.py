@@ -29,9 +29,11 @@ class Session(object):
         env_secrets = collect_env()
         register(env_secrets.values())
         self.secret_names = sorted(env_secrets)
+        self.dialect = getattr(cfg, "dialect", "spark")
         self.messages = [{"role": "system",
                           "content": build_system(tools, self.cwd,
-                                                  secret_names=self.secret_names)}]
+                                                  secret_names=self.secret_names,
+                                                  dialect=self.dialect)}]
         self.goal = ""
         self.has_plan = False
         self.plan_text = ""
@@ -78,7 +80,13 @@ class Session(object):
             self.messages.append({"role": "assistant", "content": text})
 
     def add_observation(self, text):
-        message = {"role": self.tool_role, "content": wrap_tool_response(text)}
+        # Qwen's chat template wraps a tool message in <tool_response> itself;
+        # wrapping it here too would nest the tags.
+        if self.tool_role == "tool" and self.dialect == "qwen":
+            content = text
+        else:
+            content = wrap_tool_response(text)
+        message = {"role": self.tool_role, "content": content}
         if self.tool_role == "tool":
             message["tool_call_id"] = "c%d" % len(self.messages)
         self.messages.append(message)
@@ -90,6 +98,8 @@ class Session(object):
             if message["role"] == "tool":
                 message["role"] = "user"
                 message.pop("tool_call_id", None)
+                if not message["content"].startswith("<tool_response>"):
+                    message["content"] = wrap_tool_response(message["content"])
 
     # -------------------------------------------------------------- context
     def total_chars(self):

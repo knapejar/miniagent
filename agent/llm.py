@@ -10,6 +10,18 @@ import time
 import urllib.error
 import urllib.request
 
+from .protocol import cut_after_call
+
+# Statuses a tunnel or the kaggle-tpu-lab proxy answers with while the route to
+# the server is being re-established - worth another try, unlike a 400.
+RETRY_STATUS = (502, 503, 504, 520, 522, 524, 530)
+RETRY_WAIT = 10
+CALL_END = "</tool_call>"
+OVERRUN_CHARS = 80     # text after a finished call before the stream is abandoned
+# Qwen3.8 thinking levels, passed through its chat template (vLLM). miniagent's
+# "high" is the model's top level.
+QWEN_EFFORT = {"low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh"}
+
 
 class LLMError(RuntimeError):
     """Server-side failure. `overflow` means the prompt exceeded the context."""
@@ -18,7 +30,8 @@ class LLMError(RuntimeError):
         RuntimeError.__init__(self, message)
         self.status = status
         low = message.lower()
-        self.overflow = ("context" in low and "exceed" in low) or "too long" in low
+        self.overflow = (("context" in low and "exceed" in low) or "too long" in low
+                         or "maximum context length" in low)   # vLLM's wording
 
 
 class Usage(object):
@@ -42,14 +55,32 @@ class LLMClient(object):
         self.tool_role = "tool"       # probed at runtime: does the server accept it?
 
     # ---------------------------------------------------------- request body
+    @property
+    def server_stop(self):
+        """Spark stops on </tool_call> at the server. Qwen thinks first, and a
+        server-side stop would also fire on a </tool_call> it merely writes
+        while reasoning about the format - so for Qwen the client stops, on the
+        answer only."""
+        return getattr(self.cfg, "dialect", "spark") != "qwen"
+
     def _body(self, messages, stream):
         body = {"model": self.cfg.model, "messages": messages, "stream": stream,
-                "temperature": self.cfg.temperature, "top_p": self.cfg.top_p,
-                "top_k": self.cfg.top_k, "max_tokens": self.cfg.max_tokens,
-                "stop": ["</tool_call>"]}
+                "max_tokens": self.cfg.max_tokens}
+        for name in ("temperature", "top_p", "top_k"):
+            if getattr(self.cfg, name) is not None:
+                body[name] = getattr(self.cfg, name)
+        if self.server_stop:
+            body["stop"] = [CALL_END]
         if stream:
             body["stream_options"] = {"include_usage": True}
-        if self.cfg.effort != "default":
+        if getattr(self.cfg, "profile", "local") == "kaggle":
+            # vLLM validates the top-level reasoning_effort against the OpenAI
+            # values and Qwen3.8 reads its level from the chat template instead.
+            if self.cfg.effort == "none":
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif self.cfg.effort in QWEN_EFFORT:
+                body["chat_template_kwargs"] = {"reasoning_effort": QWEN_EFFORT[self.cfg.effort]}
+        elif self.cfg.effort != "default":
             # LM Studio ignores chat_template_kwargs (measured) and honours only
             # reasoning_effort; kwargs stay for other backends.
             body["reasoning_effort"] = self.cfg.effort
@@ -57,20 +88,30 @@ class LLMClient(object):
                 body["chat_template_kwargs"] = {"enable_thinking": False}
         return body
 
-    def _request(self, messages, stream):
-        request = urllib.request.Request(
-            self.cfg.url.rstrip("/") + "/chat/completions",
-            data=json.dumps(self._body(messages, stream)).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + self.cfg.api_key})
-        try:
-            return urllib.request.urlopen(request, timeout=self.cfg.timeout)
-        except urllib.error.HTTPError as e:
-            raise LLMError("HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:500]),
-                           status=e.code)
-        except urllib.error.URLError as e:
-            raise LLMError("cannot reach %s (%s)" % (self.cfg.url, e.reason))
+    def _request(self, messages, stream, cancel=None):
+        data = json.dumps(self._body(messages, stream)).encode("utf-8")
+        retries = getattr(self.cfg, "retries", 0) or 0
+        for attempt in range(retries + 1):
+            request = urllib.request.Request(
+                self.cfg.url.rstrip("/") + "/chat/completions", data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + (self.cfg.api_key or "none"),
+                         "ngrok-skip-browser-warning": "1"})
+            try:
+                return urllib.request.urlopen(request, timeout=self.cfg.timeout)
+            except urllib.error.HTTPError as e:
+                error = LLMError("HTTP %s: %s" % (
+                    e.code, e.read().decode("utf-8", "replace")[:500]), status=e.code)
+                if e.code not in RETRY_STATUS:
+                    raise error
+            except urllib.error.URLError as e:
+                error = LLMError("cannot reach %s (%s)" % (self.cfg.url, e.reason))
+            if attempt == retries:
+                raise error
+            if cancel is not None and cancel.wait(RETRY_WAIT * (attempt + 1)):
+                raise error
+            if cancel is None:
+                time.sleep(RETRY_WAIT * (attempt + 1))
 
     # ---------------------------------------------------------------- calls
     def chat(self, messages, on_delta=None, cancel=None):
@@ -91,6 +132,8 @@ class LLMClient(object):
         choice = data["choices"][0]
         message = choice.get("message") or {}
         text = message.get("content") or ""
+        if not self.server_stop:
+            text = cut_after_call(text)
         if on_delta and text:
             on_delta("content", text)
         usage = data.get("usage") or {}
@@ -107,7 +150,9 @@ class LLMClient(object):
         parts, reasoning_chars, chunks = [], 0, 0
         prompt_tokens = completion_tokens = reasoning_tokens = 0
         finish = None
-        with self._request(messages, True) as response:
+        content = ""           # the answer so far, kept only for the client-side stop
+        call_end = -1          # where </tool_call> ended in `content`
+        with self._request(messages, True, cancel) as response:
             for raw in response:
                 if cancel is not None and cancel.is_set():
                     finish = "cancelled"
@@ -140,13 +185,27 @@ class LLMClient(object):
                             ttft = time.time() - started
                         if on_delta:
                             on_delta("reasoning", thought)
-                    if piece:
+                    if piece and call_end >= 0:
+                        # Past the call: normally just the end of the turn. The
+                        # model is let finish so the server still reports usage,
+                        # unless it starts writing the tool's answer itself.
+                        chunks += 1
+                        content += piece
+                    elif piece:
                         chunks += 1
                         if ttft == 0.0:
                             ttft = time.time() - started
                         parts.append(piece)
-                        if on_delta:
+                        if not self.server_stop:
+                            content += piece
+                            if CALL_END in content[-len(piece) - len(CALL_END):]:
+                                call_end = content.index(CALL_END) + len(CALL_END)
+                                piece = piece[:len(piece) - (len(content) - call_end)]
+                        if on_delta and piece:
                             on_delta("content", piece)
+                if call_end >= 0 and len(content) - call_end > OVERRUN_CHARS:
+                    finish = "stop"
+                    break
         elapsed = time.time() - started
         if not completion_tokens:      # server sent no usage -> estimate from chunks
             completion_tokens = chunks
@@ -161,6 +220,7 @@ class LLMClient(object):
         generation actually stopped there. On finish_reason "length" the call was
         cut mid-argument, and closing it would turn a truncated call into one that
         parses cleanly with its last argument silently missing."""
+        text = cut_after_call(text)
         if finish == "length":
             return text
         if "<tool_call>" in text and "</tool_call>" not in text:

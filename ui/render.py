@@ -201,6 +201,8 @@ class Renderer(object):
         print(" " + s.cyan("▝▜█████▛▘") + "  " + s.dim("an agent for local models"))
         print()
         print("  " + s.dim("model    ") + self.cfg.model + s.dim("   @ " + self.cfg.url))
+        if getattr(self.cfg, "backend_note", ""):
+            print("  " + s.dim("backend  " + self.cfg.backend_note))
         print("  " + s.dim("context  ") + human_tokens(self.cfg.ctx) +
               s.dim("   crop at %d%%   reasoning: %s   max steps: %d"
                     % (int(self.cfg.crop_at * 100), self.cfg.effort, self.cfg.max_steps)))

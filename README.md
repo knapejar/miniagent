@@ -9,6 +9,10 @@ in [LM Studio](https://lmstudio.ai/) on Windows 11. It speaks the ordinary
 OpenAI-compatible API, so llama.cpp, Ollama, vLLM, SGLang or a remote endpoint work
 just as well.
 
+It also drives **Qwen3.8-27B on a free Kaggle TPU**, served by
+[kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab): `python miniagent.py --kaggle`.
+See [Qwen3.8 on a Kaggle TPU](#qwen38-on-a-kaggle-tpu).
+
 ```
   ▐▛███▜▌   miniagent 0.2.0
  ▝▜█████▛▘  an agent for local models
@@ -80,8 +84,140 @@ docker run -d --name searxng --restart unless-stopped -p 127.0.0.1:8080:8080 ^
 
 `searxng/settings.yml` ships with the JSON API enabled, the rate limiter off for local
 use and a wide engine list. miniagent finds it automatically on `127.0.0.1:8080`;
-`MINIAGENT_SEARX` points elsewhere. Without it, search falls back to direct engines,
-and `BRAVE_API_KEY` or `TAVILY_API_KEY` are used first when present.
+`MINIAGENT_SEARX` points elsewhere, `MINIAGENT_SEARX=off` skips it. Without it, search
+falls back to direct engines, and `BRAVE_API_KEY` or `TAVILY_API_KEY` are used first
+when present.
+
+The kaggle-tpu-lab proxy also listens on 8080. With `--kaggle` SearXNG is skipped
+unless `MINIAGENT_SEARX` is set, so run SearXNG on another port there
+(`-p 127.0.0.1:8888:8080` and `set MINIAGENT_SEARX=http://127.0.0.1:8888`).
+
+## Qwen3.8 on a Kaggle TPU
+
+[kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab) serves Qwen3.8-27B (bf16,
+up to 262k context, ~130 tok/s) with vLLM on Kaggle's free TPU v5e-8 and opens public
+tunnels to it. miniagent runs here, on your machine — its tools touch your files and
+your shell — and only the model runs on Kaggle.
+
+```
+miniagent ──► http://127.0.0.1:8080/v1 ──► tunnel (cloudflared / pinggy / ngrok) ──► vLLM on the Kaggle TPU
+               launch.py proxy
+               (adds the API key, follows whichever tunnel is live)
+```
+
+### Run it
+
+Both repositories side by side (miniagent looks for `..\kaggle-tpu-lab`; elsewhere set
+`KAGGLE_TPU_LAB` to that directory):
+
+```bat
+:: 1. start the model - once per session, it takes a TPU slot plus ~22 min
+cd kaggle-tpu-lab
+python launch.py serve            :: pushes the kernel; Ctrl-C detaches, it keeps running
+python launch.py status -f        :: follow it until "YOUR ENDPOINT IS LIVE"
+
+:: 2. start the agent
+cd ..\miniagent
+python miniagent.py --kaggle                        :: interactive
+python miniagent.py --kaggle "fix the failing test" :: one shot
+python miniagent.py --kaggle --wait -f task.txt     :: wait for the kernel, then run
+miniagent-kaggle.cmd                                :: the same as --kaggle
+
+:: 3. end the session, so it stops using TPU quota
+cd ..\kaggle-tpu-lab
+python launch.py stop
+```
+
+That is all the setup there is. With `--kaggle`, before the first step, miniagent:
+
+1. reads `%USERPROFILE%\.kaggle-tpu-lab.json`, written by `launch.py serve` — the kernel,
+   its ntfy progress topic and the API key;
+2. reads that ntfy topic to see whether the kernel is live, still starting, or ended.
+   It only reads; nothing is sent to the kernel. A kernel that is still queued or
+   compiling is reported and the prompt opens anyway — type `/kaggle` once it is live,
+   or start with `--wait`;
+3. starts `launch.py proxy` in the background when nothing listens on
+   `127.0.0.1:8080` yet (log in `runs\proxy.log`) and stops it again on exit. A proxy
+   you already run yourself is simply used;
+4. reads the served model name and context limit from `/v1/models`;
+5. skips SearXNG, whose default port the proxy holds.
+
+The banner then shows the backend:
+
+```
+  model    qwen3.8-27b   @ http://127.0.0.1:8080/v1
+  backend  kaggle-tpu-lab   you/qwen38-tpu-serve   proxy started by miniagent
+  context  131.1k   crop at 70%   reasoning: medium   max steps: 60
+```
+
+### What differs from the local profile
+
+| | `--profile local` (default) | `--kaggle` |
+|---|---|---|
+| endpoint | `MINIAGENT_URL`, `http://127.0.0.1:1234/v1` | `MINIAGENT_KAGGLE_URL`, `http://127.0.0.1:8080/v1` |
+| model | `spark-x2.5-4b` | `qwen3.8-27b`, confirmed from `/v1/models` |
+| API key | `MINIAGENT_KEY` | from `.kaggle-tpu-lab.json` (the proxy adds it anyway) |
+| tool-call format | Spark `<arg_key>` | Qwen `<function=…><parameter=…>` |
+| context | 65 536 | 131 072, capped at the server's `max_model_len` |
+| max tokens per step | 8 192 | 16 384 (room for reasoning) |
+| sampling | temperature 1.0, top_p 0.95 | not sent — the model's own generation config |
+| reasoning | `reasoning_effort`, off | `chat_template_kwargs`, medium |
+| stop on `</tool_call>` | server side | client side, on the answer only |
+| retries | none | 3, on tunnel errors (502/503/504/52x/530) and refused connections |
+
+Why each one:
+
+- **Tool-call format.** Qwen3.8 was trained on the `qwen3_coder` XML, not Spark's. vLLM
+  parses that format only when a request carries `tools`, and miniagent never sends
+  them (see `agent/protocol.py`), so the system prompt describes the format the way
+  Qwen's chat template does and miniagent parses it. Values keep their indentation,
+  and tool results are not wrapped in `<tool_response>` twice, because the template
+  already wraps them. The parser reads both formats, so `--dialect` only changes the prompt.
+- **Reasoning.** Qwen3.8 has the levels `low`, `medium` and `xhigh`, set through
+  `chat_template_kwargs`. The top-level `reasoning_effort` is validated by vLLM
+  against OpenAI's values (there is no `xhigh`) and the template does not read it, so
+  it is not sent. `--effort none` turns thinking off, `high` (or `xhigh`) is
+  the top level, and `/effort` changes it mid-session.
+- **Stop sequence.** The model thinks before it calls a tool. A server-side stop on
+  `</tool_call>` would also fire when it merely mentions the tag while reasoning. So
+  miniagent watches the answer instead: after a complete call it lets the turn end
+  normally, which keeps the token counts, and it abandons the stream when the model
+  starts writing the tool's result itself.
+- **Context 131k.** vllm-tpu 0.28 has no prefix caching for this model, so each step
+  re-reads the whole prompt at ~10k tok/s. At 131k a step stays under ~10 s. `--ctx 262144`
+  uses the full window.
+- **Retries.** Pinggy URLs rotate hourly. While the proxy re-resolves a tunnel it
+  answers 502, and a step waits 10, 20 and 30 s before it gives up.
+
+### Kaggle options and settings
+
+```
+--kaggle                 same as --profile kaggle (or set MINIAGENT_PROFILE=kaggle)
+--wait                   wait until the kernel is live and the endpoint answers
+--no-proxy               never start launch.py proxy; run it yourself
+--url URL                a tunnel URL directly, e.g. https://xxxx.trycloudflare.com/v1
+--dialect spark|qwen     override the tool-call format
+--effort LEVEL           none | low | medium | high | xhigh
+
+KAGGLE_TPU_LAB           kaggle-tpu-lab directory (or its launch.py)
+KAGGLE_TPU_LAB_STATE     launch state file, default %USERPROFILE%\.kaggle-tpu-lab.json
+MINIAGENT_KAGGLE_URL     endpoint, default http://127.0.0.1:8080/v1
+MINIAGENT_KAGGLE_MODEL   model name, default qwen3.8-27b
+MINIAGENT_KAGGLE_KEY     API key, default: from the state file
+```
+
+### When something does not work
+
+| symptom | what to do |
+|---|---|
+| `the Kaggle kernel is not live yet` | it is queued for a TPU or still compiling: `python launch.py status -f`, then `/kaggle` |
+| `the Kaggle kernel has ended` | `python launch.py serve` starts a new one, then restart miniagent: a proxy it started still follows the old launch |
+| `the proxy did not start` | the last lines of `runs\proxy.log` are printed. Port taken? Use `--url http://127.0.0.1:8081/v1` |
+| `HTTP 502: kaggle-tpu-lab proxy: no live tunnel` | no tunnel answers. `python launch.py cmd tunnel` probes them, `python launch.py cmd tunnel pinggy` restarts pinggy |
+| a step ends with `no tool call (finish=length …)` | the reasoning used up the budget: `/effort low` or `--max-tokens 32768` |
+
+The endpoint is public and protected only by the API key. miniagent masks the key in
+everything it prints and traces, and never shows it to the model.
 
 ## Tools
 
@@ -135,7 +271,7 @@ stops the agent mid-token.
 
 ```
 /help   /plan    /stats   /tools   /hints   /context   /cwd
-/effort /approve /steps   /clear   /trace   /quit
+/effort /approve /steps   /clear   /trace   /kaggle  /quit
 
 !<command>    run a shell command directly, without the model
 esc           stop the agent immediately
@@ -146,12 +282,15 @@ esc           stop the agent immediately
 ```
 -f, --task-file FILE     read the task from a file
 -C, --workdir DIR        working directory for the agent
+    --kaggle             Qwen3.8-27B on a Kaggle TPU, see above
+    --profile NAME       local | kaggle
     --url URL            OpenAI-compatible endpoint
     --model NAME         model identifier
     --ctx N              context window (default 65536)
     --max-steps N        step limit per task (default 60)
     --max-tokens N       generation limit per step (default 8192)
-    --effort LEVEL       default | none | low | medium | high
+    --dialect NAME       auto | spark | qwen (tool-call format)
+    --effort LEVEL       default | none | low | medium | high | xhigh
     --temperature F      default 1.0
     --approve MODE       auto | all | none
     --crop-at F          share of the context that triggers cropping
@@ -168,8 +307,9 @@ esc           stop the agent immediately
 ```
 miniagent.py          entry point, REPL, slash commands
 agent/
-  config.py           settings and arguments
-  protocol.py         tool-call format, system prompt
+  config.py           settings, arguments, the local and kaggle profiles
+  protocol.py         tool-call formats (spark, qwen), system prompt
+  kaggle.py           Qwen3.8 on a Kaggle TPU: launch state, proxy, readiness
   llm.py              OpenAI-compatible client, streaming, cancellation
   session.py          history, context cropping, pinned plan
   loop.py             the agent loop, a generator of events
@@ -190,7 +330,7 @@ ui/
 hints/                one JSON file per tool
 tasks/                benchmark tasks, including ten hard ones
 verify/               independent checkers for those tasks
-tests/                135 tests
+tests/                167 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be

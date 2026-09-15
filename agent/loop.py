@@ -15,7 +15,7 @@ from .guards import FailureMemory, Progress, ResultRepeat, failed
 from .hints import Hints
 from .jobs import JOB_WAIT
 from .metrics import Metrics
-from .protocol import malformed, parse_tool_call, strip_think
+from .protocol import example_call, malformed, parse_tool_call, strip_think
 from .secrets import redact
 
 OBS_MAX_CHARS = 3000
@@ -247,8 +247,8 @@ class AgentLoop(object):
                 self.session.add_observation(
                     "[ERROR] That call was malformed and was NOT run: an argument value "
                     "still contained tool-call markup. One call looks like "
-                    "<tool_call>NAME<arg_key>key</arg_key><arg_value>value</arg_value>"
-                    "</tool_call> and its values are plain text."
+                    + example_call(getattr(self.cfg, "dialect", "spark"))
+                    + " and its values are plain text."
                     + self.session.reminder(step, self.cfg.max_steps))
                 continue
             yield "tool_call", {"name": name, "args": args, "tool": self.tools.get(name)}
