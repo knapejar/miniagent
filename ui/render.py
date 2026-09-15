@@ -165,6 +165,7 @@ class Renderer(object):
               self.s.dim(" – %s chars dropped" % human_tokens(d["chars"])))
 
     def _ev_note(self, d):
+        self._stop_spinner()
         colour = self.s.yellow if d.get("level") == "warn" else self.s.dim
         print("  " + colour("! " + d["text"]))
 

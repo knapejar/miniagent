@@ -525,8 +525,66 @@ def cmd_build_env(args):
 
 def load_state():
     if not STATE_FILE.exists():
-        sys.exit("No launch state found — run `python launch.py serve` first.")
+        sys.exit("No launch state found — run `python launch.py serve` (or `adopt`) first.")
     return json.loads(STATE_FILE.read_text())
+
+
+DEPLOYMAN_DIR = Path(os.environ.get("DEPLOYMAN_DIR", HERE.parent.parent / "DeployMan"))
+
+
+def deployman_machine(machine="", refresh=True, dm_dir=None):
+    """The newest (or the named) DeployMan qwen38-api / glm53-api machine with an endpoint."""
+    dm_dir = Path(dm_dir or DEPLOYMAN_DIR)
+    cmd = [sys.executable, "-m", "deployman", "--json", "status"] + (["--refresh"] if refresh else [])
+    r = subprocess.run(cmd, cwd=str(dm_dir), capture_output=True, text=True, timeout=240,
+                       encoding="utf-8", errors="replace")
+    machines = json.loads(r.stdout or "[]")
+    live = [m for m in machines
+            if (m["id"] == machine if machine else m.get("service") in ("qwen38-api", "glm53-api"))
+            and ((m.get("info") or {}).get("custom") or {}).get("endpoint")
+            and (machine or m.get("state") in ("running", "booting"))]
+    return max(live, key=lambda m: m.get("created_at") or 0) if live else None
+
+
+def state_from_deployman(m, dm_dir=None):
+    e = m["info"]["custom"]["endpoint"]
+    tunnels = {n: (t.get("url") if isinstance(t, dict) else t) for n, t in (e.get("tunnels") or {}).items()}
+    tunnels = {n: u for n, u in tunnels.items() if n in API_TUNNELS and u}
+    if not tunnels and e.get("base_url"):
+        tunnels["cloudflared"] = re.sub(r"/v1/?$", "", e["base_url"])
+    return {"kernel": m.get("ref", ""), "topic": "", "cmd_topic": "", "api_key": e["api_key"],
+            "tunnels": tunnels, "model": e.get("model", ""),
+            "deployman": {"machine": m["id"], "dir": str(Path(dm_dir or DEPLOYMAN_DIR))}}
+
+
+def refresh_from_deployman(st):
+    """All known tunnel URLs are dead: ask DeployMan (Kaggle log markers) for the current ones."""
+    dm = st.get("deployman") or {}
+    if not dm.get("machine"):
+        return False
+    try:
+        m = deployman_machine(dm["machine"], refresh=True, dm_dir=dm.get("dir"))
+    except Exception as e:
+        say(f"DeployMan refresh failed: {e}")
+        return False
+    if not m:
+        return False
+    fresh = state_from_deployman(m, dm.get("dir"))
+    if fresh["tunnels"] == st.get("tunnels") and fresh["api_key"] == st.get("api_key"):
+        return False
+    st.update(fresh)
+    STATE_FILE.write_text(json.dumps(st))
+    return True
+
+
+def cmd_adopt(args):
+    """Point the proxy, `shell` and miniagent at a server DeployMan started (no ntfy topic)."""
+    m = deployman_machine(args.machine or "", refresh=not args.no_refresh)
+    if not m:
+        sys.exit("No DeployMan machine with a live endpoint (is it still starting?).")
+    st = state_from_deployman(m)
+    STATE_FILE.write_text(json.dumps(st))
+    say(f"Adopted {m['id']}: {', '.join(f'{n} {u}' for n, u in st['tunnels'].items())}")
 
 
 def cmd_status(args):
@@ -614,15 +672,20 @@ def api_urls(st):
 def fetch_tunnels(st):
     """{name: {url, status}} from the kernel's front server over a known tunnel, else
     from an ntfy `tunnel` command. Refreshes the state file."""
-    for base in api_urls(st):
-        try:
-            tunnels = http_json(base + "/ktl/tunnels", st["api_key"], timeout=20)["tunnels"]
-            remember_tunnels(tunnels)
-            st["tunnels"] = {**st.get("tunnels", {}),
-                             **{n: t["url"] for n, t in tunnels.items() if t.get("url")}}
-            return tunnels
-        except Exception:
-            continue
+    for attempt in range(2):
+        for base in api_urls(st):
+            try:
+                tunnels = http_json(base + "/ktl/tunnels", st["api_key"], timeout=20)["tunnels"]
+                remember_tunnels(tunnels)
+                st["tunnels"] = {**st.get("tunnels", {}),
+                                 **{n: t["url"] for n, t in tunnels.items() if t.get("url")}}
+                return tunnels
+            except Exception:
+                continue
+        if attempt or not refresh_from_deployman(st):
+            break
+    if not st.get("cmd_topic"):
+        return {}
     rc, out = send_command(st, "tunnel", timeout=90)
     tunnels = {}
     for line in (out or "").splitlines():
@@ -677,9 +740,28 @@ TUNNEL_PREF = ("ngrok", "cloudflared", "pinggy")
 EFFORT_MAP = {"high": "medium", "max": "xhigh", "minimal": "low", "none": "low"}
 
 
+def _kernel_sanitizer():
+    """sanitize_request() from the Qwen kernel: the proxy and the kernel's front server drop the
+    same engine-crashing request features, from one copy of the code."""
+    src = KERNEL_SRC.read_text(encoding="utf-8")
+    start, end = src.index("# ---- sanitize: begin"), src.index("# ---- sanitize: end ----")
+    ns = {"json": json}
+    exec(compile(src[start:end], str(KERNEL_SRC), "exec"), ns)
+    return ns["sanitize_request"]
+
+
+sanitize_request = _kernel_sanitizer()
+
+
 def adapt_body(path, body, model=""):
-    """Make requests from Anthropic-API clients acceptable to vLLM + Qwen3.8."""
-    if not body or not path.startswith("/v1/messages") or model.startswith("glm"):
+    """Make requests from Anthropic-API clients acceptable to vLLM + Qwen3.8: map the effort level,
+    and drop what crashes the TPU engine (see sanitize_request in the Qwen kernel)."""
+    if not body or model.startswith("glm"):
+        return body
+    body, changed = sanitize_request(path, body)
+    if changed:
+        say(f"proxy: {path.split('?', 1)[0]} - removed {', '.join(changed)} (would crash the TPU engine)")
+    if not path.startswith("/v1/messages"):
         return body
     try:
         data = json.loads(body)
@@ -707,8 +789,21 @@ def cmd_proxy(args):
     cur = {"urls": [], "at": 0}
     lock = __import__("threading").Lock()
 
+    stamp = {"mtime": STATE_FILE.stat().st_mtime}
+
     def resolve(force=False):
         with lock:
+            try:
+                mtime = STATE_FILE.stat().st_mtime
+                if mtime != stamp["mtime"]:          # `adopt` or a new launch rewrote it
+                    stamp["mtime"] = mtime
+                    st.clear()
+                    st.update(json.loads(STATE_FILE.read_text()))
+                    cur["urls"] = []
+                    force = True
+                    say("State file changed - following the new server.")
+            except (OSError, ValueError):
+                pass
             if force or not cur["urls"]:
                 if time.time() - cur["at"] < 10 and cur["urls"]:
                     return cur["urls"]
@@ -979,6 +1074,11 @@ def main():
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--timeout", type=int, default=1800, help="upstream timeout per request (s)")
     s.set_defaults(fn=cmd_proxy)
+
+    s = sub.add_parser("adopt", help="use a server started by DeployMan (proxy, shell, miniagent)")
+    s.add_argument("machine", nargs="?", help="DeployMan machine id (default: newest running)")
+    s.add_argument("--no-refresh", action="store_true", help="DeployMan's cached state only")
+    s.set_defaults(fn=cmd_adopt)
 
     s = sub.add_parser("stop", help="terminate the TPU session")
     s.set_defaults(fn=cmd_stop)

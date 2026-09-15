@@ -26,6 +26,7 @@ PROFILES = {
         # inside <think>, so reasoning is off by default.
         "effort": "none",
         "retries": 0,
+        "outage_wait": 0,
     },
     # Qwen3.8-27B on a Kaggle TPU, started by kaggle-tpu-lab (`launch.py serve`)
     # and reached through its local proxy (`launch.py proxy`). See agent/kaggle.py.
@@ -49,6 +50,9 @@ PROFILES = {
         "effort": "medium",
         # Tunnels rotate and the proxy answers 502 while it re-resolves one.
         "retries": 3,
+        # A crashed vLLM engine restarts in place in ~15-20 min; the agent waits for
+        # it instead of dying and keeps the conversation.
+        "outage_wait": 1800,
     },
 }
 
@@ -84,6 +88,7 @@ class Config(object):
         self.top_k = pick("top_k")
         self.effort = pick("effort")
         self.retries = pick("retries")
+        self.outage_wait = pick("outage_wait")     # seconds to wait out a server outage
 
         self.crop_at = kw.get("crop_at", 0.7)      # share of ctx that triggers cropping
         self.keep_tail = kw.get("keep_tail", 8)    # messages the crop keeps at the end
@@ -92,7 +97,7 @@ class Config(object):
         self.approve = kw.get("approve", "auto")   # auto | all | none
         self.stream = kw.get("stream", True)
         self.color = kw.get("color", True)
-        self.show_reasoning = kw.get("show_reasoning", False)
+        self.show_reasoning = kw.get("show_reasoning", True)
         self.redact = kw.get("redact", True)       # mask secrets in tool output
         self.async_web = kw.get("async_web", False)  # never block on web tools
         self.trace_dir = kw.get("trace_dir", "runs")
@@ -153,7 +158,8 @@ def parse_args(argv=None):
     g = p.add_argument_group("output")
     g.add_argument("--no-stream", action="store_true", help="disable streaming")
     g.add_argument("--no-color", action="store_true")
-    g.add_argument("--show-reasoning", action="store_true", help="print the model's reasoning")
+    g.add_argument("--no-reasoning", action="store_true",
+                   help="do not print the model's reasoning (shown live by default)")
     g.add_argument("--no-redact", action="store_true", help="do not mask secrets in output")
     g.add_argument("--async-web", action="store_true",
                    help="websearch and browse never block; results arrive later")
@@ -172,7 +178,7 @@ def parse_args(argv=None):
                  workdir=a.workdir, max_steps=a.max_steps,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
                  approve=a.approve, stream=not a.no_stream, color=not a.no_color,
-                 show_reasoning=a.show_reasoning, redact=not a.no_redact,
+                 show_reasoning=not a.no_reasoning, redact=not a.no_redact,
                  async_web=a.async_web, run_name=a.run_name,
                  spawn_proxy=not a.no_proxy, wait=a.wait, **given)
     return cfg, task

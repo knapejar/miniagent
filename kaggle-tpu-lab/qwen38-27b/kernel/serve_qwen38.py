@@ -91,7 +91,7 @@ DEFAULTS = {
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "ntfy_cmd_topic": "",          # optional: accept commands from ntfy.sh/<topic> (keep it secret)
     "debug_hold_min": 30,          # on failure keep the session alive this long (needs a tunnel, SSH or ntfy)
-    "server_restarts": 3,          # vLLM dying while serving is restarted in place (same TPU
+    "server_restarts": 10,         # vLLM dying while serving is restarted in place (same TPU
                                    # session, cached graphs, ~20 min) up to this many times
     "ngrok_url": "",               # e.g. https://name.ngrok-free.dev (your free static domain)
     "ngrok_authtoken": "",         # or env / Kaggle secret NGROK_AUTHTOKEN
@@ -135,6 +135,8 @@ os.environ["HF_HOME"] = "/tmp/hf"                 # /kaggle/working is only ~21 
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 os.environ["VLLM_XLA_CACHE_PATH"] = XLA_CACHE
 os.environ["MIN_TOKEN_BUCKET"] = str(CFG["min_token_bucket"])
+# strict tools would be compiled to a structural-tag grammar, which crashes the TPU engine
+os.environ["VLLM_ENFORCE_STRICT_TOOL_CALLING"] = "0"
 os.environ["NUM_PRECOMPILE_WORKERS"] = str(CFG["precompile_workers"])
 if CFG["fast_start"]:
     os.environ["SKIP_JAX_PRECOMPILE"] = "1"
@@ -756,6 +758,88 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-connection", "transfer-encodin
                "trailer", "upgrade", "host", "content-length"}
 
 
+# ---- sanitize: begin (launch.py's proxy runs this same code) ----
+# Request features that reach code in tpu_inference 0.28 which raises INSIDE the EngineCore:
+# one such request kills the engine and every running request, and the in-place restart takes
+# ~15 min. Traced in tpu-inference/vLLM v0.28.0 source (see docs/operations.md). They are removed
+# or rewritten, never rejected, so clients keep working:
+#  - structured outputs (JSON schema / json_object / regex / choice / grammar / structural tag),
+#    forced tool choice and strict tools, which vLLM compiles to the same grammar: the bitmask
+#    buffer has max(max_num_seqs, 8) rows but MTP gives (1+3) logits rows per request - crashed
+#    2026-09-15 on Claude Code's session-title request ((16, 124160) vs vocab 248320);
+#  - prompt_logprobs and echo (which sets prompt_logprobs): ValueError for multimodal + spec decode;
+#  - allowed_token_ids: TypeError in the TPU input batch;
+#  - video parts: unsupported, EngineDeadError reported upstream.
+# And fields that fail the single request (400/500) or silently corrupt output with MTP:
+#  - seed, min_p, logit_bias, thinking_token_budget, logprob_token_ids; logprobs without
+#    top_logprobs >= 1; beam search / best_of / n > 1;
+#  - temperature 0 next to sampled requests inverts the greedy ones in the MTP rejection
+#    sampler, so greedy becomes temperature 1 + top_k 1 (still exactly greedy).
+SANITIZE_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
+SANITIZE_DROP = ("response_format", "structured_outputs", "guided_json", "guided_regex",
+                 "guided_choice", "guided_grammar", "guided_decoding_backend", "guided_whitespace_pattern",
+                 "output_format", "structural_tag", "prompt_logprobs", "allowed_token_ids", "seed",
+                 "min_p", "logit_bias", "thinking_token_budget", "logprob_token_ids", "best_of",
+                 "use_beam_search", "vllm_xargs", "kv_transfer_params", "ec_transfer_params",
+                 "repetition_detection", "prompt_embeds", "priority")
+
+
+def sanitize_request(path, body):
+    """(body, [what was changed]) - the request without engine-crashing features."""
+    route = path.split("?", 1)[0]
+    if not body or not route.startswith(SANITIZE_PATHS):
+        return body, []
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body, []
+    if not isinstance(data, dict):
+        return body, []
+    changed = [k for k in SANITIZE_DROP if data.pop(k, None) is not None]
+    for holder in ("output_config", "text"):              # Anthropic / Responses output format
+        cfg = data.get(holder)
+        if isinstance(cfg, dict) and cfg.pop("format", None) is not None:
+            changed.append(holder + ".format")
+    if data.get("echo"):
+        data["echo"] = False
+        changed.append("echo")
+    if data.get("n") not in (None, 1):
+        data["n"] = 1
+        changed.append("n")
+    if route.startswith("/v1/completions"):
+        if data.get("logprobs") is not None and data["logprobs"] < 1:
+            data.pop("logprobs")
+            changed.append("logprobs")
+    elif data.get("logprobs") and not data.get("top_logprobs"):
+        data["top_logprobs"] = 1
+        changed.append("top_logprobs")
+    tc = data.get("tool_choice")
+    if tc == "required" or (isinstance(tc, dict) and tc.get("type") in ("any", "tool", "function")):
+        data["tool_choice"] = {"type": "auto"} if route.startswith("/v1/messages") else "auto"
+        changed.append("tool_choice")
+    for tool in data.get("tools") or []:
+        if isinstance(tool, dict):
+            for holder in (tool, tool.get("function")):
+                if isinstance(holder, dict) and holder.pop("strict", None) is not None:
+                    changed.append("tools.strict")
+    temperature = data.get("temperature")
+    if isinstance(temperature, (int, float)) and temperature <= 0:
+        data["temperature"], data["top_k"] = 1.0, 1
+        data.pop("top_p", None)
+        changed.append("temperature")
+    for message in data.get("messages") or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            kept = [part for part in content if not (isinstance(part, dict)
+                    and str(part.get("type", "")).startswith(("video", "input_video")))]
+            if len(kept) != len(content):
+                kept.append({"type": "text", "text": "[video removed: this server cannot read video]"})
+                message["content"] = kept
+                changed.append("video")
+    return (json.dumps(data).encode() if changed else body), sorted(set(changed))
+# ---- sanitize: end ----
+
+
 class Front(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"         # closing the connection ends a streamed body
 
@@ -795,7 +879,9 @@ class Front(http.server.BaseHTTPRequestHandler):
         return self._json(404, {"error": "unknown control route"})
 
     def _forward(self):
-        body = self._body()
+        body, dropped = sanitize_request(self.path, self._body())
+        if dropped:
+            _raw.write(f"[front] {self.command} {self.path}: dropped {', '.join(dropped)}\n")
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         conn = http.client.HTTPConnection("127.0.0.1", VLLM_PORT, timeout=3600)
         try:

@@ -61,6 +61,12 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
         renderer._stop_spinner()
         print("\n  " + renderer.s.yellow("interrupted"))
         snapshot = loop.metrics.snapshot()
+    except Exception as e:                  # a failed task must never close the session
+        renderer._stop_spinner()
+        print("\n  " + renderer.s.red("error: %s: %s" % (type(e).__name__, e)))
+        if trace:
+            trace.write("crash", err="%s: %s" % (type(e).__name__, e))
+        snapshot = loop.metrics.snapshot()
     finally:
         watcher.stop()
     return snapshot

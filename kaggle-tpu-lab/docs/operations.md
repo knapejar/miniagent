@@ -34,6 +34,7 @@ python launch.py nettest                 # CPU kernel, no TPU queue: tunnels + c
 python launch.py serve                   # TPU kernel; watch progress, Ctrl-C only detaches
 python launch.py status -f               # re-attach to the progress stream
 python launch.py proxy                   # http://127.0.0.1:8080/v1 for every local client
+python launch.py adopt                   # point proxy/shell/miniagent at the newest DeployMan server
 python launch.py cmd status              # server + tunnels
 python launch.py cmd log 80              # tail of vllm.log (every vLLM line)
 python launch.py cmd sh "ps aux | grep vllm"
@@ -148,6 +149,34 @@ quota use.
    only with several real agents.
 6. **Keep the message budget small.** Progress events are deduplicated; command output goes
    over HTTPS when a tunnel is up.
+
+## 5b. Incident, 2026-09-16 00:04 - and the request sanitizer
+
+A second Claude Code window started a session; its title request carries a JSON-schema
+structured output. tpu_inference 0.28 sizes the grammar bitmask for max(max_num_seqs, 8) rows,
+but with MTP the logits have (1+3) rows per request: `Incompatible shapes for broadcasting:
+(16, 124160) ... (16, 248320)` inside the EngineCore. The engine died with every running request
+(miniagent at step 32) and the in-place restart takes ~15-20 min. Crash 2 of 2026-09-15 was the
+same class (structured output + MTP) and should have been blocked then.
+
+**Fix: nothing that can crash the engine reaches it.** `sanitize_request()` in the Qwen kernel
+runs in the front server (every tunnel goes through it, so direct tunnel clients are covered too)
+and, from the same source, in `launch.py proxy`. It removes or rewrites, never rejects:
+
+| Request feature | Why (tpu-inference / vLLM v0.28.0 source) |
+|---|---|
+| `response_format`, `structured_outputs`, `guided_*`, `output_format`, `output_config.format`, `text.format`, `structural_tag` | grammar bitmask vs MTP rows: engine crash |
+| `tool_choice` required / named / `any` / `tool` -> auto; `tools[].strict` removed (+ `VLLM_ENFORCE_STRICT_TOOL_CALLING=0`) | compiled to the same grammar: engine crash |
+| `prompt_logprobs`, `echo` | ValueError in `execute_model` for multimodal + spec decode: engine crash |
+| `allowed_token_ids` | TypeError in the TPU input batch: engine crash |
+| video content parts | unsupported, EngineDeadError reported upstream |
+| `seed`, `min_p`, `logit_bias`, `thinking_token_budget`, `logprob_token_ids`, `best_of`, beam search, `n` > 1, `logprobs` without `top_logprobs` | 400/500 for the request |
+| `temperature` 0 -> 1 with `top_k` 1 | the MTP rejection sampler inverts greedy requests batched with sampled ones |
+
+Clients also ride out an outage now: miniagent treats resets, 502/503 and vLLM's
+`EngineCore` 500 as transient and waits up to 30 min (`outage_wait`) with the conversation kept;
+the proxy re-reads `~/.kaggle-tpu-lab.json` when it changes and asks DeployMan for fresh tunnel
+URLs when every known one is dead. `server_restarts` is 10.
 
 ## 6. Verification (2026-09-15)
 

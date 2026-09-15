@@ -20,6 +20,7 @@ from .secrets import redact
 
 OBS_MAX_CHARS = 3000
 MAX_EMPTY_REPLIES = 3
+OUTAGE_POLL = 30          # seconds between retries while the model server is down
 LOOP_WINDOW = 3            # identical calls in a row that count as a stall
 PLAN_NUDGE_AFTER = 15      # steps without a plan update before nudging
 PLAN_NUDGE = ("\n\n[PLAN] You have not updated the plan for %d steps. "
@@ -169,13 +170,29 @@ class AgentLoop(object):
                 yield "end", {"reason": "cancelled", "metrics": self.metrics.snapshot()}
                 return
 
-            try:
-                raw, usage = self._call_model(on_delta)
-            except LLMError as e:
-                self._log("error", err=str(e))
-                yield "end", {"reason": "error", "error": str(e),
-                              "metrics": self.metrics.snapshot()}
-                return
+            waited = 0
+            while True:
+                try:
+                    raw, usage = self._call_model(on_delta)
+                    break
+                except LLMError as e:
+                    limit = getattr(self.cfg, "outage_wait", 0) or 0
+                    if not e.transient or waited >= limit or self._cancelled():
+                        self._log("error", err=str(e))
+                        yield "end", {"reason": "error", "error": str(e),
+                                      "metrics": self.metrics.snapshot()}
+                        return
+                    # the server is down or restarting: wait it out, keep the conversation
+                    self._log("outage", err=str(e)[:300], waited=waited)
+                    yield "note", {"level": "warn", "text": "model server unavailable (%s) - "
+                                   "retrying in %d s, waited %d/%d min (esc to stop)" % (
+                                       str(e)[:160], OUTAGE_POLL, waited // 60, limit // 60)}
+                    if self.cancel is not None:
+                        self.cancel.wait(OUTAGE_POLL)
+                    else:
+                        time.sleep(OUTAGE_POLL)
+                    waited += OUTAGE_POLL
+                    yield "step", {"n": step, "max": self.cfg.max_steps}   # fresh output for the retry
 
             if self._pending_crop:
                 yield "crop", {"chars": self._pending_crop, "n": self.metrics.crops}

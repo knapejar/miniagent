@@ -5,6 +5,7 @@ Streams the reply chunk by chunk so tokens/s can be shown live, and so a cancel
 request stops generation mid-token instead of after the whole reply.
 No dependencies beyond the standard library.
 """
+import http.client
 import json
 import time
 import urllib.error
@@ -26,9 +27,10 @@ QWEN_EFFORT = {"low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhig
 class LLMError(RuntimeError):
     """Server-side failure. `overflow` means the prompt exceeded the context."""
 
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, transient=False):
         RuntimeError.__init__(self, message)
         self.status = status
+        self.transient = transient      # the server is down or restarting; worth waiting
         low = message.lower()
         self.overflow = (("context" in low and "exceed" in low) or "too long" in low
                          or "maximum context length" in low)   # vLLM's wording
@@ -127,12 +129,18 @@ class LLMClient(object):
             try:
                 return urllib.request.urlopen(request, timeout=self.cfg.timeout)
             except urllib.error.HTTPError as e:
-                error = LLMError("HTTP %s: %s" % (
-                    e.code, e.read().decode("utf-8", "replace")[:500]), status=e.code)
-                if e.code not in RETRY_STATUS:
+                text = e.read().decode("utf-8", "replace")[:500]
+                # vLLM answers 500 "EngineCore encountered an issue" once its engine died;
+                # it is restarted, so that is an outage like 502/503, not a bad request.
+                transient = e.code in RETRY_STATUS or (e.code == 500 and "Engine" in text)
+                error = LLMError("HTTP %s: %s" % (e.code, text), status=e.code, transient=transient)
+                if not transient:
                     raise error
             except urllib.error.URLError as e:
-                error = LLMError("cannot reach %s (%s)" % (self.cfg.url, e.reason))
+                error = LLMError("cannot reach %s (%s)" % (self.cfg.url, e.reason), transient=True)
+            except (OSError, http.client.HTTPException) as e:   # reset, timeout, dropped
+                error = LLMError("connection to %s failed (%s: %s)" % (
+                    self.cfg.url, type(e).__name__, e), transient=True)
             if attempt == retries:
                 raise error
             if cancel is not None and cancel.wait(RETRY_WAIT * (attempt + 1)):
@@ -185,69 +193,80 @@ class LLMClient(object):
         calls = {}             # index -> {"name", "arguments"} from structured tool_calls
         content = ""           # the answer so far, kept only for the client-side stop
         call_end = -1          # where </tool_call> ended in `content`
-        with self._request(messages, True, cancel) as response:
-            for raw in response:
-                if cancel is not None and cancel.is_set():
-                    finish = "cancelled"
-                    break
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    event = json.loads(payload)
-                except ValueError:
-                    continue
-                if event.get("usage"):
-                    usage = event["usage"]
-                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
-                    completion_tokens = usage.get("completion_tokens", completion_tokens)
-                    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
-                        "reasoning_tokens", reasoning_tokens)
-                for choice in event.get("choices") or []:
-                    finish = choice.get("finish_reason") or finish
-                    delta = choice.get("delta") or {}
-                    piece = delta.get("content")
-                    thought = delta.get("reasoning_content") or delta.get("reasoning")
-                    for call in delta.get("tool_calls") or []:
-                        entry = calls.setdefault(call.get("index", 0),
-                                                 {"name": "", "arguments": ""})
-                        function = call.get("function") or {}
-                        entry["name"] = entry["name"] or function.get("name") or ""
-                        entry["arguments"] += function.get("arguments") or ""
-                        chunks += 1
-                        if ttft == 0.0:
-                            ttft = time.time() - started
-                    if thought:
-                        reasoning_chars += len(thought)
-                        chunks += 1
-                        if ttft == 0.0:
-                            ttft = time.time() - started
-                        if on_delta:
-                            on_delta("reasoning", thought)
-                    if piece and call_end >= 0:
-                        # Past the call: normally just the end of the turn. The
-                        # model is let finish so the server still reports usage,
-                        # unless it starts writing the tool's answer itself.
-                        chunks += 1
-                        content += piece
-                    elif piece:
-                        chunks += 1
-                        if ttft == 0.0:
-                            ttft = time.time() - started
-                        parts.append(piece)
-                        if not self.server_stop:
+        try:
+            with self._request(messages, True, cancel) as response:
+                for raw in response:
+                    if cancel is not None and cancel.is_set():
+                        finish = "cancelled"
+                        break
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if isinstance(event.get("error"), dict):
+                        # vLLM reports a failure that happens after the 200 inside the stream
+                        message = str(event["error"].get("message", event["error"]))[:500]
+                        raise LLMError("server error mid-reply: %s" % message,
+                                       status=event["error"].get("code"),
+                                       transient="Engine" in message)
+                    if event.get("usage"):
+                        usage = event["usage"]
+                        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                        completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
+                            "reasoning_tokens", reasoning_tokens)
+                    for choice in event.get("choices") or []:
+                        finish = choice.get("finish_reason") or finish
+                        delta = choice.get("delta") or {}
+                        piece = delta.get("content")
+                        thought = delta.get("reasoning_content") or delta.get("reasoning")
+                        for call in delta.get("tool_calls") or []:
+                            entry = calls.setdefault(call.get("index", 0),
+                                                     {"name": "", "arguments": ""})
+                            function = call.get("function") or {}
+                            entry["name"] = entry["name"] or function.get("name") or ""
+                            entry["arguments"] += function.get("arguments") or ""
+                            chunks += 1
+                            if ttft == 0.0:
+                                ttft = time.time() - started
+                        if thought:
+                            reasoning_chars += len(thought)
+                            chunks += 1
+                            if ttft == 0.0:
+                                ttft = time.time() - started
+                            if on_delta:
+                                on_delta("reasoning", thought)
+                        if piece and call_end >= 0:
+                            # Past the call: normally just the end of the turn. The
+                            # model is let finish so the server still reports usage,
+                            # unless it starts writing the tool's answer itself.
+                            chunks += 1
                             content += piece
-                            if CALL_END in content[-len(piece) - len(CALL_END):]:
-                                call_end = content.index(CALL_END) + len(CALL_END)
-                                piece = piece[:len(piece) - (len(content) - call_end)]
-                        if on_delta and piece:
-                            on_delta("content", piece)
-                if call_end >= 0 and len(content) - call_end > OVERRUN_CHARS:
-                    finish = "stop"
-                    break
+                        elif piece:
+                            chunks += 1
+                            if ttft == 0.0:
+                                ttft = time.time() - started
+                            parts.append(piece)
+                            if not self.server_stop:
+                                content += piece
+                                if CALL_END in content[-len(piece) - len(CALL_END):]:
+                                    call_end = content.index(CALL_END) + len(CALL_END)
+                                    piece = piece[:len(piece) - (len(content) - call_end)]
+                            if on_delta and piece:
+                                on_delta("content", piece)
+                    if call_end >= 0 and len(content) - call_end > OVERRUN_CHARS:
+                        finish = "stop"
+                        break
+        except (OSError, http.client.HTTPException) as e:
+            # the tunnel or the server went away mid-reply (vLLM engine crash, tunnel drop)
+            raise LLMError("connection lost mid-reply (%s: %s)" % (type(e).__name__, e),
+                           transient=True)
         elapsed = time.time() - started
         if calls and CALL_END not in "".join(parts):
             call_text, complete = calls_to_text(calls, self._dialect)

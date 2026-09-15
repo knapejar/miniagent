@@ -315,7 +315,7 @@ esc           stop the agent immediately
     --no-stream          disable streaming
     --no-color           plain output
     --no-redact          do not mask secrets in tool output
-    --show-reasoning     print the model's reasoning
+    --no-reasoning       do not print the model's reasoning (shown live by default)
     --run-name NAME      name of the trace file
 ```
 
