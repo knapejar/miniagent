@@ -148,6 +148,27 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
   the rest of the weights int8, the latent cache int8. The 260k needle test passes; we have not
   run a formal benchmark against the bf16 model yet.
 
+## If it fails
+
+The kernel looks before it installs anything, so the common problems show up in the first
+minute with a plain message:
+
+- **"this session has no working TPU"**: Kaggle started the session without a TPU attached. It
+  happens, most often on new or not-yet-verified accounts, and nothing in the notebook can fix it.
+  Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell
+  must print 8.
+- **"no Internet from this session"**: turn Internet on in Session options. Kaggle only allows
+  that on phone-verified accounts.
+- **"datasets not attached"**: Add Input in the right sidebar and attach the names it lists (the
+  two expert datasets and the serve dataset).
+- **The tunnel gives no URL**: the kernel tries three times. If it still fails, the server is
+  running but only reachable inside the kernel; start the session again. A fresh URL can take a
+  minute to resolve, and the kernel replaces one that never does, so watch the log for a
+  `NEW ENDPOINT` line before giving up.
+- **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default)
+  and Kaggle ends TPU sessions after nine hours.
+- **Anything else**: the log prints the step it was in and the error; paste that into an issue.
+
 ## Credits
 
 - [zai-org](https://huggingface.co/zai-org/GLM-5.3-Flash) for GLM-5.3-Flash, released under MIT.

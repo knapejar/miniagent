@@ -6,14 +6,15 @@ the engine package. It also runs standalone (pasted into a Kaggle notebook next 
 previous cell) — then it prints instead of using ntfy.
 
 Steps (each one is announced in the log):
-  1/6  runtime  — pinned libtpu + a few pip packages (~1 min), cloudflared, the engine package
+  1/6  runtime  — pre-flight (datasets attached, Internet on, a real TPU: ~20 s, before anything slow), pinned libtpu
+                  + a few pip packages (~1 min), cloudflared, the engine package
   2/6  weights  — the routed experts (3-bit codebook tables, Unsloth's UD-IQ3_XXS GGUF) and the non-expert weights
                   (int8) straight onto the eight chips (~6 min); the non-expert weights come from the serve dataset's
                   base store when it is attached, else from the FP8 checkpoint datasets
   3/6  vision   — the vision tower, sharded over the chips
   4/6  warm-up  — the prefill buckets, the batched decode programs and the snapshot programs (~9 min with the serve
                   dataset's compile cache, ~14 min cold: the rest is JAX tracing, which no cache skips)
-  5/6  tunnel   — a public cloudflared URL
+  5/6  tunnel   — a public cloudflared URL (three attempts; a URL that never resolves is replaced once)
   6/6  ready    — READY banner + self-test, then keep serving until keepalive_min elapses
 
 A cold run leaves `jax_cache/` (everything it compiled) and `base/` (the non-expert weights, vision tower and
@@ -136,9 +137,55 @@ def hbm():
     return st.get("bytes_in_use", 0) / 1e9, (st.get("bytes_limit") or 0) / 1e9
 
 
+def fail(step, msg):
+    """Stop with a plain message (the launcher prints `step` and `tail` of a "failed" phase)."""
+    log("   " + msg)
+    publish("failed", step=step, tail=msg)
+    sys.exit(1)
+
+
+def preflight():
+    """Look before the slow steps (~20 s): the datasets attached, Internet on (pip, cloudflared) and a real TPU present.
+    Kaggle sometimes starts a "TPU" session with no TPU (a CPU-only container, most often on new or not-yet-verified
+    accounts): jax then sees one CPU device and the build dies minutes later with a sharding error."""
+    need = list(CFG["expert_datasets"]) + ([] if CFG["serve_dataset"] and mounts_of([CFG["serve_dataset"]]) else
+                                           ([CFG["serve_dataset"]] if CFG["serve_dataset"] and not mounts_of(CFG["base_datasets"]) else list(CFG["base_datasets"])))
+    missing = [n for n in need if not mounts_of([n])]
+    if missing:
+        fail("datasets", f"datasets not attached: {missing}. In the right sidebar, Add Input -> search each name -> attach, then run again.")
+    try:
+        urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
+    except Exception as e:  # noqa: BLE001
+        fail("no-internet", f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
+                            "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
+    code = ("import jax\n"
+            "try:\n"
+            "    d = jax.devices()\n"
+            "    print('TPU_CHECK', len(d), d[0].platform, getattr(d[0], 'device_kind', ''))\n"
+            "except Exception as e:\n"
+            "    print('TPU_CHECK 0 none', str(e).replace(chr(10), ' ')[:200])\n")
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+        m = re.search(r"TPU_CHECK (\d+) (\S+)(.*)", (r.stdout or "") + (r.stderr or ""))
+    except Exception as e:  # noqa: BLE001
+        log(f"   (TPU check skipped: {e})"); return
+    if m is None:
+        log("   (TPU check inconclusive: the image's jax did not answer; continuing)"); return
+    n, platform, rest = int(m.group(1)), m.group(2), m.group(3).strip()
+    if n == 8 and platform == "tpu":
+        log(f"   pre-flight OK: datasets attached, Internet on, 8 TPU chips ({rest})"); return
+    if n == 0 and not re.search(r"jellyfish|TPU initialization failed|initialize backend 'tpu'|No TPU|vfio", rest, re.I):
+        log(f"   (TPU check inconclusive, continuing: {rest[:160]})"); return
+    fail("no-tpu", f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a TPU "
+                   "session without one (most often on new or not-yet-verified accounts); nothing in this notebook can fix "
+                   "that. Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell must "
+                   "print 8 before this script is worth running.")
+
+
 # ----------------------------------------------------------------------------- 1. runtime
 if not CFG["skip_runtime"]:
-    banner(1, "Runtime", "pinned libtpu + pip packages, cloudflared, the engine")
+    banner(1, "Runtime", "pre-flight, pinned libtpu + pip packages, cloudflared, the engine")
+    preflight()
     sh([sys.executable, "-m", "pip", "install", "-q", "safetensors", "huggingface_hub", "transformers>=5.16", "pillow",
         "torch", "--index-url", "https://download.pytorch.org/whl/cpu", "--extra-index-url", "https://pypi.org/simple"], "pip packages")
     if CFG["libtpu"]:
@@ -190,8 +237,8 @@ if "eng" not in globals():
     gguf_mounts = mounts_of(CFG["expert_datasets"])
     fp8_mounts = [] if BASE_DIR else mounts_of(CFG["base_datasets"])
     if len(gguf_mounts) < len(CFG["expert_datasets"]) or (not BASE_DIR and len(fp8_mounts) < len(CFG["base_datasets"])):
-        publish("failed", reason="datasets", note=f"attach {CFG['expert_datasets']} + ({CFG['serve_dataset'] or CFG['base_datasets']})")
-        sys.exit(f"datasets missing: found gguf {gguf_mounts}, fp8 {fp8_mounts}, serve {SERVE_MOUNT}")
+        fail("datasets", f"datasets missing: found gguf {gguf_mounts}, fp8 {fp8_mounts}, serve {SERVE_MOUNT}; attach "
+                         f"{CFG['expert_datasets']} + {CFG['serve_dataset'] or CFG['base_datasets']}")
     hf_dir = BASE_DIR or fp8_mounts[0]
     log(f"   experts from {gguf_mounts}; the rest from {'the base store ' + BASE_DIR if BASE_DIR else 'the FP8 checkpoint'}")
     publish("loading", note="weights")
@@ -1103,19 +1150,63 @@ log(f"   HTTP server on :{PORT}")
 
 banner(5, "Tunnel", "a public cloudflared URL")
 url = None
-if CFG["tunnel"]:
-    tun = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+TUN = [None]
+
+
+def start_tunnel(attempts=3, wait_s=90):
+    """A cloudflared quick tunnel -> its public URL, or None. Registration sometimes fails or hangs (seen in our runs):
+    an attempt that prints no URL within `wait_s` is killed and retried."""
     pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    for i in range(attempts):
+        tun = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        q = queue.Queue()
+        threading.Thread(target=lambda: [q.put(l) for l in iter(tun.stdout.readline, "")], daemon=True).start()
+        t0 = time.time()
+        while time.time() - t0 < wait_s:
+            try:
+                line = q.get(timeout=5)
+            except queue.Empty:
+                if tun.poll() is not None:
+                    break
+                continue
+            m = pat.search(line)
+            if m:
+                TUN[0] = tun
+                return m.group(0)
+        tun.kill()
+        log(f"   tunnel attempt {i + 1}/{attempts}: no URL within {wait_s} s (cloudflared rc {tun.poll()}); retrying")
+    return None
+
+
+def tunnel_probe(u, wait_s=180):
+    """Background: confirm the public URL answers (a fresh hostname can take a minute to resolve); if it never does,
+    open a new tunnel once and announce the new URL."""
     t0 = time.time()
-    while time.time() - t0 < 90 and url is None:
-        line = tun.stdout.readline()
-        m = pat.search(line or "")
-        if m:
-            url = m.group(0)
-    threading.Thread(target=lambda: [None for _ in iter(tun.stdout.readline, "")], daemon=True).start()
+    while time.time() - t0 < wait_s:
+        try:
+            urllib.request.urlopen(f"{u}/health", timeout=10).read()
+            log(f"   tunnel reachable from outside: {u} ({time.time() - t0:.0f} s after it opened)")
+            return
+        except Exception:  # noqa: BLE001
+            time.sleep(10)
+    log(f"   tunnel URL {u} did not answer in {wait_s} s: opening a new one")
+    if TUN[0] is not None:
+        TUN[0].kill()
+    new = start_tunnel()
+    if new:
+        STATE["url"] = new
+        publish("tunnel-url", endpoint=new)
+        log(f"#  NEW ENDPOINT: {new}   (the earlier URL never resolved; the API key is unchanged)")
+    else:
+        publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
+
+
+if CFG["tunnel"]:
+    url = start_tunnel()
     if url:
         publish("tunnel-url", endpoint=url)
+        threading.Thread(target=tunnel_probe, args=(url,), daemon=True).start()
     else:
         publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
 STATE["url"] = url or f"http://127.0.0.1:{PORT}"

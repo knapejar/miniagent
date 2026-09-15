@@ -37,6 +37,9 @@ and API key appear in a `READY` banner in its output, about 16 minutes after you
 
 (Without the serve dataset the script can still build from `rahim3/glm53-flash-fp8-1` … `-4`, the FP8 checkpoint;
 that takes about 22 minutes.)
+
+If the last cell stops in its first minute, its message says why: no TPU in this session (Kaggle does that
+sometimes; stop and start the session again), Internet off, or a dataset not attached.
 """,
 }
 
