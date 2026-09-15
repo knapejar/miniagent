@@ -64,6 +64,16 @@ set MINIAGENT_URL=http://192.168.1.10:1234/v1
 set MINIAGENT_MODEL=qwen3-coder-30b
 ```
 
+Tool calls come in three dialects (`--dialect`, `MINIAGENT_DIALECT`). `spark` and
+`nanbeige` are the text formats those small local models were trained on; every other
+model gets `openai` — standard function calling (`tools` in the request, structured
+`tool_calls` back, results as `role: tool`), which vLLM, SGLang, LM Studio and hosted
+APIs parse on the server. A remote vLLM endpoint with a key:
+
+```bat
+python miniagent.py --url https://xxxx.trycloudflare.com/v1 --api-key sk-... --model qwen3.8-27b --effort low
+```
+
 ### Web search (optional, recommended)
 
 Search engines block automated queries from a home address within a handful of

@@ -32,6 +32,7 @@ HELP = """  commands
     /context           what is currently taking up the context
     /cwd [path]        show or change the working directory
     /effort <level>    default | none | low | medium | high
+    /reasoning         show or hide what the model is thinking
     /approve <mode>    auto | all | none
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
@@ -132,6 +133,10 @@ def handle_command(line, cfg, session, renderer, trace, last):
         if arg in ("default", "none", "low", "medium", "high"):
             cfg.effort = arg
         print("  " + s.dim("reasoning: %s" % cfg.effort))
+    elif cmd == "/reasoning":
+        cfg.show_reasoning = not cfg.show_reasoning
+        print("  " + s.dim("reasoning is %s" %
+                           ("shown" if cfg.show_reasoning else "hidden")))
     elif cmd == "/approve":
         if arg in ("auto", "all", "none"):
             cfg.approve = arg
@@ -158,7 +163,7 @@ def main(argv=None):
 
     tools = default_tools()
     session = Session(cfg, tools)
-    client = LLMClient(cfg)
+    client = LLMClient(cfg, tools)
     trace = Trace(cfg.trace_dir, cfg.run_name)
     renderer = Renderer(cfg, Metrics())
 

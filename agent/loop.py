@@ -15,7 +15,7 @@ from .guards import FailureMemory, Progress, ResultRepeat, failed
 from .hints import Hints
 from .jobs import JOB_WAIT
 from .metrics import Metrics
-from .protocol import malformed, parse_tool_call, strip_think
+from .protocol import malformed, native_args, parse_tool_call, strip_think
 from .secrets import redact
 
 OBS_MAX_CHARS = 3000
@@ -80,7 +80,8 @@ class AgentLoop(object):
                 self.metrics.crops += 1
                 self._log("crop_on_overflow", err=str(e)[:200])
                 text, usage = self.client.chat(self.session.messages, on_delta, self.cancel)
-            elif self.session.tool_role == "tool" and "tool" in str(e).lower():
+            elif (self.session.tool_role == "tool" and not self.session.native
+                  and "tool" in str(e).lower()):
                 self.session.downgrade_tool_role()
                 self._log("tool_role_fallback", err=str(e)[:200])
                 text, usage = self.client.chat(self.session.messages, on_delta, self.cancel)
@@ -135,7 +136,7 @@ class AgentLoop(object):
                   % (job, label, seconds, result)
                   for job, label, result, seconds in finished]
         for block in blocks:
-            self.session.add_observation(clip(block))
+            self.session.add_observation(clip(block), answers_call=False)
             self._log("job_done", step=step, job=block[:120])
         return "%d background result(s) delivered" % len(finished)
 
@@ -188,8 +189,20 @@ class AgentLoop(object):
                 return
 
             body = strip_think(raw)
-            call = parse_tool_call(body)
-            self.session.add_assistant(body)
+            structured = getattr(usage, "tool_calls", None) or []
+            bad_args = False
+            if structured:
+                # openai dialect: the server parsed the call; the first one is run
+                first = structured[0]
+                args = native_args(first.get("arguments"))
+                bad_args = args is None
+                call = (first.get("name") or "", args or {})
+                self.session.add_assistant(body, call=first)
+                if len(structured) > 1:
+                    self._log("extra_calls_dropped", step=step, n=len(structured) - 1)
+            else:
+                call = parse_tool_call(body)
+                self.session.add_assistant(body)
 
             if call is None:
                 # An empty reply or a cut-off at the token limit is NOT a finished
@@ -208,7 +221,7 @@ class AgentLoop(object):
                         self._log("stalled", step=step)
                         yield "end", {"reason": "stalled", "metrics": self.metrics.snapshot()}
                         return
-                    correction = ("[ERROR] Your last reply contained no <tool_call> and was "
+                    correction = ("[ERROR] Your last reply contained no tool call and was "
                                   "cut off at the token limit. Keep your reasoning short, then "
                                   "emit exactly ONE <tool_call> now to make progress.")
                     self.session.add_observation(
@@ -240,6 +253,15 @@ class AgentLoop(object):
 
             self._empty = 0
             name, args = call
+            if bad_args:
+                self._log("bad_arguments", step=step, tool=name)
+                yield "note", {"level": "warn",
+                               "text": "tool call arguments are not a JSON object - not run"}
+                self.session.add_observation(
+                    "[ERROR] The arguments of that call were not a valid JSON object, so it "
+                    "was NOT run. Call the tool again with proper arguments."
+                    + self.session.reminder(step, self.cfg.max_steps))
+                continue
             if malformed(args):
                 self._log("malformed_call", step=step, tool=name)
                 yield "note", {"level": "warn",

@@ -2,6 +2,7 @@
 """Core tests.  Run with:  python -m unittest discover -s tests -v"""
 import os
 import sys
+import io
 import threading
 import time
 import unittest
@@ -10,12 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.config import Config                                       # noqa: E402
 from agent.loop import clip                                           # noqa: E402
-from agent.protocol import (PLAN_HEADER, build_system, format_tool_call,   # noqa: E402
-                            parse_tool_call, strip_think)
+from agent.protocol import (PLAN_HEADER, build_system, dialect_for,        # noqa: E402
+                            format_tool_call, parse_tool_call, strip_think)
 from agent.secrets import has_secret, redact                          # noqa: E402
 from agent.session import Session                                     # noqa: E402
 from agent.tools import default_tools                                 # noqa: E402
+from agent.metrics import Metrics                                     # noqa: E402
 from agent.tools.shell import looks_like_powershell                   # noqa: E402
+from ui.render import Renderer                                        # noqa: E402
 
 # Paid for in every turn of the model - a budget, not a style rule. Raised from
 # 1100 when websearch and browse gained multi-target and background: 26 tokens
@@ -41,6 +44,35 @@ class TestProtocol(unittest.TestCase):
         parsed = parse_tool_call('<tool_call>{"name":"read","arguments":{"path":"x"}}</tool_call>')
         self.assertEqual(parsed, ("read", {"path": "x"}))
 
+    def test_nanbeige_xml_format(self):
+        name, args = parse_tool_call(
+            "<tool_call>\n<function=sh>\n<parameter=cmd>\ndir /b\n</parameter>\n"
+            "</function>\n</tool_call>")
+        self.assertEqual(name, "sh")
+        self.assertEqual(args, {"cmd": "dir /b"})
+
+    def test_nanbeige_several_parameters(self):
+        parsed = parse_tool_call(
+            "<tool_call><function=read><parameter=path>\nREADME.md\n</parameter>"
+            "<parameter=count>\n20\n</parameter></function></tool_call>")
+        self.assertEqual(parsed, ("read", {"path": "README.md", "count": "20"}))
+
+    def test_nanbeige_unterminated_call_keeps_its_argument(self):
+        # The stop sequence eats </tool_call> and </parameter> with it. Closing
+        # on a lookahead instead of the tag is what saves the argument here.
+        parsed = parse_tool_call("<tool_call><function=sh><parameter=cmd>\nver")
+        self.assertEqual(parsed, ("sh", {"cmd": "ver"}))
+
+    def test_nanbeige_roundtrip(self):
+        text = format_tool_call("write", {"path": "a.txt", "text": "l1\nl2"}, "nanbeige")
+        self.assertEqual(parse_tool_call(text),
+                         ("write", {"path": "a.txt", "text": "l1\nl2"}))
+
+    def test_dialect_is_guessed_from_the_model_name(self):
+        self.assertEqual(dialect_for("nanbeige4.2-3b"), "nanbeige")
+        self.assertEqual(dialect_for("spark-x2.5-4b"), "spark")
+        self.assertEqual(dialect_for(None), "spark")
+
     def test_unterminated_call(self):
         parsed = parse_tool_call("<tool_call>sh<arg_key>cmd</arg_key><arg_value>ver</arg_value>")
         self.assertEqual(parsed, ("sh", {"cmd": "ver"}))
@@ -64,6 +96,16 @@ class TestProtocol(unittest.TestCase):
         prompt = build_system(default_tools(), r"C:\ws")
         self.assertIn("<tools>", prompt)
         self.assertLess(len(prompt) / 3.4, SYSTEM_PROMPT_TOKEN_BUDGET)
+
+    def test_nanbeige_prompt_carries_its_own_call_format(self):
+        # Without this block the model mixes xml and json into a call that
+        # parses into nothing, and every single step fails.
+        prompt = build_system(default_tools(), r"C:\ws", dialect="nanbeige")
+        self.assertIn("<function=example_function_name>", prompt)
+        self.assertLess(len(prompt) / 3.4, SYSTEM_PROMPT_TOKEN_BUDGET)
+
+    def test_spark_prompt_is_untouched_by_the_dialect_slot(self):
+        self.assertNotIn("<function=", build_system(default_tools(), r"C:\ws"))
 
 
 class TestSecrets(unittest.TestCase):
@@ -1074,3 +1116,160 @@ class TestAsyncWebSwitch(unittest.TestCase):
     def test_without_the_flag_an_ordinary_call_still_blocks(self):
         self.assertIsNone(
             self.tool.background(self.ctx(False), {}, "label", lambda: "x"))
+
+
+class TestReasoningDisplay(unittest.TestCase):
+    """The spinner rewrites its line every 100 ms, so reasoning printed while it
+    runs is wiped before it can be read. The thought has to stop it first."""
+
+    def _stream(self, show_reasoning):
+        renderer = Renderer(Config(show_reasoning=show_reasoning, color=False), Metrics())
+        buf = io.StringIO()
+        stdout, sys.stdout = sys.stdout, buf
+        try:
+            renderer.on_delta("reasoning", "first thought\nsecond line")
+            renderer.on_delta("content", "<tool_call>")
+        finally:
+            sys.stdout = stdout
+        return buf.getvalue()
+
+    def test_thought_is_shown_and_indented(self):
+        out = self._stream(True)
+        self.assertIn("thinking", out)
+        self.assertIn("first thought", out)
+        self.assertIn("\n  second line", out)
+
+    def test_nothing_leaks_when_it_is_off(self):
+        self.assertEqual(self._stream(False), "")
+
+
+class TestOpenAIDialect(unittest.TestCase):
+    """Standard function calling: specs in `tools`, structured `tool_calls` back,
+    results as role "tool" messages carrying the call id."""
+
+    def cfg(self, **kw):
+        return Config(model="qwen3.8-27b", workdir=os.environ.get("TEMP", "."), **kw)
+
+    def test_unknown_models_get_standard_function_calling(self):
+        self.assertEqual(dialect_for("qwen3.8-27b"), "openai")
+        self.assertEqual(dialect_for("claude-sonnet-5"), "openai")
+        self.assertEqual(self.cfg().dialect, "openai")
+
+    def test_arguments_become_strings_like_the_text_dialects(self):
+        from agent.protocol import native_args
+        self.assertEqual(native_args('{"path": "a.txt", "start": 5, "x": true}'),
+                         {"path": "a.txt", "start": "5", "x": "true"})
+        self.assertIsNone(native_args("{broken"))
+        self.assertIsNone(native_args("[1, 2]"))
+
+    def test_request_carries_tools_and_no_stop_sequence(self):
+        from agent.llm import LLMClient
+        body = LLMClient(self.cfg(effort="low"), default_tools())._body([], True)
+        self.assertEqual(body["tools"][0]["type"], "function")
+        self.assertNotIn("stop", body)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "low"})
+        off = LLMClient(self.cfg(effort="none"), default_tools())._body([], True)
+        self.assertNotIn("reasoning_effort", off)
+        self.assertEqual(off["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_system_prompt_leaves_tool_specs_to_the_server(self):
+        prompt = build_system(default_tools(), r"C:\ws", dialect="openai")
+        self.assertNotIn("<tools>", prompt)
+        self.assertNotIn("<tool_call>", prompt)
+        self.assertIn("AT MOST 5 lines", prompt)
+
+    def test_streamed_tool_call_fragments_are_assembled(self):
+        import json as _json
+        from agent import llm
+
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "hmm"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                                    "function": {"name": "sh", "arguments": ""}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"cmd": '}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"ver"}'}}]},
+                          "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 9}},
+        ]
+        lines = [("data: " + _json.dumps(c) + "\n").encode() for c in chunks] + [b"data: [DONE]\n"]
+
+        class Response(list):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        client = llm.LLMClient(self.cfg(), default_tools())
+        client._request = lambda messages, stream: Response(lines)
+        kinds = []
+        text, usage = client.chat([], on_delta=lambda kind, piece: kinds.append(kind))
+        self.assertEqual(text, "")
+        self.assertEqual(usage.tool_calls, [{"id": "call_1", "name": "sh", "arguments": '{"cmd": "ver"}'}])
+        self.assertEqual(usage.finish_reason, "tool_calls")
+        self.assertIn("tool", kinds)
+
+    def test_rejected_reasoning_effort_is_dropped_and_retried(self):
+        from agent.llm import LLMClient, LLMError, Usage
+        client = LLMClient(self.cfg(effort="low"), default_tools())
+        seen = []
+
+        def fake(messages, on_delta, cancel):
+            seen.append(client._body(messages, False).get("reasoning_effort"))
+            if len(seen) == 1:
+                raise LLMError("HTTP 400: reasoning_effort: Input should be 'low'", status=400)
+            return "ok", Usage()
+        client._chat = fake
+        self.assertEqual(client.chat([])[0], "ok")
+        self.assertEqual(seen, ["low", None])
+
+    def test_loop_runs_a_structured_call_and_answers_its_id(self):
+        from agent.llm import Usage
+        from agent.loop import AgentLoop
+
+        class NativeClient(object):
+            def __init__(self):
+                self.seen = []
+
+            def chat(self, messages, on_delta=None, cancel=None):
+                self.seen.append([dict(m) for m in messages])
+                if len(self.seen) == 1:
+                    call = {"id": "call_7", "name": "plan", "arguments": '{"text": "step one"}'}
+                    return "", Usage(10, 5, 0, "tool_calls", 0.1, 0.1, [call, dict(call, id="x")])
+                return "Done.", Usage(20, 2, 0, "stop", 0.1, 0.1)
+
+        cfg = self.cfg(max_steps=4)
+        session = Session(cfg, default_tools())
+        client = NativeClient()
+        events = list(AgentLoop(cfg, session, client, default_tools()).run("GOAL"))
+        self.assertIn(("final", {"text": "Done."}), events)
+        self.assertEqual(session.plan_text, "step one")
+        history = client.seen[1]
+        assistant = [m for m in history if m.get("tool_calls")]
+        self.assertEqual(len(assistant), 1)
+        self.assertEqual(len(assistant[0]["tool_calls"]), 1)
+        result = history[history.index(assistant[0]) + 1]
+        self.assertEqual((result["role"], result["tool_call_id"]), ("tool", "call_7"))
+        self.assertNotIn("<tool_response>", result["content"])
+
+    def test_background_results_do_not_take_the_call_id(self):
+        session = Session(self.cfg(), default_tools())
+        session.start("GOAL")
+        session.add_assistant("", call={"id": "c1", "name": "sh", "arguments": "{}"})
+        session.add_observation("[BACKGROUND RESULT] x", answers_call=False)
+        session.add_observation("real result")
+        self.assertEqual(session.messages[-2]["role"], "user")
+        self.assertEqual(session.messages[-1], {"role": "tool", "tool_call_id": "c1",
+                                                "content": "real result"})
+
+    def test_crop_never_leaves_an_orphaned_tool_result(self):
+        session = Session(self.cfg(keep_tail=2), default_tools())
+        session.start("GOAL")
+        for i in range(6):
+            session.add_assistant("", call={"id": "c%d" % i, "name": "sh", "arguments": "{}"})
+            session.add_observation("out %d" % i)
+        self.assertTrue(session.crop())
+        self.assertTrue(session.messages[3]["content"].startswith("[context cropped"))
+        for i, message in enumerate(session.messages):
+            if message["role"] == "tool":
+                self.assertTrue(session.messages[i - 1].get("tool_calls"), session.messages)

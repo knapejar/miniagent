@@ -10,6 +10,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .protocol import NATIVE, tools_field
+
 
 class LLMError(RuntimeError):
     """Server-side failure. `overflow` means the prompt exceeded the context."""
@@ -23,13 +25,15 @@ class LLMError(RuntimeError):
 
 class Usage(object):
     def __init__(self, prompt_tokens=0, completion_tokens=0, reasoning_tokens=0,
-                 finish_reason=None, ttft=0.0, elapsed=0.0):
+                 finish_reason=None, ttft=0.0, elapsed=0.0, tool_calls=None):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.reasoning_tokens = reasoning_tokens
         self.finish_reason = finish_reason
         self.ttft = ttft              # time to first token
         self.elapsed = elapsed
+        # structured calls of the "openai" dialect: [{"id", "name", "arguments"}]
+        self.tool_calls = tool_calls or []
 
     @property
     def tps(self):
@@ -37,24 +41,42 @@ class Usage(object):
 
 
 class LLMClient(object):
-    def __init__(self, cfg):
+    def __init__(self, cfg, tools=None):
         self.cfg = cfg
+        self.tools = tools or []
         self.tool_role = "tool"       # probed at runtime: does the server accept it?
+        self.send_effort = True       # dropped when the server rejects reasoning_effort
+
+    @property
+    def native(self):
+        return self.cfg.dialect == NATIVE
 
     # ---------------------------------------------------------- request body
     def _body(self, messages, stream):
         body = {"model": self.cfg.model, "messages": messages, "stream": stream,
                 "temperature": self.cfg.temperature, "top_p": self.cfg.top_p,
-                "top_k": self.cfg.top_k, "max_tokens": self.cfg.max_tokens,
-                "stop": ["</tool_call>"]}
+                "top_k": self.cfg.top_k, "max_tokens": self.cfg.max_tokens}
+        if self.native:
+            # No stop sequence: the server's tool parser needs the whole call.
+            if self.tools:
+                body["tools"] = tools_field(self.tools)
+                body["tool_choice"] = "auto"
+        else:
+            body["stop"] = ["</tool_call>"]
         if stream:
             body["stream_options"] = {"include_usage": True}
-        if self.cfg.effort != "default":
+        effort = self.cfg.effort
+        if effort != "default":
             # LM Studio ignores chat_template_kwargs (measured) and honours only
             # reasoning_effort; kwargs stay for other backends.
-            body["reasoning_effort"] = self.cfg.effort
-            if self.cfg.effort == "none":
+            if self.send_effort and not (self.native and effort == "none"):
+                body["reasoning_effort"] = effort
+            if effort == "none":
                 body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif self.native:
+                # vLLM passes this to the chat template; Qwen3.8 knows low | medium | xhigh.
+                body["chat_template_kwargs"] = {
+                    "reasoning_effort": "xhigh" if effort == "high" else effort}
         return body
 
     def _request(self, messages, stream):
@@ -80,6 +102,16 @@ class LLMClient(object):
         "content" or "reasoning". `cancel` is a threading.Event; when it is set
         the stream is abandoned and whatever arrived so far is returned.
         """
+        try:
+            return self._chat(messages, on_delta, cancel)
+        except LLMError as e:
+            # OpenAI and vLLM accept only low | medium | high here; retry without it.
+            if e.status == 400 and self.send_effort and "reasoning_effort" in str(e):
+                self.send_effort = False
+                return self._chat(messages, on_delta, cancel)
+            raise
+
+    def _chat(self, messages, on_delta, cancel):
         if self.cfg.stream:
             return self._chat_stream(messages, on_delta, cancel)
         return self._chat_once(messages, on_delta)
@@ -97,14 +129,18 @@ class LLMClient(object):
         details = usage.get("completion_tokens_details") or {}
         elapsed = time.time() - started
         finish = choice.get("finish_reason")
+        calls = [{"id": c.get("id") or "", "name": (c.get("function") or {}).get("name") or "",
+                  "arguments": (c.get("function") or {}).get("arguments") or ""}
+                 for c in message.get("tool_calls") or []]
         return self._close(text, finish), Usage(
             usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
-            details.get("reasoning_tokens", 0), finish, elapsed, elapsed)
+            details.get("reasoning_tokens", 0), finish, elapsed, elapsed, calls)
 
     def _chat_stream(self, messages, on_delta, cancel=None):
         started = time.time()
         ttft = 0.0
         parts, reasoning_chars, chunks = [], 0, 0
+        calls = {}                     # index -> {"id", "name", "arguments"}
         prompt_tokens = completion_tokens = reasoning_tokens = 0
         finish = None
         with self._request(messages, True) as response:
@@ -140,6 +176,19 @@ class LLMClient(object):
                             ttft = time.time() - started
                         if on_delta:
                             on_delta("reasoning", thought)
+                    for call in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(call.get("index", len(calls)),
+                                                {"id": "", "name": "", "arguments": ""})
+                        function = call.get("function") or {}
+                        slot["id"] = call.get("id") or slot["id"]
+                        slot["name"] += function.get("name") or ""
+                        fragment = function.get("arguments") or ""
+                        slot["arguments"] += fragment
+                        chunks += 1
+                        if ttft == 0.0:
+                            ttft = time.time() - started
+                        if on_delta:
+                            on_delta("tool", fragment)
                     if piece:
                         chunks += 1
                         if ttft == 0.0:
@@ -153,7 +202,8 @@ class LLMClient(object):
         if not reasoning_tokens and reasoning_chars:
             reasoning_tokens = max(1, reasoning_chars // 4)
         return self._close("".join(parts), finish), Usage(
-            prompt_tokens, completion_tokens, reasoning_tokens, finish, ttft, elapsed)
+            prompt_tokens, completion_tokens, reasoning_tokens, finish, ttft, elapsed,
+            [calls[i] for i in sorted(calls)])
 
     @staticmethod
     def _close(text, finish=None):

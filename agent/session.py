@@ -15,7 +15,7 @@ History layout:
 import os
 
 from .jobs import JobRunner
-from .protocol import PLAN_HEADER, build_system, wrap_tool_response
+from .protocol import NATIVE, PLAN_HEADER, build_system, wrap_tool_response
 from .secrets import collect_env, register
 
 CHARS_PER_TOKEN = 3.4      # starting guess, calibrated against the server
@@ -31,7 +31,8 @@ class Session(object):
         self.secret_names = sorted(env_secrets)
         self.messages = [{"role": "system",
                           "content": build_system(tools, self.cwd,
-                                                  secret_names=self.secret_names)}]
+                                                  secret_names=self.secret_names,
+                                                  dialect=cfg.dialect)}]
         self.goal = ""
         self.has_plan = False
         self.plan_text = ""
@@ -39,6 +40,7 @@ class Session(object):
         self.cropped = False           # flag that forces a goal reminder
         self.crops = 0
         self.tool_role = "tool"
+        self.pending_call = None       # id of a structured call still owed a result
         self.jobs = JobRunner()
 
     # --------------------------------------------------------------- basics
@@ -60,6 +62,7 @@ class Session(object):
         plan = self.plan_text if keep_plan else ""
         dropped = len(self.messages) - 1
         self.messages = self.messages[:1]
+        self.pending_call = None
         self.has_plan = False
         self.plan_text = plan
         self.goal = ""
@@ -73,11 +76,35 @@ class Session(object):
         if self.has_plan:
             self.messages[2] = {"role": "user", "content": PLAN_HEADER + text}
 
-    def add_assistant(self, text):
-        if text:
+    @property
+    def native(self):
+        return getattr(self.cfg, "dialect", None) == NATIVE
+
+    def add_assistant(self, text, call=None):
+        """`call` is a structured tool call {"id", "name", "arguments"} of the
+        openai dialect. Only the one that gets run is recorded: every recorded
+        call must be answered by a tool message with the same id."""
+        if call is not None:
+            call_id = call.get("id") or "call_%d" % len(self.messages)
+            self.messages.append({"role": "assistant", "content": text or "", "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": call.get("name") or "",
+                             "arguments": call.get("arguments") or "{}"}}]})
+            self.pending_call = call_id
+        elif text:
             self.messages.append({"role": "assistant", "content": text})
 
-    def add_observation(self, text):
+    def add_observation(self, text, answers_call=True):
+        """`answers_call=False` for text that is not the result of the last call
+        (background results) - in the openai dialect it must not take its id."""
+        if self.native:
+            if self.pending_call and answers_call:
+                self.messages.append({"role": "tool", "tool_call_id": self.pending_call,
+                                      "content": text})
+                self.pending_call = None
+            else:
+                self.messages.append({"role": "user", "content": text})
+            return
         message = {"role": self.tool_role, "content": wrap_tool_response(text)}
         if self.tool_role == "tool":
             message["tool_call_id"] = "c%d" % len(self.messages)
@@ -118,6 +145,11 @@ class Session(object):
         tail = self.cfg.keep_tail
         if len(self.messages) <= head + tail + 1:
             return 0
+        if self.native:
+            # A tool message must follow the assistant message carrying its call,
+            # so the kept tail may not start with an orphaned result.
+            while tail > 1 and self.messages[-tail].get("role") == "tool":
+                tail -= 1
         cut = self.messages[head:-tail]
         dropped = sum(len(m.get("content") or "") for m in cut)
         self.messages[head:-tail] = [{

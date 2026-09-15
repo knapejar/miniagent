@@ -3,6 +3,8 @@
 import argparse
 import os
 
+from .protocol import dialect_for
+
 
 class Config(object):
     """Everything that shapes a run. Built from command line arguments."""
@@ -11,6 +13,11 @@ class Config(object):
         self.url = kw.get("url", os.getenv("MINIAGENT_URL", "http://127.0.0.1:1234/v1"))
         self.model = kw.get("model", os.getenv("MINIAGENT_MODEL", "spark-x2.5-4b"))
         self.api_key = kw.get("api_key", os.getenv("MINIAGENT_KEY", "lmstudio"))
+        # Which text format the model was trained to call tools in. Guessed from
+        # the model name, because getting it wrong costs every single step.
+        self.dialect = kw.get("dialect", "auto")
+        if self.dialect == "auto":
+            self.dialect = dialect_for(self.model)
 
         self.workdir = kw.get("workdir", ".")
         self.ctx = kw.get("ctx", 65536)
@@ -59,6 +66,10 @@ def parse_args(argv=None):
     g.add_argument("--api-key", default=os.getenv("MINIAGENT_KEY", "lmstudio"))
     g.add_argument("--effort", choices=["default", "none", "low", "medium", "high"],
                    default="none", help="reasoning_effort (default: none)")
+    g.add_argument("--dialect", choices=["auto", "spark", "nanbeige", "openai"],
+                   default=os.getenv("MINIAGENT_DIALECT", "auto"),
+                   help="tool-call format: spark | nanbeige text formats, or openai = "
+                        "standard function calling (default: guessed from the model name)")
     g.add_argument("--temperature", type=float, default=1.0)
     g.add_argument("--top-p", type=float, default=0.95)
     g.add_argument("--max-tokens", type=int, default=8192)
@@ -89,6 +100,7 @@ def parse_args(argv=None):
     cfg = Config(url=a.url, model=a.model, api_key=a.api_key, workdir=a.workdir,
                  ctx=a.ctx, max_steps=a.max_steps, max_tokens=a.max_tokens,
                  temperature=a.temperature, top_p=a.top_p, effort=a.effort,
+                 dialect=a.dialect,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
                  approve=a.approve, stream=not a.no_stream, color=not a.no_color,
                  show_reasoning=a.show_reasoning, redact=not a.no_redact,

@@ -16,6 +16,9 @@ BULLET = "●"
 ELBOW = "⎿"
 
 
+THOUGHT_INDENT = "  "
+
+
 class Spinner(object):
     """Live line while generating: frame, tokens, tokens/s, elapsed."""
 
@@ -68,6 +71,7 @@ class Renderer(object):
         self._mode = None          # None = undecided yet, then "text" or "tool"
         self._tokens = 0
         self._reasoning = 0
+        self._thinking = False
         self._t0 = time.time()
         self._md = MarkdownStream(self.s, self._emit)
 
@@ -89,7 +93,15 @@ class Renderer(object):
         if kind == "reasoning":
             self._reasoning += 1
             if self.cfg.show_reasoning:
-                self._emit(self.s.grey(piece))
+                self._thought(piece)
+            return
+        self._end_thought()
+        if kind == "tool":                         # arguments of a structured call
+            if self._mode == "text":
+                self._emit("\n")
+                self.spinner = Spinner(self.s, self.lock, self._label)
+                self.spinner.start()
+            self._mode = "tool"
             return
         self._buf += piece
         if self._mode is None:
@@ -111,6 +123,27 @@ class Renderer(object):
                 return
             self._md.feed(piece)
 
+    def _thought(self, piece):
+        """The thought and the spinner share one line and the spinner rewrites
+        that line every 100 ms, so it has to go before a word is printed -
+        otherwise clear_line() eats the reasoning as fast as it arrives."""
+        if not self._thinking:
+            self._thinking = True
+            self._stop_spinner()
+            self._emit(self.s.dim("  thinking") + "\n" + THOUGHT_INDENT)
+        self._emit(self.s.grey(piece.replace("\n", "\n" + THOUGHT_INDENT)))
+
+    def _end_thought(self, resume=True):
+        """Called when the reply proper starts, or when the turn ends thinking
+        and nothing else. Idempotent - every content chunk goes through it."""
+        if not self._thinking:
+            return
+        self._thinking = False
+        self._emit("\n")
+        if resume:
+            self.spinner = Spinner(self.s, self.lock, self._label)
+            self.spinner.start()
+
     def _emit(self, text):
         with self.lock:
             sys.stdout.write(text)
@@ -131,6 +164,7 @@ class Renderer(object):
         self.step_begin(d["n"], d["max"])
 
     def _ev_usage(self, d):
+        self._end_thought(resume=False)
         self._stop_spinner()
 
     def _ev_tool_call(self, d):
@@ -200,7 +234,8 @@ class Renderer(object):
         print("  " + s.cyan("▐▛███▜▌") + "   " + s.bold("miniagent") + s.dim(" 0.2.0"))
         print(" " + s.cyan("▝▜█████▛▘") + "  " + s.dim("an agent for local models"))
         print()
-        print("  " + s.dim("model    ") + self.cfg.model + s.dim("   @ " + self.cfg.url))
+        print("  " + s.dim("model    ") + self.cfg.model +
+              s.dim("   @ %s   calls: %s" % (self.cfg.url, self.cfg.dialect)))
         print("  " + s.dim("context  ") + human_tokens(self.cfg.ctx) +
               s.dim("   crop at %d%%   reasoning: %s   max steps: %d"
                     % (int(self.cfg.crop_at * 100), self.cfg.effort, self.cfg.max_steps)))
