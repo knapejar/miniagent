@@ -49,8 +49,8 @@ your account if you haven't; free tier includes ~20 TPU hours/week).
 ```bash
 # 1. Kaggle CLI + API token (one-time)
 pip install kaggle
-# kaggle.com → Settings → API → Create New Token, then place the file:
-#   Linux/macOS: ~/.kaggle/kaggle.json     Windows: %USERPROFILE%\.kaggle\kaggle.json
+kaggle auth login            # browser login; or kaggle.com → Settings → API → Generate New Token
+                             # and save it to ~/.kaggle/access_token (Windows: %USERPROFILE%\.kaggle\access_token)
 
 # 2. Get this repo and launch
 git clone https://github.com/ARahim3/kaggle-tpu-lab
@@ -95,6 +95,67 @@ python launch.py serve --keepalive-min 120                       # auto-stop aft
 python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 ```
+
+### Tunnels, control channels and SSH
+
+Every launch opens its tunnels in the first seconds of the kernel (before the runtime
+installs), and every tunnel points at a small **front server** inside the kernel, not at
+vLLM directly. The front server forwards the OpenAI/Anthropic API to vLLM and answers its
+own control routes, so **a live tunnel is always also a command channel** — while vLLM
+compiles, after it crashed, or when a later step failed.
+
+| Tunnel | Needs | Port | Carries |
+|---|---|---|---|
+| **ngrok** | free account + static domain | 443 | API + control, URL never changes |
+| **cloudflared** quick tunnel | nothing | **7844** (blocked on some networks) | API + control |
+| **pinggy** (SSH reverse tunnel) | nothing | 443 | API + control, URL rotates every 60 min |
+| **cloudflared-ssh** | nothing | 7844 on the kernel side, 443 on yours | SSH to the kernel |
+| **pinggy-ssh** (TCP) | nothing | 443 | SSH to the kernel |
+
+```bash
+python launch.py proxy       # http://127.0.0.1:8080/v1, any API key; follows whichever tunnel is live
+python launch.py shell       # status | log 100 | tunnel | sh <cmd> | stop
+python launch.py cmd sh "free -g; ps aux | grep vllm"
+python launch.py ssh         # root shell in the kernel (cloudflared first, then pinggy)
+python launch.py ssh --via pinggy nvidia-smi   # any remote command
+```
+
+How the launcher reaches the kernel, in order:
+
+1. **HTTPS to a known tunnel** (`/ktl/cmd`, `/ktl/tunnels`, authenticated with the launch's
+   API key). The launcher stores every tunnel URL it has seen in `~/.kaggle-tpu-lab.json`.
+2. **ntfy.sh** as the fallback (commands on a secret topic, replies on the progress topic).
+   ntfy.sh is a free shared service and rate-limits busy IPs — on 2026-09-15 it stopped
+   delivering to a TPU kernel mid-session, which is why it is no longer the primary channel.
+3. **SSH**: `serve` and `nettest` create `~/.kaggle-tpu-lab/id_ed25519` once and put its
+   public key into the kernel config; the kernel installs `openssh-server` if needed and runs
+   `sshd` on `127.0.0.1:2222` behind its own tunnels. `launch.py ssh` downloads a local
+   `cloudflared` once for `cloudflared access ssh` (plain HTTPS). `--no-ssh` turns it off.
+
+Front-server routes (all behind any API tunnel):
+
+| Route | Auth | Answer |
+|---|---|---|
+| `GET /ktl/health` | none | `{"ktl": true, "server": <vLLM up>, "phase": ..., "uptime": ...}` |
+| `GET /ktl/tunnels` | `Authorization: Bearer <api key>` | every tunnel with its URL and status |
+| `POST /ktl/cmd` | same | body = command (`status`, `log 80`, `tunnel`, `sh <cmd>`, `stop`) → `{"rc", "out"}` |
+| anything else | vLLM checks the key | forwarded to vLLM on `127.0.0.1:8001`, streaming |
+
+For a URL that never changes, claim the free static domain in the ngrok dashboard:
+
+```bash
+export NGROK_URL="https://<name>.ngrok-free.dev"     # Windows: setx NGROK_URL https://...
+export NGROK_AUTHTOKEN="<token>"
+python launch.py nettest     # ~5 min CPU session, no TPU queue: checks every tunnel, the channels and SSH
+python launch.py serve       # ngrok is the primary endpoint, the others stay as backups
+python launch.py cmd tunnel ngrok https://<name>.ngrok-free.dev <authtoken>   # or add it to a running session
+```
+
+If vLLM dies while serving, the kernel restarts it in place (same TPU session, cached
+graphs, ~20 min) up to `server_restarts` times (default 3). If a startup step fails, the
+session is held for `--debug-hold-min` (default 30) so you can look around with `shell`
+or `ssh` instead of losing the TPU slot. See [docs/operations.md](docs/operations.md) for
+the recovery runbook and the incidents behind these changes.
 
 
 ## Using it with coding agents
@@ -141,7 +202,8 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 ## What's actually in this repo
 
 ```
-launch.py                        the CLI: serve / status / stop, with live progress
+launch.py                        the CLI: serve / status / shell / cmd / ssh / proxy / nettest / stop
+docs/operations.md               control channels, SSH, recovery runbook, incident notes
 kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
@@ -182,7 +244,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
 - **One TPU session at a time** per Kaggle account, sessions cap at 9 h, free quota is
   ~20 TPU-hours/week. The server auto-stops after `--keepalive-min` so a forgotten
   session doesn't eat your quota.
-- **The endpoint is public** (random cloudflared URL) but protected by the generated
+- **The endpoint is public** (random tunnel URLs) but protected by the generated
   API key. Treat the URL+key pair like a secret; a new launch gets fresh ones.
 - **Prefix caching is off for now**: vllm-tpu 0.28.0 deliberately disables automatic
   prefix caching for hybrid linear-attention models on TPU. Upstream merged the fix
@@ -212,6 +274,16 @@ folder in the Kaggle UI (Output tab → New Dataset).
   acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
   than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.
+- **Two vLLM 0.28.0 engine crashes with MTP are patched at runtime.** With several clients
+  on one server the scheduler received draft tokens as a tuple (`AttributeError:
+  __delitem__`), and a request with structured output handed xgrammar a JAX array sharded
+  over 8 chips (`BufferError: to_dlpack ...`). Either killed the engine. The kernel now turns
+  drafts into plain ints in `vllm/v1/core/sched/scheduler.py` right after install (marker
+  `KTL fix v2`), and restarts vLLM if it still dies.
+- **Claude Code works through `launch.py proxy`.** Claude Code sends
+  `output_config.effort: "high"`; Qwen3.8's template only knows `xhigh | medium | low`, so the
+  proxy maps `high -> medium` and `max -> xhigh`. Point Claude Code at the proxy
+  (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`), not at a raw tunnel.
 - **Harmless log noise.** vLLM prints a few scary-looking lines on every TPU start:
   `Unable to poll the TPU GCE Metadata` (Kaggle isn't a GCE VM), `Failed to import
   from vllm._C` (that's the CUDA extension), `Triton ... 0 active driver(s)`, and

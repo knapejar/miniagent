@@ -11,30 +11,51 @@ Steps (each one is announced in the log):
   2/6  cache    — restore the pre-built XLA compile cache from the env dataset
   3/6  weights  — find the mounted weights dataset (or download from HF to /tmp)
   4/6  server   — start vLLM (TP=8, text-only, MTP speculative decoding)
-  5/6  tunnel   — open a public cloudflared URL (printed before the server is
-                  live so you can prepare your client)
+  5/6  tunnel   — open public URLs: ngrok (static domain, if configured), a
+                  cloudflared quick tunnel and a pinggy SSH tunnel over port 443
+                  (no account, URL rotates hourly); each one is probed
   6/6  ready    — READY banner + self-test, then keep serving until
                   keepalive_min elapses
+
+Control channels, independent of the model server:
+  * the front server: every tunnel points at a small HTTP server in this script
+    (:8000) that forwards the API to vLLM (:8001) and answers /ktl/health,
+    /ktl/tunnels and /ktl/cmd itself - so a live tunnel is also a command channel,
+    even while vLLM is down, restarting or crashed;
+  * SSH: with ssh_pubkey set, sshd listens on 127.0.0.1:2222 behind its own
+    cloudflared (ssh://) and pinggy (tcp) tunnels - `launch.py ssh`;
+  * ntfy: commands published to ntfy.sh/<ntfy_cmd_topic> run too and reply on the
+    progress topic. ntfy.sh rate-limits busy IPs, so it is the fallback, not the
+    primary channel.
+On a failure the session is held for debug_hold_min so you can look around.
 
 With both datasets attached the endpoint is live in ~22 minutes (~12 with
 text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15 min).
 """
 import base64
 import collections
+import io
+import platform
 import struct
+import tarfile
+import traceback
 import zlib
 import glob
 import gzip
+import http.client
+import http.server
 import importlib.util
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -64,6 +85,20 @@ DEFAULTS = {
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
+    "ntfy_cmd_topic": "",          # optional: accept commands from ntfy.sh/<topic> (keep it secret)
+    "debug_hold_min": 30,          # on failure keep the session alive this long (needs ntfy_cmd_topic)
+    "server_restarts": 3,          # vLLM dying while serving is restarted in place (same TPU
+                                   # session, cached graphs, ~20 min) up to this many times
+    "ngrok_url": "",               # e.g. https://name.ngrok-free.dev (your free static domain)
+    "ngrok_authtoken": "",         # or env / Kaggle secret NGROK_AUTHTOKEN
+    "ngrok_pooling": True,         # --pooling-enabled: a stale agent can't block the URL
+    "cloudflared": True,           # also open a trycloudflare quick tunnel as a backup URL
+    "cloudflared_protocol": "http2",  # TCP 7844 (quic = UDP 7844); either port may be blocked,
+                                      # which is why ngrok (plain 443) is the primary tunnel
+    "pinggy": True,                # no-account fallback: ssh -p 443 a.pinggy.io (free tunnels
+                                   # expire after 60 min; the watchdog reconnects, new URL)
+    "net_test": False,             # CPU smoke test: dummy HTTP server + tunnels + command channel
+    "ssh_pubkey": "",              # authorized key for root; enables sshd behind its own tunnels
     "served_model_name": "qwen3.8-27b",
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
@@ -76,13 +111,19 @@ if _cfg_file.exists():
 if not CFG["api_key"]:
     CFG["api_key"] = "sk-" + secrets.token_hex(16)
 
-PORT = 8000
+PORT = 8000                          # front server: what every tunnel points at
+VLLM_PORT = 8001                     # vLLM itself, reached through the front server
+SSH_PORT = 2222
 VENV = "/tmp/venv"
 PY = f"{VENV}/bin/python"
 XLA_CACHE = "/tmp/xla_cache"
 WORK = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path("/tmp")
 RAW_LOG = WORK / "vllm.log"          # every line vLLM/pip print, for debugging
 CLOUDFLARED = Path("/tmp/cloudflared")
+NGROK = Path("/tmp/ngrok")
+ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
+        "arm64": "arm64"}.get(platform.machine().lower(), "amd64")
+CMD_TIMEOUT = 300                    # seconds a `sh` command from the channel may run
 T0 = time.time()
 PY_VER = f"{sys.version_info.major}.{sys.version_info.minor}"
 
@@ -116,19 +157,64 @@ def banner(step, title, note=""):
     log("=" * 70)
 
 
-def publish(phase, **extra):
-    """Progress event: always logged; also pushed to ntfy if a topic is set."""
-    log(f"PHASE {phase}", json.dumps(extra) if extra else "")
+STATE = {"phase": "boot"}
+
+
+def ntfy_send(payload):
+    """Push one JSON event to the progress topic (ntfy.sh caps a message at 4 KB)."""
     if not CFG["ntfy_topic"]:
         return
     try:
-        body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}",
-                "message": json.dumps({"phase": phase, **extra})}
+        body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {payload['phase']}",
+                "message": json.dumps(payload)}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log(f"(ntfy publish failed: {e})")
+
+
+def publish(phase, **extra):
+    """Progress event: always logged; also pushed to ntfy if a topic is set."""
+    STATE["phase"] = phase
+    log(f"PHASE {phase}", json.dumps(extra) if extra else "")
+    ntfy_send({"phase": phase, **extra})
+
+
+def log_tail(n):
+    try:
+        with open(RAW_LOG, errors="ignore") as f:
+            return "".join(collections.deque(f, maxlen=n))
+    except OSError as e:
+        return f"(cannot read {RAW_LOG}: {e})"
+
+
+def hold_for_debug():
+    """Keep the Kaggle session (and the command channel) alive for a post-mortem."""
+    mins = CFG["debug_hold_min"] if CFG["ntfy_cmd_topic"] else 0
+    if mins > 0:
+        publish("hold", minutes=mins)
+        log(f"   holding the session {mins} min for debugging — send commands via ntfy "
+            "(status / log / sh <cmd> / stop)")
+        time.sleep(mins * 60)
+
+
+def fail(step, **extra):
+    extra.setdefault("tail", log_tail(40)[-2500:])
+    publish("failed", step=step, **extra)
+    hold_for_debug()
+    sys.exit(1)
+
+
+def _excepthook(tp, val, tb):
+    txt = "".join(traceback.format_exception(tp, val, tb))
+    log(txt)
+    publish("failed", step="exception", tail=txt[-2500:])
+    hold_for_debug()
+    os._exit(1)
+
+
+sys.excepthook = _excepthook
 
 
 def sh(cmd, tag, show=None, env=None):
@@ -163,16 +249,605 @@ def find_input(*patterns):
     return None
 
 
+def install_binary(dest, fetch):
+    """Write to a private temp file, then rename: a half-written or concurrently
+    written binary can never end up at `dest`."""
+    part = Path(f"{dest}.part-{threading.get_ident()}")
+    try:
+        fetch(part)
+        part.chmod(0o755)
+        os.replace(part, dest)
+        return True
+    except Exception as e:
+        log(f"({dest.name} install failed: {e})")
+        part.unlink(missing_ok=True)
+        return False
+
+
 def fetch_cloudflared():
     if CLOUDFLARED.exists():
-        return
+        return True
+    return install_binary(CLOUDFLARED, lambda p: urllib.request.urlretrieve(
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+        f"cloudflared-linux-{ARCH}", p))
+
+
+def fetch_ngrok():
+    if NGROK.exists():
+        return True
+
+    def get(part):
+        url = f"https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-{ARCH}.tgz"
+        with urllib.request.urlopen(url, timeout=120) as r:
+            data = r.read()
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            part.write_bytes(tf.extractfile("ngrok").read())
+    return install_binary(NGROK, get)
+
+
+# ---------------- tunnels ----------------
+TUNNELS = {}   # name -> {url, state, note, probe, proc, cmd, env, parse, restarts}
+
+
+def ngrok_authtoken():
+    tok = CFG["ngrok_authtoken"] or os.environ.get("NGROK_AUTHTOKEN", "")
+    if tok or not os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return tok
+    box = []
+
+    def from_kaggle_secrets():   # notebook flow: Add-ons -> Secrets -> NGROK_AUTHTOKEN
+        try:
+            from kaggle_secrets import UserSecretsClient
+            box.append(UserSecretsClient().get_secret("NGROK_AUTHTOKEN"))
+        except Exception:
+            pass
+    th = threading.Thread(target=from_kaggle_secrets, daemon=True)
+    th.start()
+    th.join(20)
+    return box[0] if box else ""
+
+
+def _spawn(t):
+    t["state"], t["note"], t["probe"] = "starting", "", ""
+    t["proc"] = subprocess.Popen(t["cmd"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, text=True, env=t["env"])
+
+    def pump(proc=t["proc"]):
+        for line in proc.stdout:
+            _raw.write(f"[{t['name']}] {line}")
+            t["parse"](t, line.strip())
+    threading.Thread(target=pump, daemon=True).start()
+    TUNNELS[t["name"]] = t
+    return t
+
+
+def start_ngrok():
+    url = CFG["ngrok_url"].strip().rstrip("/")
+    if not url:
+        return None
+    if not url.startswith("http"):
+        url = "https://" + url
+    tok = ngrok_authtoken()
+    if not tok:
+        log("   ngrok_url is set but there is no authtoken (config ngrok_authtoken, env or "
+            "Kaggle secret NGROK_AUTHTOKEN) -> skipping ngrok")
+        return None
+    if not fetch_ngrok():
+        return None
+    cmd = [str(NGROK), "http", str(PORT), "--url", url, "--log", "stdout", "--log-format", "json"]
+    if CFG["ngrok_pooling"]:
+        cmd.append("--pooling-enabled")
+
+    def parse(t, line):
+        try:
+            j = json.loads(line)
+        except ValueError:
+            j = {}
+        if j.get("msg") == "started tunnel":
+            t["state"], t["note"] = "online", ""
+        elif "ERR_NGROK" in line or j.get("lvl") in ("eror", "crit"):
+            t["state"] = "error"
+            t["note"] = str(j.get("err") or j.get("msg") or line)[:300]
+    # token via env, not argv, so it doesn't show up in `ps`
+    return _spawn({"name": "ngrok", "url": url, "cmd": cmd, "parse": parse, "restarts": 0,
+                   "env": {**os.environ, "NGROK_AUTHTOKEN": tok}})
+
+
+def port_open(port, host="127.0.0.1", timeout=1.0):
     try:
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            CLOUDFLARED)
-        CLOUDFLARED.chmod(0o755)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def start_cloudflared(name="cloudflared", target=None):
+    if not CFG["cloudflared"] or not fetch_cloudflared():
+        return None
+    target = target or f"http://127.0.0.1:{PORT}"
+    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+    def parse(t, line):
+        m = pat.search(line)
+        if m and not t["url"]:
+            t["url"] = m.group(0)
+        if "Registered tunnel connection" in line:
+            t["state"], t["note"] = "online", ""
+        elif " ERR " in line and t["state"] != "online":
+            t["note"] = line[-300:]
+    return _spawn({"name": name, "url": None, "parse": parse, "restarts": 0,
+                   "env": None,
+                   "cmd": [str(CLOUDFLARED), "tunnel", "--url", target,
+                           "--no-autoupdate", "--protocol", CFG["cloudflared_protocol"]]})
+
+
+def ensure_ssh():
+    if shutil.which("ssh"):
+        return shutil.which("ssh")
+    log("   ssh client missing -> apt-get install openssh-client")
+    for cmd in (["apt-get", "update", "-qq"],
+                ["apt-get", "install", "-y", "-qq", "--no-install-recommends", "openssh-client"]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=240,
+                           env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+        except Exception as e:
+            log(f"   ({' '.join(cmd[:2])} failed: {e})")
+    return shutil.which("ssh")
+
+
+def start_pinggy(name="pinggy", port=None, tcp=False):
+    """Reverse SSH tunnel over port 443: needs no account and no port but 443, so it
+    survives networks that block cloudflared's 7844. Free tunnels last 60 min; the
+    watchdog reconnects and publishes the new URL."""
+    if not CFG["pinggy"]:
+        return None
+    ssh = ensure_ssh()
+    if not ssh:
+        log("   no ssh client -> skipping pinggy")
+        return None
+    if tcp:
+        pat = re.compile(r"tcp://[a-z0-9.-]+:\d+")
+    else:
+        pat = re.compile(r"https://[a-z0-9-]+\.(?:[a-z0-9-]+\.)*(?:pinggy\.net|pinggy-free\.link|pinggy\.link)")
+
+    def parse(t, line):
+        m = pat.search(line)
+        if m and not t["url"] and "dashboard." not in m.group(0):
+            t["url"], t["state"], t["note"] = m.group(0), "online", ""
+        elif "expire" in line or "denied" in line.lower() or "error" in line.lower():
+            t["note"] = line[-200:]
+    return _spawn({"name": name, "url": None, "parse": parse, "restarts": 0, "env": None,
+                   "cmd": [ssh, "-p", "443", "-T", "-o", "StrictHostKeyChecking=no",
+                           "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=30",
+                           "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes",
+                           "-o", "ConnectTimeout=20",
+                           "-R", f"0:127.0.0.1:{port or PORT}",
+                           ("tcp@a.pinggy.io" if tcp else "a.pinggy.io")]})
+
+
+def http_get(url, headers=None, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": "kaggle-tpu-lab", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(600).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(600).decode("utf-8", "ignore")
     except Exception as e:
-        log(f"(cloudflared download failed: {e})")
+        return None, str(e)[:200]
+
+
+def probe_tunnel(t):
+    """Request the public URL from inside the kernel: tells a working tunnel in
+    front of a not-yet-started server apart from a broken tunnel."""
+    if t["proc"].poll() is not None:
+        v = f"exited rc={t['proc'].returncode} {t['note']}".strip()
+    elif not t["url"]:
+        v = f"no URL yet {t['note']}".strip()
+    elif t["name"].endswith("-ssh"):
+        v = t["state"]                      # sshd behind it; nothing to GET
+    else:
+        code, body = http_get(t["url"] + "/ktl/health", {"ngrok-skip-browser-warning": "1"})
+        try:
+            health = json.loads(body) if code == 200 else {}
+        except ValueError:
+            health = {}
+        if health.get("ktl"):
+            v = "live" if health.get("server") else "tunnel-ok (server not up yet)"
+        else:
+            v = f"broken (HTTP {code}: {' '.join(body.split())[:160]})"
+    t["probe"] = v
+    return v
+
+
+def primary_url():
+    rank = lambda t: 0 if t["probe"] == "live" else 1 if t["probe"].startswith("tunnel-ok") else 2
+    ok = sorted((t for t in TUNNELS.values() if t["url"] and not t["name"].endswith("-ssh")),
+                key=rank)   # stable: ngrok first
+    return ok[0]["url"] if ok else None
+
+
+def tunnel_summary():
+    return {n: {"url": t["url"], "status": t["probe"] or t["state"]} for n, t in TUNNELS.items()}
+
+
+WATCHDOG = []
+
+
+def start_watchdog():
+    if not WATCHDOG:
+        WATCHDOG.append(threading.Thread(target=tunnel_watchdog, daemon=True))
+        WATCHDOG[0].start()
+
+
+def tunnel_watchdog():
+    while True:
+        time.sleep(20)
+        for t in list(TUNNELS.values()):
+            if t["proc"].poll() is None or TUNNELS.get(t["name"]) is not t:
+                continue          # alive, or replaced by a `tunnel <name>` command
+            t["restarts"] += 1
+            log(f"   {t['name']} exited (rc={t['proc'].returncode}) {t['note']} -> restarting")
+            # pinggy's free tunnel ends every 60 min by design: reconnect right away
+            time.sleep(3 if t["name"].startswith("pinggy") else min(300, 10 * t["restarts"]))
+            if t["name"].startswith(("cloudflared", "pinggy")):
+                t["url"] = None           # these get a new URL on every start
+            _spawn(t)
+            for _ in range(60):
+                if t["url"] and t["state"] != "starting":
+                    break
+                time.sleep(2)
+            probe_tunnel(t)
+            publish("tunnel-restart", name=t["name"], restarts=t["restarts"],
+                    endpoint=(t["url"] if t["name"].endswith("-ssh") else f"{t['url']}/v1")
+                    if t["url"] else None, status=t["probe"], tunnels=tunnel_summary())
+
+
+def start_sshd():
+    """Root sshd on 127.0.0.1:SSH_PORT for the launcher's key only."""
+    if not CFG["ssh_pubkey"]:
+        return False
+    sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+    if not sshd:
+        log("   sshd missing -> apt-get install openssh-server")
+        env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        for cmd in (["apt-get", "install", "-y", "-qq", "--no-install-recommends", "openssh-server"],
+                    ["apt-get", "update", "-qq"],
+                    ["apt-get", "install", "-y", "-qq", "--no-install-recommends", "openssh-server"]):
+            try:
+                if subprocess.run(cmd, capture_output=True, timeout=300, env=env).returncode == 0 \
+                        and cmd[1] == "install":
+                    break
+            except Exception as e:
+                log(f"   ({' '.join(cmd[:2])} failed: {e})")
+        sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+    if not sshd:
+        log("   no sshd -> SSH channel off")
+        return False
+    home = Path(os.path.expanduser("~"))
+    (home / ".ssh").mkdir(mode=0o700, exist_ok=True)
+    keys = home / ".ssh" / "authorized_keys"
+    keys.write_text(CFG["ssh_pubkey"].strip() + "\n")
+    keys.chmod(0o600)
+    Path("/run/sshd").mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ssh-keygen", "-A"], capture_output=True)
+    log_fh = open(WORK / "sshd.log", "a")
+    subprocess.Popen([sshd, "-D", "-e", "-p", str(SSH_PORT), "-o", "ListenAddress=127.0.0.1",
+                      "-o", "PasswordAuthentication=no", "-o", "PermitRootLogin=prohibit-password",
+                      "-o", "AllowTcpForwarding=yes", "-o", "ClientAliveInterval=30"],
+                     stdout=log_fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    for _ in range(20):
+        if port_open(SSH_PORT):
+            return True
+        time.sleep(0.5)
+    log("   sshd did not start (see sshd.log)")
+    return False
+
+
+def open_tunnels(wait_s=150):
+    starters = [("ngrok", start_ngrok), ("cloudflared", start_cloudflared),
+                ("pinggy", start_pinggy)]
+    try:
+        if start_sshd():
+            starters += [("cloudflared-ssh",
+                          lambda: start_cloudflared("cloudflared-ssh", f"ssh://127.0.0.1:{SSH_PORT}")),
+                         ("pinggy-ssh", lambda: start_pinggy("pinggy-ssh", SSH_PORT, tcp=True))]
+    except Exception as e:
+        log(f"   ssh channel error: {e}")
+    for name, start in starters:
+        if name in TUNNELS:       # already started from the command channel
+            continue
+        try:
+            start()
+        except Exception as e:
+            log(f"   tunnel start error: {e}")
+    if not TUNNELS:
+        publish("tunnel-failed", note=f"no tunnel could be started; server only on :{PORT} "
+                                      "inside the kernel (command channel still works)")
+        return None
+    t0 = time.time()
+    while time.time() < t0 + wait_s and any(
+            t["state"] == "starting" and t["proc"].poll() is None for t in TUNNELS.values()):
+        # one working tunnel is enough to announce; don't wait out a blocked one
+        if time.time() > t0 + 45 and any(t["state"] == "online" for t in TUNNELS.values()):
+            break
+        time.sleep(2)
+    time.sleep(3)
+    for t in list(TUNNELS.values()):
+        log(f"   {t['name']:<15} {t['url'] or '-'}  -> {probe_tunnel(t)}")
+    start_watchdog()
+    url = primary_url()
+    publish("tunnel-url", endpoint=f"{url}/v1" if url else None, tunnels=tunnel_summary())
+    return url
+
+
+# ---------------- command channel (ntfy) ----------------
+HELP = """commands:
+  status             server + tunnel state
+  log [N]            last N lines of vllm.log (default 60)
+  tunnel [restart]   probe tunnels / restart them
+  tunnel pinggy      (re)start the pinggy tunnel (port 443, no account)
+  tunnel ngrok <url> <authtoken>   start ngrok with your static domain right now
+  sh <command>       run a shell command (unknown words run as shell too)
+  stop               stop the server and end the Kaggle session"""
+
+
+def shutdown(rc):
+    """Terminate the server and every tunnel, then exit from any thread."""
+    procs = [globals().get("server")] + [t["proc"] for t in TUNNELS.values()]
+    for p in procs:
+        if p is not None and p.poll() is None:
+            p.terminate()
+    time.sleep(3)
+    os._exit(rc)
+
+
+def status_text():
+    srv = globals().get("server")
+    code, _ = http_get(f"http://127.0.0.1:{VLLM_PORT}/v1/models",
+                       {"Authorization": f"Bearer {CFG['api_key']}"}, timeout=5)
+    lines = [f"uptime {elapsed()}, last phase: {STATE['phase']}",
+             "server: " + ("not started" if srv is None else "running" if srv.poll() is None
+                           else f"exited rc={srv.returncode}") + f", local HTTP: {code}"]
+    for n, t in TUNNELS.items():
+        lines.append(f"{n}: {t['url']}  state={t['state']}  probe={t['probe']}  "
+                     f"restarts={t['restarts']}  {t['note']}")
+    return "\n".join(lines)
+
+
+def send_result(ref, cmd, rc, out):
+    out = out or "(no output)"
+    if len(out) > 12000:
+        out = "...[truncated]\n" + out[-12000:]
+    parts, i = [], 0
+    while i < len(out):
+        n = 3000
+        while n > 200 and len(json.dumps(out[i:i + n])) > 3300:
+            n //= 2
+        parts.append(out[i:i + n])
+        i += n
+    for k, chunk in enumerate(parts):
+        ntfy_send({"phase": "cmd-result", "ref": ref, "cmd": cmd[:200], "rc": rc,
+                   "part": k, "parts": len(parts), "out": chunk})
+
+
+def run_command(text, ref):
+    """ntfy path: acknowledge, execute, reply in chunks on the progress topic."""
+    text = text.strip()
+    shown = re.sub(r"^(tunnel ngrok \S+) \S+", r"\1 <token>", text)   # don't echo secrets
+    ntfy_send({"phase": "cmd-ack", "ref": ref, "cmd": shown[:200]})
+    if text.partition(" ")[0] == "stop":
+        send_result(ref, shown, 0, "stopping the server and ending the session")
+    rc, out = execute(text)
+    send_result(ref, shown, rc, out)
+
+
+def execute(text):
+    """Run one control command. Returns (rc, output)."""
+    text = text.strip()
+    word, _, rest = text.partition(" ")
+    rc = 0
+    try:
+        if word in ("help", "?"):
+            out = HELP
+        elif word == "status":
+            out = status_text()
+        elif word == "log":
+            out = log_tail(int(rest) if rest.strip().isdigit() else 60)
+        elif word == "tunnel":
+            sub = rest.split()
+            if sub[:1] == ["restart"]:
+                for t in TUNNELS.values():
+                    t["proc"].terminate()
+                start_watchdog()
+                out = "tunnels terminated; the watchdog restarts them within ~30 s"
+            elif sub[:1] in (["pinggy"], ["ngrok"]):
+                name = sub[0]
+                if name == "ngrok":
+                    if len(sub) < 3:
+                        raise ValueError("usage: tunnel ngrok <https://name.ngrok-free.dev> <authtoken>")
+                    CFG["ngrok_url"], CFG["ngrok_authtoken"] = sub[1], sub[2]
+                else:
+                    CFG["pinggy"] = True
+                old = TUNNELS.pop(name, None)
+                if old and old["proc"].poll() is None:
+                    old["proc"].terminate()
+                    time.sleep(2)
+                t = (start_ngrok if name == "ngrok" else start_pinggy)()
+                if t is None:
+                    raise RuntimeError(f"{name} could not be started (see `log 40`)")
+                start_watchdog()
+                for _ in range(30):
+                    if t["url"] and t["state"] != "starting":
+                        break
+                    time.sleep(2)
+                out = f"{name}: {t['url']} -> {probe_tunnel(t)}"
+                publish("tunnel-restart", name=name, restarts=t["restarts"],
+                        endpoint=f"{t['url']}/v1" if t["url"] else None, status=t["probe"])
+            else:
+                out = "\n".join(f"{n}: {t['url']} -> {probe_tunnel(t)}"
+                                for n, t in TUNNELS.items()) or "no tunnels"
+        elif word == "stop":
+            publish("stopped", reason="stop-command")
+            threading.Timer(2, shutdown, args=(0,)).start()
+            out = "stopping the server and ending the session"
+        else:
+            p = subprocess.run(["bash", "-lc", rest if word == "sh" else text],
+                               capture_output=True, text=True, timeout=CMD_TIMEOUT, cwd=str(WORK))
+            rc, out = p.returncode, p.stdout + p.stderr
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout.decode(errors="ignore") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        rc, out = 124, f"timed out after {CMD_TIMEOUT} s\n{partial}"
+    except Exception as e:
+        rc, out = 1, f"error: {e}"
+    return rc, out
+
+
+def cmd_listener():
+    topic, since = CFG["ntfy_cmd_topic"], str(int(T0) - 60)
+    while True:
+        try:
+            with urllib.request.urlopen(f"https://ntfy.sh/{topic}/json?since={since}",
+                                        timeout=120) as r:
+                for raw in r:
+                    try:
+                        e = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if e.get("event") != "message":
+                        continue
+                    since = e["id"]
+                    threading.Thread(target=run_command, args=(e.get("message", ""), e["id"]),
+                                     daemon=True).start()
+        except Exception:
+            time.sleep(10)
+
+
+if CFG["ntfy_cmd_topic"]:
+    threading.Thread(target=cmd_listener, daemon=True).start()
+
+
+# ---------------- front server: API proxy + control over any tunnel ----------------
+HOP_HEADERS = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "te",
+               "trailer", "upgrade", "host", "content-length"}
+
+
+class Front(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"         # closing the connection ends a streamed body
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _authorized(self):
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        token = token or self.headers.get("X-KTL-Token", "") or self.headers.get("x-api-key", "")
+        return bool(token) and any(secrets.compare_digest(token, good) for good in
+                                   (CFG["api_key"], CFG["ntfy_cmd_topic"]) if good)
+
+    def _json(self, code, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+    def _control(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/ktl/health":
+            return self._json(200, {"ktl": True, "server": port_open(VLLM_PORT),
+                                    "phase": STATE["phase"], "uptime": elapsed()})
+        if not self._authorized():
+            return self._json(401, {"error": "bearer token required"})
+        if path == "/ktl/tunnels":
+            return self._json(200, {"tunnels": tunnel_summary(), "phase": STATE["phase"]})
+        if path == "/ktl/cmd" and self.command == "POST":
+            rc, out = execute(self._body().decode("utf-8", "replace"))
+            return self._json(200, {"rc": rc, "out": out})
+        return self._json(404, {"error": "unknown control route"})
+
+    def _forward(self):
+        body = self._body()
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
+        conn = http.client.HTTPConnection("127.0.0.1", VLLM_PORT, timeout=3600)
+        try:
+            conn.request(self.command, self.path, body=body or None, headers=headers)
+            resp = conn.getresponse()
+        except OSError:
+            conn.close()
+            return self._json(503, {"error": {"type": "server_unavailable", "code": 503,
+                                              "message": "the model server is not up "
+                                              f"(phase: {STATE['phase']}); retry later"}})
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() not in HOP_HEADERS or (k.lower() == "content-length"
+                                                and not resp.chunked):
+                self.send_header(k, v)
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _handle(self):
+        try:
+            if self.path.startswith("/ktl/"):
+                self._control()
+            else:
+                self._forward()
+        except Exception as e:                     # never let one request kill the front
+            _raw.write(f"[front] {self.command} {self.path}: {e!r}\n")
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _handle
+
+
+def start_front():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Front)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+FRONT = start_front()
+
+# ---------------- network test (CPU session, no model) ----------------
+if CFG["net_test"]:
+    log("=" * 70)
+    log(f" NETWORK TEST — front :{PORT} -> dummy HTTP server :{VLLM_PORT} + tunnels + channels")
+    log("=" * 70)
+    server = subprocess.Popen([sys.executable, "-m", "http.server", str(VLLM_PORT), "--bind", "127.0.0.1"],
+                              cwd=str(WORK), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open_tunnels(wait_s=90)
+    summary = tunnel_summary()
+    publish("nettest-result", ok=any(v["status"] == "live" for v in summary.values()),
+            tunnels=summary, command_channel=bool(CFG["ntfy_cmd_topic"]),
+            ssh=bool(CFG["ssh_pubkey"]) and port_open(SSH_PORT),
+            arch=platform.machine(), keepalive_min=CFG["keepalive_min"])
+    t_end = time.time() + CFG["keepalive_min"] * 60
+    while time.time() < t_end:
+        time.sleep(30)
+    publish("auto-shutdown", served_min=CFG["keepalive_min"])
+    shutdown(0)
+
+
+# Tunnels and the SSH channel come up right away, in the background, so the kernel
+# is reachable while the runtime installs and when any later step fails.
+TUNNEL_BOOT = {}
+if not CFG["build_bundle"]:
+    def _boot_tunnels():
+        TUNNEL_BOOT["url"] = open_tunnels()
+    TUNNEL_BOOT["thread"] = threading.Thread(target=_boot_tunnels, daemon=True)
+    TUNNEL_BOOT["thread"].start()
 
 
 # gzip+base64 of patches/mtp-rollback-v0280.diff; regenerated by tools/embed_patch.py
@@ -197,6 +872,37 @@ def apply_mtp_patch():
         return True
     log(p.stdout[-1500:], p.stderr[-500:])
     return False
+
+
+SCHED_ORIG = "            del spec_token_ids[orig_num_spec_tokens:]\n"
+SCHED_V1 = "            spec_token_ids = list(spec_token_ids)  # KTL fix: may be a tuple\n"
+SCHED_V2 = ("            spec_token_ids = [int(t) for t in (spec_token_ids.tolist() if hasattr("
+            "spec_token_ids, 'tolist') else spec_token_ids)]  # KTL fix v2\n")
+
+
+def apply_scheduler_fix():
+    """vllm 0.28.0 + tpu-inference with MTP: the drafts handed to the scheduler can be a
+    tuple, or a JAX array sharded over the 8 chips. `del spec_token_ids[...]` then raises
+    AttributeError: __delitem__, and a request with structured output (grammar) fails in
+    xgrammar with "to_dlpack ... Sharding over 8 devices". Either kills the whole engine
+    (both seen live with several agents on one server). Turn drafts into plain ints."""
+    try:
+        origin = subprocess.check_output(
+            [PY, "-c", "import importlib.util as u; print(u.find_spec('vllm').origin)"],
+            text=True).strip()
+        path = Path(os.path.dirname(origin), "v1", "core", "sched", "scheduler.py")
+        src = path.read_text()
+        if "KTL fix v2" in src:
+            return True
+        src = src.replace(SCHED_V1, "")
+        if src.count(SCHED_ORIG) != 1:
+            log("   scheduler fix: target line not found (different vLLM version?)")
+            return False
+        path.write_text(src.replace(SCHED_ORIG, SCHED_V2 + SCHED_ORIG))
+        return True
+    except Exception as e:
+        log(f"   scheduler fix failed: {e}")
+        return False
 
 
 def runtime_ok():
@@ -248,9 +954,8 @@ if bundle_root:
         manifest = json.loads(Path(hits[0]).read_text())
     else:
         bundle = bundle_root
-if bundle and Path(bundle, "cloudflared").exists() and not CLOUDFLARED.exists():
-    shutil.copy(Path(bundle, "cloudflared"), CLOUDFLARED)
-    CLOUDFLARED.chmod(0o755)
+if bundle and Path(bundle, "cloudflared").exists() and not CLOUDFLARED.exists() and ARCH == "amd64":
+    install_binary(CLOUDFLARED, lambda p: shutil.copy(Path(bundle, "cloudflared"), p))
 if manifest and (manifest.get("python") != PY_VER
                  or manifest.get("vllm_tpu_version") != CFG["vllm_tpu_version"]):
     log(f"   env dataset was built for python {manifest.get('python')} / vllm-tpu "
@@ -265,9 +970,11 @@ publish("install", vllm_tpu=CFG["vllm_tpu_version"])
 log("   installer output goes to", RAW_LOG)
 runtime = install_runtime(manifest.get("built"))
 if runtime is None or not runtime_ok():
-    publish("failed", step="install")
-    sys.exit(1)
+    fail("install")
 publish("installed", secs=int(time.time() - t), via=runtime)
+if not apply_scheduler_fix() and CFG["mtp_tokens"] > 0:
+    publish("scheduler-fix-failed", note="MTP stays on; concurrent requests may crash vLLM "
+                                         "(it is restarted automatically)")
 if apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
@@ -332,7 +1039,7 @@ def server_args(cfg):
             "--tensor-parallel-size", "8",
             "--max-model-len", str(cfg["max_model_len"]),
             "--max-num-seqs", str(cfg["max_num_seqs"]),
-            "--port", str(PORT),
+            "--port", str(VLLM_PORT), "--host", "127.0.0.1",
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
             "--reasoning-parser", "qwen3"]
@@ -456,7 +1163,7 @@ def launch_server(cfg):
 
 def healthy(cfg):
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/models",
+        req = urllib.request.Request(f"http://127.0.0.1:{VLLM_PORT}/v1/models",
                                      headers={"Authorization": f"Bearer {cfg['api_key']}"})
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status == 200
@@ -466,22 +1173,22 @@ def healthy(cfg):
 
 def wait_healthy(server, cfg, expect_min):
     t = time.time()
+    said = 0
     while time.time() - t < 5400:
         if server.poll() is not None:
             tail = "\n".join(list(server.tail)[-100:])
             log(f"server exited rc={server.returncode}; last output:\n{tail}")
             log(f"full log: {RAW_LOG}")
-            publish("failed", step="server", rc=server.returncode, tail=tail[-2500:])
-            sys.exit(1)
+            fail("server", rc=server.returncode, tail=tail[-2500:])
         if healthy(cfg):
             return int(time.time() - t)
         el = int(time.time() - t)
-        if el and el % 120 < 6:
+        if el // 120 > said:
+            said = el // 120
             publish("compiling", elapsed_s=el)
             log(f"   ... {el // 60} min into startup (typically ~{expect_min} min)")
         time.sleep(5)
-    publish("failed", step="health-timeout", tail="\n".join(list(server.tail)[-60:])[-2500:])
-    sys.exit(1)
+    fail("health-timeout", tail="\n".join(list(server.tail)[-60:])[-2500:])
 
 
 def stop_server(p):
@@ -501,7 +1208,7 @@ def completion(cfg, prompt, max_tokens, stream=False, timeout=900):
     if stream:
         body.update(stream=True, ignore_eos=True, stream_options={"include_usage": True})
     req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/v1/completions", data=json.dumps(body).encode(),
+        f"http://127.0.0.1:{VLLM_PORT}/v1/completions", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {cfg['api_key']}"})
     if not stream:
@@ -544,7 +1251,7 @@ def chat(cfg, messages, max_tokens=32, timeout=600):
     body = {"model": cfg["served_model_name"], "messages": messages, "max_tokens": max_tokens,
             "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/v1/chat/completions", data=json.dumps(body).encode(),
+        f"http://127.0.0.1:{VLLM_PORT}/v1/chat/completions", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {cfg['api_key']}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -712,46 +1419,25 @@ server = launch_server(CFG)
 
 # ---------------- 5. tunnel (in parallel with the server start) ----------------
 banner(5, "Public URL")
-url = None
-tunnel = None
-for _ in range(60):  # cloudflared download runs in the background from step 1
-    if CLOUDFLARED.exists():
-        break
-    time.sleep(2)
-if CLOUDFLARED.exists():
-    tunnel = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
-                               "--no-autoupdate", "--protocol", "quic"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-    lines = []
-
-    def pump_cf():
-        for line in tunnel.stdout:
-            lines.append(line.rstrip())
-            _raw.write(f"[cloudflared] {line}")
-    threading.Thread(target=pump_cf, daemon=True).start()
-    deadline = time.time() + 180
-    while time.time() < deadline and url is None:
-        for ln in lines:
-            m = pat.search(ln)
-            if m:
-                url = m.group(0).rstrip("/")
-                break
-        time.sleep(1)
+TUNNEL_BOOT["thread"].join(timeout=300)
+url = TUNNEL_BOOT.get("url") or primary_url()
 if url:
     log(f"   your endpoint will be  {url}/v1")
     log("   (not live yet — it answers 502 until the READY banner below)")
-    publish("tunnel-url", endpoint=f"{url}/v1")
-else:
-    publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
 
 # ---------------- 6. wait, announce, self-test, keep alive ----------------
 startup = wait_healthy(server, CFG, expect_min)
 publish("serving", startup_secs=startup)
+for t in TUNNELS.values():
+    probe_tunnel(t)
+url = primary_url()
+publish("tunnel-check", tunnels=tunnel_summary())
 log("")
 log("#" * 70)
 log(f"#  READY — the server is live ({elapsed()} after start)")
 log(f"#  ENDPOINT : {url + '/v1' if url else 'http://127.0.0.1:8000/v1 (tunnel failed)'}")
+for n, t in TUNNELS.items():
+    log(f"#    {n:<11}: {t['url']}/v1  ({t['probe']})")
 log(f"#  API KEY  : {CFG['api_key']}")
 log(f"#  MODEL    : {CFG['served_model_name']}   (context {CFG['max_model_len']}, "
     f"{CFG['max_num_seqs']} parallel requests)")
@@ -765,7 +1451,7 @@ log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on i
 log("#" * 70)
 publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
-        keepalive_min=CFG["keepalive_min"], startup_secs=startup)
+        keepalive_min=CFG["keepalive_min"], startup_secs=startup, tunnels=tunnel_summary())
 
 if CFG["fast_start"]:
     banner(6, "Warm-up", "loading the common request shapes; the endpoint is usable meanwhile")
@@ -776,13 +1462,33 @@ else:
 self_test(CFG)
 
 t_serve = time.time()
+t_beat = t_serve
+restarts = 0
 while time.time() - t_serve < CFG["keepalive_min"] * 60:
-    time.sleep(120)
+    time.sleep(15)
     if server.poll() is not None:
-        publish("stopped", reason="server-exit", rc=server.returncode)
-        sys.exit(1)
-    up = int((time.time() - t_serve) / 60)
-    if up % 10 < 2:
+        # Restarting in place keeps the TPU slot; a new kernel means the queue again.
+        restarts += 1
+        tail = "\n".join(list(server.tail)[-40:])
+        log(f"   vLLM exited rc={server.returncode} while serving; last output:\n{tail}")
+        if restarts > CFG["server_restarts"]:
+            fail("server-exit", rc=server.returncode, tail=tail[-2500:])
+        publish("server-restart", rc=server.returncode, restart=restarts,
+                of=CFG["server_restarts"], tail=tail[-1500:])
+        stop_server(server)
+        server = launch_server(CFG)
+        startup = wait_healthy(server, CFG, expect_min)
+        url = primary_url()
+        publish("serving", startup_secs=startup, restart=restarts)
+        publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+                model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
+                keepalive_min=CFG["keepalive_min"], startup_secs=startup,
+                tunnels=tunnel_summary())
+        continue
+    if time.time() - t_beat >= 600:
+        t_beat = time.time()
+        up = int((time.time() - t_serve) / 60)
+        url = primary_url()
         publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None))
         log(f"   still serving ({up} min) — {url + '/v1' if url else ''}")
 publish("auto-shutdown", served_min=CFG["keepalive_min"])
