@@ -68,6 +68,7 @@ class Renderer(object):
         self._mode = None          # None = undecided yet, then "text" or "tool"
         self._tokens = 0
         self._reasoning = 0
+        self._in_reasoning = False
         self._t0 = time.time()
         self._md = MarkdownStream(self.s, self._emit)
 
@@ -89,8 +90,15 @@ class Renderer(object):
         if kind == "reasoning":
             self._reasoning += 1
             if self.cfg.show_reasoning:
+                if not self._in_reasoning:
+                    self._in_reasoning = True
+                    self._stop_spinner()
+                    self._emit("\n  " + self.s.grey("thinking: "))
                 self._emit(self.s.grey(piece))
             return
+        if self._in_reasoning:
+            self._in_reasoning = False
+            self._emit("\n")
         self._buf += piece
         if self._mode is None:
             head = self._buf.lstrip()
