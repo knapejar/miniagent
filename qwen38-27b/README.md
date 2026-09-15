@@ -1,4 +1,4 @@
-# kaggle-tpu-lab
+# Qwen3.8-27B on a free Kaggle TPU v5e-8
 
 **Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on Kaggle's free
 TPU v5e-8, with a public OpenAI-compatible endpoint you can plug into Claude Code,
@@ -21,7 +21,7 @@ Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades
 that (verification competes with batch compute). Serving many users? Launch with
 `--max-model-len 131072 --max-num-seqs 16 --mtp 0` for max aggregate throughput.
 
-## Why this works (the one-paragraph version)
+## How this works
 
 Qwen3.8-27B is a hybrid: 48 of its 64 layers are **gated-DeltaNet linear attention**, only
 16 are classic full attention. That makes its KV cache tiny (~64 KB/token), which is why a
@@ -94,6 +94,7 @@ python launch.py serve --reasoning-effort medium                 # server-side d
 python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
 python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
+python launch.py serve --no-async-scheduling                     # for clients that use JSON mode / structured outputs with MTP on (see "If it fails")
 ```
 
 
@@ -138,10 +139,10 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 *server-side default* (for clients that can't pass extra fields), launch with
 `--reasoning-effort medium`.
 
-## What's actually in this repo
+## What's actually in this folder
 
 ```
-launch.py                        the CLI: serve / status / stop, with live progress
+../launch.py                     the CLI at the repo root: serve / status / stop, with live progress
 kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
@@ -218,6 +219,21 @@ folder in the Kaggle UI (Output tab → New Dataset).
   `Transparent hugepages are not enabled`. None of them matter. The kernel log only
   shows real progress lines; the full vLLM output is saved to `vllm.log` next to the
   script (`"verbose": true` / `--verbose` prints it live).
+
+## If it fails
+
+- **"this session has no working TPU"** at step 1 (or, in older versions, `Insufficient devices for 2D mesh:
+  found 1, expected 8` / `No jellyfish device found` minutes later): Kaggle started the session without a TPU
+  attached. It happens, most often on new or not-yet-verified accounts, and nothing in the notebook can fix it.
+  Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell must print 8.
+- **Every download fails with "name resolution"** at step 1: Internet is off for the session (Session options),
+  or the account is not phone-verified yet, which disables it.
+- **The server exits the moment a client connects, with `AttributeError: __delitem__`**: the client used JSON
+  mode / structured outputs while MTP and vLLM's async scheduling are on, a path vllm-tpu 0.28.0 cannot handle.
+  Set `"async_scheduling": false` in the config cell (`--no-async-scheduling` from the launcher), or
+  `"mtp_tokens": 0`.
+- **Anything else**: the kernel now prints the root cause and the first error block from `vllm.log` when the
+  server dies; paste that into an issue.
 
 ## Credits
 
