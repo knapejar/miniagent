@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Qwen3.8-27B on a Kaggle TPU, served by kaggle-tpu-lab.
 
-The other half lives in a separate repository (kaggle-tpu-lab): `launch.py
+The other half lives in kaggle-tpu-lab/ of this repository: `launch.py
 serve` pushes a Kaggle kernel that starts vLLM and opens public tunnels, and
 `launch.py proxy` gives this machine a stable http://127.0.0.1:8080/v1 that
 follows whichever tunnel is live and adds the API key itself. Pinggy tunnels
@@ -54,13 +54,14 @@ def load_state(path=None):
 
 
 def find_launcher(environ=None):
-    """kaggle-tpu-lab's launch.py: $KAGGLE_TPU_LAB (the directory or the file),
-    else a kaggle-tpu-lab checkout next to miniagent or in the current directory."""
+    """kaggle-tpu-lab's launch.py: $KAGGLE_TPU_LAB (the directory or the file), else
+    kaggle-tpu-lab/ in this repository, next to it, or in the current directory."""
     environ = os.environ if environ is None else environ
     candidates = []
     if environ.get("KAGGLE_TPU_LAB"):
         candidates.append(environ["KAGGLE_TPU_LAB"])
-    candidates += [os.path.join(HERE, "..", "kaggle-tpu-lab"),
+    candidates += [os.path.join(HERE, "kaggle-tpu-lab"),
+                   os.path.join(HERE, "..", "kaggle-tpu-lab"),
                    os.path.join(os.getcwd(), "kaggle-tpu-lab")]
     for path in candidates:
         if os.path.isdir(path):

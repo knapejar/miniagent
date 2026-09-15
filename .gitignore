@@ -7,3 +7,4 @@ sandbox/
 .venv/
 .idea/
 .vscode/
+.note_do_not_commit

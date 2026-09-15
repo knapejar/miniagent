@@ -53,8 +53,8 @@ kaggle auth login            # browser login; or kaggle.com → Settings → API
                              # and save it to ~/.kaggle/access_token (Windows: %USERPROFILE%\.kaggle\access_token)
 
 # 2. Get this repo and launch
-git clone https://github.com/ARahim3/kaggle-tpu-lab
-cd kaggle-tpu-lab
+git clone https://github.com/knapejar/miniagent      # kaggle-tpu-lab lives in this repo
+cd miniagent/kaggle-tpu-lab
 python launch.py serve
 ```
 

@@ -58,20 +58,15 @@ USERPROFILE=$(cygpath -w /tmp/ktl-home) HOME=/tmp/ktl-home KAGGLE_USERNAME=<you>
 |---|---|---|
 | anything OpenAI-compatible | `http://127.0.0.1:8080/v1` (proxy), any key | or a tunnel URL + the API key from the banner |
 | Claude Code | `tools\claude-qwen.cmd` (proxy on :8080) | the proxy maps `output_config.effort` `high -> medium`, `max -> xhigh`; a raw tunnel returns HTTP 400 for `high` |
-| miniagent | `python miniagent.py --kaggle` | needs `integrations/miniagent-vllm-tool-calls.patch` (see below) |
+| miniagent | `python miniagent.py --kaggle` (repo root, one level up) | reads structured `tool_calls` (see below) |
 | another PC | tunnel URL + API key, or copy `~/.kaggle-tpu-lab.json` there and run `launch.py proxy` | pinggy URLs rotate hourly; cloudflared URLs live until the kernel restarts its tunnel |
 
 **miniagent patch.** vLLM runs with `--enable-auto-tool-choice --tool-call-parser
 qwen3_coder`, which extracts `<tool_call>` markup from the answer **even when the request
 lists no tools** and streams it as structured `delta.tool_calls` with the text removed.
-miniagent read only text, saw "no tool call" three times and stalled. The patch rebuilds the
-markup from `tool_calls` (streaming and non-streaming) and adds four tests. Apply it in the
-miniagent checkout (made against commit `2d78b91`):
-
-```bash
-cd ../miniagent && git apply ../kaggle-tpu-lab/integrations/miniagent-vllm-tool-calls.patch
-python -m unittest discover -s tests
-```
+miniagent read only text, saw "no tool call" three times and stalled. miniagent now rebuilds
+the markup from `tool_calls` (streaming and non-streaming, `agent/llm.py`, with tests); the
+former `integrations/miniagent-vllm-tool-calls.patch` is merged into the miniagent code.
 
 **Speed seen by agents.** miniagent reports tokens / whole step time. Without prefix
 caching every step re-reads the whole conversation (~9-10k tok/s prefill), so a 60-token

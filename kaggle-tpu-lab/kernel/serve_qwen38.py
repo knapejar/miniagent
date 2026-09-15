@@ -86,7 +86,7 @@ DEFAULTS = {
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "ntfy_cmd_topic": "",          # optional: accept commands from ntfy.sh/<topic> (keep it secret)
-    "debug_hold_min": 30,          # on failure keep the session alive this long (needs ntfy_cmd_topic)
+    "debug_hold_min": 30,          # on failure keep the session alive this long (needs a tunnel, SSH or ntfy)
     "server_restarts": 3,          # vLLM dying while serving is restarted in place (same TPU
                                    # session, cached graphs, ~20 min) up to this many times
     "ngrok_url": "",               # e.g. https://name.ngrok-free.dev (your free static domain)
@@ -191,11 +191,12 @@ def log_tail(n):
 
 def hold_for_debug():
     """Keep the Kaggle session (and the command channel) alive for a post-mortem."""
-    mins = CFG["debug_hold_min"] if CFG["ntfy_cmd_topic"] else 0
+    channels = bool(CFG["ntfy_cmd_topic"] or CFG["ssh_pubkey"] or globals().get("TUNNELS"))
+    mins = CFG["debug_hold_min"] if channels else 0
     if mins > 0:
         publish("hold", minutes=mins)
-        log(f"   holding the session {mins} min for debugging — send commands via ntfy "
-            "(status / log / sh <cmd> / stop)")
+        log(f"   holding the session {mins} min for debugging — launch.py cmd / ssh over a tunnel, "
+            "or ntfy (status / log / sh <cmd> / stop)")
         time.sleep(mins * 60)
 
 
@@ -467,10 +468,11 @@ def primary_url():
 
 
 def tunnel_summary():
-    return {n: {"url": t["url"], "status": t["probe"] or t["state"]} for n, t in TUNNELS.items()}
+    return {n: {"url": t["url"], "status": t["probe"] or t["state"]} for n, t in list(TUNNELS.items())}
 
 
 WATCHDOG = []
+SSH_BOOT = []
 
 
 def start_watchdog():
@@ -506,20 +508,28 @@ def start_sshd():
     """Root sshd on 127.0.0.1:SSH_PORT for the launcher's key only."""
     if not CFG["ssh_pubkey"]:
         return False
-    sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+    def find_sshd():
+        return shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+    sshd = find_sshd()
     if not sshd:
         log("   sshd missing -> apt-get install openssh-server")
         env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-        for cmd in (["apt-get", "install", "-y", "-qq", "--no-install-recommends", "openssh-server"],
-                    ["apt-get", "update", "-qq"],
-                    ["apt-get", "install", "-y", "-qq", "--no-install-recommends", "openssh-server"]):
-            try:
-                if subprocess.run(cmd, capture_output=True, timeout=300, env=env).returncode == 0 \
-                        and cmd[1] == "install":
-                    break
-            except Exception as e:
-                log(f"   ({' '.join(cmd[:2])} failed: {e})")
-        sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+        # another installer (e.g. a DeployMan bootstrap) may hold the dpkg lock: wait for it
+        lock = ["-o", "DPkg::Lock::Timeout=180"]
+        t_end = time.time() + 480
+        while not sshd and time.time() < t_end:
+            for cmd in (["apt-get", "install", "-y", "-qq", "--no-install-recommends", *lock, "openssh-server"],
+                        ["apt-get", "update", "-qq", *lock],
+                        ["apt-get", "install", "-y", "-qq", "--no-install-recommends", *lock, "openssh-server"]):
+                try:
+                    if subprocess.run(cmd, capture_output=True, timeout=400, env=env).returncode == 0 \
+                            and cmd[1] == "install":
+                        break
+                except Exception as e:
+                    log(f"   ({' '.join(cmd[:2])} failed: {e})")
+            sshd = find_sshd()
+            if not sshd:
+                time.sleep(15)
     if not sshd:
         log("   no sshd -> SSH channel off")
         return False
@@ -546,13 +556,24 @@ def start_sshd():
 def open_tunnels(wait_s=150):
     starters = [("ngrok", start_ngrok), ("cloudflared", start_cloudflared),
                 ("pinggy", start_pinggy)]
-    try:
-        if start_sshd():
-            starters += [("cloudflared-ssh",
-                          lambda: start_cloudflared("cloudflared-ssh", f"ssh://127.0.0.1:{SSH_PORT}")),
-                         ("pinggy-ssh", lambda: start_pinggy("pinggy-ssh", SSH_PORT, tcp=True))]
-    except Exception as e:
-        log(f"   ssh channel error: {e}")
+
+    def ssh_channel():
+        # own thread: installing sshd can take minutes and must not delay the API tunnels
+        try:
+            if not start_sshd():
+                return
+            for name, start in (("cloudflared-ssh", lambda: start_cloudflared(
+                                    "cloudflared-ssh", f"ssh://127.0.0.1:{SSH_PORT}")),
+                                ("pinggy-ssh", lambda: start_pinggy("pinggy-ssh", SSH_PORT, tcp=True))):
+                if name not in TUNNELS:
+                    start()
+            time.sleep(60)
+            publish("ssh-channel", tunnels=tunnel_summary())
+        except Exception as e:
+            log(f"   ssh channel error: {e}")
+    if CFG["ssh_pubkey"] and not SSH_BOOT:
+        SSH_BOOT.append(threading.Thread(target=ssh_channel, daemon=True))
+        SSH_BOOT[0].start()
     for name, start in starters:
         if name in TUNNELS:       # already started from the command channel
             continue

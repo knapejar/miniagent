@@ -10,8 +10,24 @@ OpenAI-compatible API, so llama.cpp, Ollama, vLLM, SGLang or a remote endpoint w
 just as well.
 
 It also drives **Qwen3.8-27B on a free Kaggle TPU**, served by
-[kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab): `python miniagent.py --kaggle`.
+[`kaggle-tpu-lab/`](kaggle-tpu-lab/) in this repository: `python miniagent.py --kaggle`.
 See [Qwen3.8 on a Kaggle TPU](#qwen38-on-a-kaggle-tpu).
+
+## What is where
+
+| Path | What |
+|---|---|
+| `miniagent.py`, `agent/`, `ui/`, `hints/`, `tests/` | the agent (runs on your PC, standard library only) — [Layout](#layout) |
+| `tasks/`, `verify/` | benchmark tasks and their checkers |
+| `searxng/` | settings for a local SearXNG (web search) |
+| [`kaggle-tpu-lab/`](kaggle-tpu-lab/) | the model side: Qwen3.8-27B on a Kaggle TPU — kernel, `launch.py` (serve / proxy / cmd / ssh / stop), notebook, patches, [operations runbook](kaggle-tpu-lab/docs/operations.md). Merged with its history from `knapejar/kaggle-tpu-lab` (a fork of [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab)) |
+| `miniagent-kaggle.cmd`, `kaggle-tpu-lab/tools/claude-qwen.cmd` | shortcuts: miniagent / Claude Code on the Kaggle model |
+
+The same kernel also runs under **DeployMan** (a separate local tool for launching services
+on free-tier machines): its `services/qwen38-api/` carries a copy of
+`kaggle-tpu-lab/kernel/serve_qwen38.py` plus a `run.py` wrapper, and adds a queue-time
+history (`deployman stats`) and an SSH tunnel that is up from the kernel's first seconds.
+Change the kernel here, then copy it there.
 
 ```
   ▐▛███▜▌   miniagent 0.2.0
@@ -94,21 +110,21 @@ unless `MINIAGENT_SEARX` is set, so run SearXNG on another port there
 
 ## Qwen3.8 on a Kaggle TPU
 
-[kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab) serves Qwen3.8-27B (bf16,
+[kaggle-tpu-lab](kaggle-tpu-lab/) serves Qwen3.8-27B (bf16,
 up to 262k context, ~130 tok/s) with vLLM on Kaggle's free TPU v5e-8 and opens public
 tunnels to it. miniagent runs here, on your machine — its tools touch your files and
 your shell — and only the model runs on Kaggle.
 
 ```
-miniagent ──► http://127.0.0.1:8080/v1 ──► tunnel (cloudflared / pinggy / ngrok) ──► vLLM on the Kaggle TPU
+miniagent ──► http://127.0.0.1:8080/v1 ──► tunnel (cloudflared / pinggy / ngrok) ──► front server ──► vLLM on the Kaggle TPU
                launch.py proxy
                (adds the API key, follows whichever tunnel is live)
 ```
 
 ### Run it
 
-Both repositories side by side (miniagent looks for `..\kaggle-tpu-lab`; elsewhere set
-`KAGGLE_TPU_LAB` to that directory):
+miniagent finds `launch.py` in `kaggle-tpu-lab\` of this repository (or in `KAGGLE_TPU_LAB`,
+if set):
 
 ```bat
 :: 1. start the model - once per session, it takes a TPU slot plus ~22 min
@@ -117,14 +133,14 @@ python launch.py serve            :: pushes the kernel; Ctrl-C detaches, it keep
 python launch.py status -f        :: follow it until "YOUR ENDPOINT IS LIVE"
 
 :: 2. start the agent
-cd ..\miniagent
+cd ..
 python miniagent.py --kaggle                        :: interactive
 python miniagent.py --kaggle "fix the failing test" :: one shot
 python miniagent.py --kaggle --wait -f task.txt     :: wait for the kernel, then run
 miniagent-kaggle.cmd                                :: the same as --kaggle
 
 :: 3. end the session, so it stops using TPU quota
-cd ..\kaggle-tpu-lab
+cd kaggle-tpu-lab
 python launch.py stop
 ```
 
@@ -214,6 +230,7 @@ MINIAGENT_KAGGLE_KEY     API key, default: from the state file
 | `the Kaggle kernel has ended` | `python launch.py serve` starts a new one, then restart miniagent: a proxy it started still follows the old launch |
 | `the proxy did not start` | the last lines of `runs\proxy.log` are printed. Port taken? Use `--url http://127.0.0.1:8081/v1` |
 | `HTTP 502: kaggle-tpu-lab proxy: no live tunnel` | no tunnel answers. `python launch.py cmd tunnel` probes them, `python launch.py cmd tunnel pinggy` restarts pinggy |
+| the API answers `503 server_unavailable` | vLLM is compiling, restarting or crashed; the kernel is still reachable: `python launch.py cmd status`, `cmd log 120`, `python launch.py ssh` — see [the runbook](kaggle-tpu-lab/docs/operations.md#4-recovery-runbook) |
 | a step ends with `no tool call (finish=length …)` | the reasoning used up the budget: `/effort low` or `--max-tokens 32768` |
 
 The endpoint is public and protected only by the API key. miniagent masks the key in
@@ -330,7 +347,8 @@ ui/
 hints/                one JSON file per tool
 tasks/                benchmark tasks, including ten hard ones
 verify/               independent checkers for those tasks
-tests/                167 tests
+tests/                171 tests
+kaggle-tpu-lab/       the model side on Kaggle (own README)
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be
