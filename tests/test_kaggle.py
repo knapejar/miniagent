@@ -200,6 +200,68 @@ class TestClientSideStop(unittest.TestCase):
         self.assertEqual(text, "All done, 3 files changed.")
 
 
+class TestStructuredToolCalls(unittest.TestCase):
+    """vLLM with --enable-auto-tool-choice returns the call as tool_calls, not text
+    (seen on the real Kaggle server: finish_reason tool_calls, no content)."""
+
+    def client(self, events):
+        stream = FakeStream(events)
+        client = LLMClient(Config(profile="kaggle"))
+        client._request = lambda *a, **kw: stream
+        return client
+
+    def test_streamed_tool_call_becomes_markup(self):
+        args = json.dumps({"path": "app.py", "text": "def f():\n    return 1\n"})
+        events = [{"choices": [{"delta": {"reasoning": "write the file"}}]},
+                  {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                   "type": "function", "function": {"name": "write"}}]}}]}]
+        events += [{"choices": [{"delta": {"tool_calls": [{"index": 0,
+                   "function": {"arguments": args[i:i + 7]}}]}}]}
+                   for i in range(0, len(args), 7)]
+        events.append({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+        shown = []
+        text, used = self.client(events).chat([], on_delta=lambda k, t: shown.append((k, t)))
+        self.assertEqual(parse_tool_call(text),
+                         ("write", {"path": "app.py", "text": "def f():\n    return 1\n"}))
+        self.assertIn("<function=write>", "".join(t for k, t in shown if k == "content"))
+        self.assertGreater(used.completion_tokens, 0)
+
+    def test_non_string_arguments_are_rendered_as_json(self):
+        events = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {
+            "name": "read", "arguments": json.dumps({"path": "a.txt", "limit": 40})}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}]
+        text, _ = self.client(events).chat([])
+        self.assertEqual(parse_tool_call(text), ("read", {"path": "a.txt", "limit": "40"}))
+
+    def test_cut_off_arguments_stay_a_truncated_call(self):
+        events = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {
+            "name": "write", "arguments": '{"path": "a.py", "text": "def'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]}]
+        text, used = self.client(events).chat([])
+        self.assertNotIn("</tool_call>", text)
+        self.assertEqual(used.finish_reason, "length")
+
+    def test_non_stream_message_tool_calls(self):
+        client = LLMClient(Config(profile="kaggle", stream=False))
+        body = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "content": None, "tool_calls": [{"id": "x", "type": "function", "function": {
+                "name": "sh", "arguments": json.dumps({"cmd": "dir"})}}]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+        class Response(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(body).encode()
+        client._request = lambda *a, **kw: Response()
+        text, _ = client.chat([])
+        self.assertEqual(parse_tool_call(text), ("sh", {"cmd": "dir"}))
+
+
 class TestRetries(unittest.TestCase):
     def setUp(self):
         self.urlopen, self.wait = llm.urllib.request.urlopen, llm.RETRY_WAIT

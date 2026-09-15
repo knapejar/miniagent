@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .protocol import cut_after_call
+from .protocol import cut_after_call, format_tool_call
 
 # Statuses a tunnel or the kaggle-tpu-lab proxy answers with while the route to
 # the server is being re-established - worth another try, unlike a 400.
@@ -49,12 +49,39 @@ class Usage(object):
         return self.completion_tokens / self.elapsed if self.elapsed > 0 else 0.0
 
 
+def calls_to_text(calls, dialect="qwen"):
+    """vLLM started with --enable-auto-tool-choice parses the model's tool call
+    out of the answer even when the request lists no tools, and sends it as
+    structured `tool_calls` with the text removed. Turn the first call back into
+    the markup protocol.py reads. Returns (text, complete): arguments that are
+    not valid JSON mean the call was cut off, so it is left unclosed."""
+    if not calls:
+        return "", True
+    call = calls[min(calls)] if isinstance(calls, dict) else calls[0]
+    function = call.get("function") or call
+    name = (function.get("name") or "").strip()
+    raw = function.get("arguments") or "{}"
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        if not isinstance(args, dict):
+            raise ValueError("arguments are not an object")
+    except ValueError:
+        return "<tool_call>\n<function=%s>\n" % name, False
+    args = {key: value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            for key, value in args.items()}
+    return format_tool_call(name, args, dialect), True
+
+
 class LLMClient(object):
     def __init__(self, cfg):
         self.cfg = cfg
         self.tool_role = "tool"       # probed at runtime: does the server accept it?
 
     # ---------------------------------------------------------- request body
+    @property
+    def _dialect(self):
+        return getattr(self.cfg, "dialect", "spark") or "spark"
+
     @property
     def server_stop(self):
         """Spark stops on </tool_call> at the server. Qwen thinks first, and a
@@ -132,6 +159,12 @@ class LLMClient(object):
         choice = data["choices"][0]
         message = choice.get("message") or {}
         text = message.get("content") or ""
+        finish = choice.get("finish_reason")
+        if message.get("tool_calls") and "<tool_call>" not in text:
+            call_text, complete = calls_to_text(message["tool_calls"], self._dialect)
+            text = (text.rstrip() + "\n" if text.strip() else "") + call_text
+            if not complete:
+                finish = "length"
         if not self.server_stop:
             text = cut_after_call(text)
         if on_delta and text:
@@ -139,7 +172,6 @@ class LLMClient(object):
         usage = data.get("usage") or {}
         details = usage.get("completion_tokens_details") or {}
         elapsed = time.time() - started
-        finish = choice.get("finish_reason")
         return self._close(text, finish), Usage(
             usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
             details.get("reasoning_tokens", 0), finish, elapsed, elapsed)
@@ -150,6 +182,7 @@ class LLMClient(object):
         parts, reasoning_chars, chunks = [], 0, 0
         prompt_tokens = completion_tokens = reasoning_tokens = 0
         finish = None
+        calls = {}             # index -> {"name", "arguments"} from structured tool_calls
         content = ""           # the answer so far, kept only for the client-side stop
         call_end = -1          # where </tool_call> ended in `content`
         with self._request(messages, True, cancel) as response:
@@ -178,6 +211,15 @@ class LLMClient(object):
                     delta = choice.get("delta") or {}
                     piece = delta.get("content")
                     thought = delta.get("reasoning_content") or delta.get("reasoning")
+                    for call in delta.get("tool_calls") or []:
+                        entry = calls.setdefault(call.get("index", 0),
+                                                 {"name": "", "arguments": ""})
+                        function = call.get("function") or {}
+                        entry["name"] = entry["name"] or function.get("name") or ""
+                        entry["arguments"] += function.get("arguments") or ""
+                        chunks += 1
+                        if ttft == 0.0:
+                            ttft = time.time() - started
                     if thought:
                         reasoning_chars += len(thought)
                         chunks += 1
@@ -207,6 +249,15 @@ class LLMClient(object):
                     finish = "stop"
                     break
         elapsed = time.time() - started
+        if calls and CALL_END not in "".join(parts):
+            call_text, complete = calls_to_text(calls, self._dialect)
+            if parts and "".join(parts).strip():
+                call_text = "\n" + call_text
+            parts.append(call_text)
+            if on_delta:
+                on_delta("content", call_text)
+            if not complete:
+                finish = "length"
         if not completion_tokens:      # server sent no usage -> estimate from chunks
             completion_tokens = chunks
         if not reasoning_tokens and reasoning_chars:
