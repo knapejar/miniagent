@@ -73,10 +73,10 @@ DEFAULTS = {
                                    # rollback); we apply patches/mtp-rollback-v0280.diff
                                    # (a port of upstream PR #3178) before serving —
                                    # verified lossless, 12/12 greedy exact-match.
-    "async_scheduling": None,      # None = vLLM's default (on). false passes --no-async-scheduling: needed by
-                                   # clients that use JSON mode / structured outputs while MTP is on (vllm-tpu
-                                   # 0.28.0 hands the scheduler device arrays on that path -> "AttributeError:
-                                   # __delitem__" and the server exits); costs some throughput
+    "async_scheduling": False,     # off: vllm-tpu 0.28.0 with async scheduling + MTP asserts in tpu_runner
+                                   # (_prepare_async_token_substitution_indices) when long agent contexts fill the
+                                   # KV cache and requests get preempted (2026-09-16 10:51 UTC, engine death);
+                                   # it also broke JSON-mode clients ("AttributeError: __delitem__"). None = vLLM default (on)
     "reasoning_effort_default": "xhigh",   # server-side default: xhigh | medium | low
     "tool_call_parser": "qwen3_coder",  # matches Qwen3.8's XML tool format; "" disables
     "text_only": False,            # True: skip the vision tower + its TPU graphs (saves ~8 min,
