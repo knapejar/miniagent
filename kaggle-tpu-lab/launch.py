@@ -774,6 +774,30 @@ def adapt_body(path, body, model=""):
     return body
 
 
+GENERATION_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
+NO_READ_TIMEOUT = ("pinggy", "ngrok")   # cloudflared quick tunnels cut a response silent for 120 s (524)
+
+
+def blocking_generation(path, body):
+    """A generation request answered in one piece: nothing is sent until the whole reply is done,
+    so a long one outlives Cloudflare's 120 s read timeout. Streamed requests are not affected."""
+    if not body or not path.split("?", 1)[0].startswith(GENERATION_PATHS):
+        return False
+    try:
+        return not json.loads(body).get("stream")
+    except (ValueError, AttributeError):
+        return False
+
+
+def prefer_for_request(urls, blocking, avoid=()):
+    """Tunnel order for one request: skip tunnels that already timed it out, and send blocking
+    generations over a tunnel without a read timeout first."""
+    usable = [u for u in urls if u not in avoid] or list(urls)
+    if blocking:
+        usable.sort(key=lambda u: 0 if any(n in u for n in NO_READ_TIMEOUT) else 1)
+    return usable
+
+
 def live_tunnels(st):
     """The kernel's public API URLs that answer right now, best first."""
     tunnels = fetch_tunnels(st)
@@ -829,11 +853,14 @@ def cmd_proxy(args):
             headers["Authorization"] = f"Bearer {st['api_key']}"
             headers["ngrok-skip-browser-warning"] = "1"
             last = "no live tunnel"
+            blocking = blocking_generation(self.path, body)
+            avoid = set()
             for attempt in range(4):
-                urls = resolve(force=attempt > 0)
+                urls = resolve(force=attempt > 0 and not avoid)
                 if not urls:
                     time.sleep(15)
                     continue
+                urls = prefer_for_request(urls, blocking, avoid)
                 u = urllib.parse.urlsplit(urls[0])
                 conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=args.timeout)
                 try:
@@ -845,6 +872,13 @@ def cmd_proxy(args):
                     conn.close()
                     cur["urls"] = []
                     time.sleep(5)
+                    continue
+                if r.status == 524 and len(urls) > 1:
+                    # the tunnel edge gave up waiting (Cloudflare: 120 s without a response byte);
+                    # the server is fine, so try the same request over a tunnel without that limit
+                    last = f"{urls[0]}: tunnel edge HTTP 524"
+                    conn.close()
+                    avoid.add(urls[0])
                     continue
                 if r.status in (502, 503, 504, 530) or (
                         r.status == 404 and r.getheader("Content-Type", "").startswith("text/html")):

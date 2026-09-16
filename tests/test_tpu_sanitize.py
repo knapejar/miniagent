@@ -63,5 +63,27 @@ class TestSanitize(unittest.TestCase):
         self.assertIn('os.environ["VLLM_ENFORCE_STRICT_TOOL_CALLING"] = "0"', src)
 
 
+class TestTunnelReadTimeout(unittest.TestCase):
+    """Cloudflare answers 524 to a response silent for 120 s: long non-streamed generations go
+    over pinggy first, and the kernel front sends keepalive bytes on Cloudflare requests."""
+    urls = ["https://a.trycloudflare.com", "https://x.free.pinggy.net"]
+
+    def test_blocking_generation(self):
+        b = lambda d: json.dumps(d).encode()
+        self.assertTrue(launch.blocking_generation("/v1/messages?beta=true", b({"messages": []})))
+        self.assertFalse(launch.blocking_generation("/v1/messages", b({"stream": True})))
+        self.assertFalse(launch.blocking_generation("/v1/models", b""))
+
+    def test_tunnel_order(self):
+        self.assertTrue(launch.prefer_for_request(self.urls, True)[0].endswith("pinggy.net"))
+        self.assertEqual(launch.prefer_for_request(self.urls, False), self.urls)
+        self.assertEqual(launch.prefer_for_request(self.urls, False, {self.urls[0]}), [self.urls[1]])
+
+    def test_kernel_front_keeps_cloudflare_alive(self):
+        with open(launch.KERNEL_SRC, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('keepalive = "cf-ray" in', src)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,6 +178,23 @@ Clients also ride out an outage now: miniagent treats resets, 502/503 and vLLM's
 the proxy re-reads `~/.kaggle-tpu-lab.json` when it changes and asks DeployMan for fresh tunnel
 URLs when every known one is dead. `server_restarts` is 10.
 
+### 2026-09-16: verified on the TPU, and the 120 s tunnel timeout
+
+The request that crashed the engine went through the proxy and straight over the tunnel:
+answered, `dropped output_config.format, tool_choice, tools.strict` in the front log, no
+EngineDead. Claude Code on Qwen wrote an MD-to-HTML converter with 39 passing tests in 2 min;
+three parallel sessions then ran 8 min with 0 engine deaths and 0 HTTP 500.
+
+One of the three failed with `API Error: 524`: a **non-streamed** generation longer than 120 s.
+Cloudflare quick tunnels cut a response that sends nothing for 120 s (reproduced: 20k tokens
+non-streamed, cloudflared 524 after 125 s, pinggy OK after 154 s). Fixed twice:
+
+- `launch.py proxy` sends non-streamed generations over pinggy/ngrok first and retries a 524
+  over another tunnel;
+- the kernel front server, for a non-streamed generation arriving through Cloudflare (`CF-Ray`),
+  sends 200 + headers after 60 s and a space every 20 s until vLLM answers (leading whitespace is
+  valid JSON). The status of such a response is always 200; faster answers keep their real one.
+
 ## 6. Verification (2026-09-15)
 
 On a Kaggle CPU kernel (`launch.py nettest`), from a Windows 11 PC whose own network blocks

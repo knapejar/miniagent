@@ -840,6 +840,21 @@ def sanitize_request(path, body):
 # ---- sanitize: end ----
 
 
+KEEPALIVE_AFTER_S = 60       # a non-streamed generation silent this long gets its headers early
+KEEPALIVE_EVERY_S = 20
+GENERATION_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
+
+
+def blocking_generation(path, body):
+    """A generation answered in one piece (not streamed): silent until the whole reply is done."""
+    if not body or not path.split("?", 1)[0].startswith(GENERATION_PATHS):
+        return False
+    try:
+        return not json.loads(body).get("stream")
+    except (ValueError, AttributeError):
+        return False
+
+
 class Front(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"         # closing the connection ends a streamed body
 
@@ -884,14 +899,49 @@ class Front(http.server.BaseHTTPRequestHandler):
             _raw.write(f"[front] {self.command} {self.path}: dropped {', '.join(dropped)}\n")
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         conn = http.client.HTTPConnection("127.0.0.1", VLLM_PORT, timeout=3600)
-        try:
-            conn.request(self.command, self.path, body=body or None, headers=headers)
-            resp = conn.getresponse()
-        except OSError:
+        done, result = threading.Event(), {}
+
+        def call():
+            try:
+                conn.request(self.command, self.path, body=body or None, headers=headers)
+                result["resp"] = conn.getresponse()
+            except OSError as e:
+                result["error"] = e
+            done.set()
+
+        threading.Thread(target=call, daemon=True).start()
+        # Cloudflare cuts a response that sends nothing for 120 s (HTTP 524), and a non-streamed
+        # generation sends nothing until it is complete. Past KEEPALIVE_AFTER_S such a request gets
+        # its 200 + headers early and a space every KEEPALIVE_EVERY_S (leading whitespace is valid
+        # JSON); the body follows as vLLM wrote it. Faster answers keep their real status.
+        keepalive = "cf-ray" in {k.lower() for k in self.headers} and blocking_generation(self.path, body)
+        if not done.wait(KEEPALIVE_AFTER_S if keepalive else None):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                while not done.wait(KEEPALIVE_EVERY_S):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                if "error" in result:
+                    self.wfile.write(json.dumps({"error": {"type": "server_unavailable", "code": 503,
+                                                           "message": f"the model server failed: {result['error']}"}}).encode())
+                else:
+                    resp = result["resp"]
+                    if resp.status != 200:
+                        _raw.write(f"[front] {self.path}: HTTP {resp.status} after keepalive\n")
+                    self.wfile.write(resp.read())
+            except OSError:
+                pass
+            finally:
+                conn.close()
+            return
+        if "error" in result:
             conn.close()
             return self._json(503, {"error": {"type": "server_unavailable", "code": 503,
                                               "message": "the model server is not up "
                                               f"(phase: {STATE['phase']}); retry later"}})
+        resp = result["resp"]
         self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() not in HOP_HEADERS or (k.lower() == "content-length"
