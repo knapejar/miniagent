@@ -106,8 +106,8 @@ def summarize(results, wall, args):
         "tool_tokens": args.tool_tokens, "system_tokens": args.system_tokens,
         "wall_s": round(wall, 1), "errors": len(results) - len(ok),
         "ttft_median_s": med([r["ttft"] for r in later]),
-        "ttft_per_1k_prompt_ms": med([1000 * r["ttft"] / (r["prompt_tokens"] / 1000) / 1000
-                                      for r in later if r["prompt_tokens"]]),
+        "ttft_s_per_1k_prompt": med([r["ttft"] / (r["prompt_tokens"] / 1000)
+                                     for r in later if r["prompt_tokens"]]),
         "decode_tps_median": med([r["decode_tps"] for r in ok if r["decode_tps"]]),
         "recall_accuracy": round(sum(r["correct"] for r in checks) / len(checks), 3) if checks else None,
         "per_turn": [{"turn": t, "prompt_tokens": med([r["prompt_tokens"] for r in rs]),

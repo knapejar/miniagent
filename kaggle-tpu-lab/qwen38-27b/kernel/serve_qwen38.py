@@ -105,9 +105,14 @@ DEFAULTS = {
     "ssh_pubkey": "",              # authorized key for root; enables sshd behind its own tunnels
     "served_model_name": "qwen3.8-27b",
     # ---- experiments (defaults = the proven setup above; see docs/experiments.md) ----
-    "runtime_install": [],         # uv pip install args replacing `vllm-tpu==<version>`, e.g. a
-                                   # tpu-inference main build; our 0.28.0 patches are then skipped
-    "quantization": "",            # e.g. "fp8": 8-bit weights quantized at load (~20 GiB HBM -> KV cache)
+    "runtime": "",                 # "" = vllm-tpu 0.28.0 + our patches; a RUNTIMES key builds another stack
+                                   # ("tpu-main-20260915": prefix caching for this hybrid model, MTP off)
+    "weights_model_id": "",        # HF repo served instead of the bf16 dataset, downloaded into RAM, e.g.
+                                   # "Avesed/Qwen3.8-27B-INT8-W8A8" (int8 W8A8, 29 GiB: ~22 GiB more KV cache)
+    "quantization": "",            # only for checkpoints that need the flag; v5e has no native fp8, and
+                                   # online "fp8" on the bf16 checkpoint does not load on TPU
+    "num_gpu_blocks_override": 0,  # pin the attention KV pool; prefix caching at 262k needs it (22000) or the
+                                   # mamba snapshot pool shrinks to the minimum
     "kv_cache_dtype": "",          # e.g. "fp8": ~2x KV tokens if the TPU backend honours it
     "prefix_caching": False,       # hybrid-model prefix caching (tpu-inference main only); forces MTP off
     "additional_config": {},       # --additional-config JSON, e.g. {"custom_mamba_cache_multiplier": 3}
@@ -126,9 +131,9 @@ if not CFG["api_key"]:
 if CFG["prefix_caching"] and CFG["mtp_tokens"]:
     # tpu-inference turns prefix caching off whenever speculative decoding is on (tpu_platform.py)
     CFG["mtp_tokens"] = 0
-EXPERIMENT = {k: CFG[k] for k in ("runtime_install", "quantization", "kv_cache_dtype", "prefix_caching",
-                                  "additional_config", "max_num_batched_tokens", "gpu_memory_utilization")
-              if CFG[k]}
+EXPERIMENT_KEYS = ("runtime", "weights_model_id", "quantization", "kv_cache_dtype", "prefix_caching",
+                   "additional_config", "num_gpu_blocks_override", "max_num_batched_tokens", "gpu_memory_utilization")
+EXPERIMENT = {k: CFG[k] for k in EXPERIMENT_KEYS if CFG[k]}
 
 PORT = 8000                          # front server: what every tunnel points at
 VLLM_PORT = 8001                     # vLLM itself, reached through the front server
@@ -648,9 +653,9 @@ def shutdown(rc):
 
 
 RECONFIGURABLE = ("max_model_len", "max_num_seqs", "mtp_tokens", "text_only", "async_scheduling",
-                  "reasoning_effort_default", "min_token_bucket", "runtime_install", "quantization",
-                  "kv_cache_dtype", "prefix_caching", "additional_config", "max_num_batched_tokens",
-                  "gpu_memory_utilization")
+                  "reasoning_effort_default", "min_token_bucket", "runtime", "weights_model_id", "quantization",
+                  "kv_cache_dtype", "prefix_caching", "additional_config", "num_gpu_blocks_override",
+                  "max_num_batched_tokens", "gpu_memory_utilization")
 RECONFIG = {"pending": None, "start": {}, "last": None}
 
 
@@ -1123,6 +1128,14 @@ def runtime_ok():
     return False
 
 
+# Other serving stacks for `runtime`, pinned so a run is reproducible (docs/experiments.md).
+RUNTIMES = {
+    # tpu-inference nightly == main 10a1415 (Sep 15, has PRs #3422 + #3550: prefix caching for hybrid
+    # models, only without speculative decoding) + vLLM at the commit its CI tests against, built for TPU.
+    "tpu-main-20260915": 'set -euo pipefail\nexport UV_LINK_MODE=copy\nVLLM_SHA=51da0ca66c8065619c79e35dff97aa99aeaf5644\nTPUI=0.29.0.dev20260915\nUV="$PYTHON -m uv"\nVPY="$VENV/bin/python"\nrm -rf "$VENV" /tmp/vllm-src\n$UV venv "$VENV" --python "$PYTHON" -q\necho "tpu-inference==${TPUI}" > /tmp/overrides.txt\n$UV pip install --python "$VPY" --torch-backend=cpu "tpu-inference==${TPUI}"\ngit clone -q --filter=blob:none https://github.com/vllm-project/vllm /tmp/vllm-src\ngit -C /tmp/vllm-src checkout -q "$VLLM_SHA"\n$UV pip install --python "$VPY" --torch-backend=cpu -r /tmp/vllm-src/requirements/tpu.txt --overrides /tmp/overrides.txt\n$UV pip install --python "$VPY" --torch-backend=cpu ninja setuptools-rust setuptools-scm cmake wheel\ncd /tmp/vllm-src\nVLLM_TARGET_DEVICE=tpu MAX_JOBS=32 $UV pip install --python "$VPY" --torch-backend=cpu --no-build-isolation --overrides /tmp/overrides.txt .\n"$VPY" -c "import vllm, importlib.metadata as m; print(\'vllm\', vllm.__version__, \'tpu-inference\', m.version(\'tpu-inference\')); from tpu_inference.core.hybrid_coordinator import MirrorMambaBlockPool"\n',
+}
+
+
 def install_runtime(built=None):
     """Fresh venv with vllm-tpu pinned. CPU torch (what vllm-tpu's own Docker
     image uses) — the default PyPI torch drags in ~3 GB of CUDA libraries that
@@ -1130,14 +1143,17 @@ def install_runtime(built=None):
     dependency resolution to that day so the compile cache keeps matching."""
     ver = CFG["vllm_tpu_version"]
     shutil.rmtree(VENV, ignore_errors=True)
-    if CFG["runtime_install"]:
-        log("   building venv with uv from runtime_install:", " ".join(CFG["runtime_install"]))
-        if (sh([sys.executable, "-m", "pip", "install", "-q", "uv"], "pip") == 0
-                and sh([sys.executable, "-m", "uv", "venv", VENV, "--python", sys.executable, "-q"], "uv") == 0
-                and sh([sys.executable, "-m", "uv", "pip", "install", "--python", PY,
-                        "--torch-backend=cpu", *CFG["runtime_install"]], "uv") == 0):
-            return "uv-custom"
-        return None
+    if CFG["runtime"]:
+        recipe = RUNTIMES.get(CFG["runtime"])
+        if recipe is None:
+            log(f"   unknown runtime {CFG['runtime']!r}; known: {sorted(RUNTIMES)}")
+            return None
+        log(f"   building runtime {CFG['runtime']} (vLLM from source, a few minutes)...")
+        Path("/tmp/runtime.sh").write_text(recipe)
+        env = {**os.environ, "VENV": VENV, "PYTHON": sys.executable}
+        ok = (sh([sys.executable, "-m", "pip", "install", "-q", "uv"], "pip") == 0
+              and sh(["bash", "/tmp/runtime.sh"], "runtime", env=env) == 0)
+        return CFG["runtime"] if ok else None
     pin = ["--exclude-newer", f"{built}T23:59:59Z"] if built else []
     log("   building venv with uv" + (f" (packages as of {built})" if built else "") + "...")
     if (sh([sys.executable, "-m", "pip", "install", "-q", "uv"], "pip") == 0
@@ -1274,13 +1290,13 @@ runtime = install_runtime(manifest.get("built"))
 if runtime is None or not runtime_ok():
     fail("install")
 publish("installed", secs=int(time.time() - t), via=runtime)
-if CFG["runtime_install"]:
-    log("   custom runtime: the vllm-tpu 0.28.0 scheduler fix and MTP patch are not applied")
-    publish("runtime-custom", install=CFG["runtime_install"], versions=runtime_versions())
+if CFG["runtime"]:
+    log(f"   runtime {CFG['runtime']}: the vllm-tpu 0.28.0 scheduler fix and MTP patch are not applied")
+    publish("runtime-custom", runtime=CFG["runtime"], versions=runtime_versions())
 elif not apply_scheduler_fix() and CFG["mtp_tokens"] > 0:
     publish("scheduler-fix-failed", note="MTP stays on; concurrent requests may crash vLLM "
                                          "(it is restarted automatically)")
-if CFG["runtime_install"]:
+if CFG["runtime"]:
     if CFG["mtp_tokens"] > 0:
         log("   note: MTP on a custom runtime runs without our rollback patch")
 elif apply_mtp_patch():
@@ -1318,19 +1334,43 @@ else:
     publish("cache-missing", note="cold compile: expect ~10 extra minutes")
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "55 GB bf16 safetensors")
-weights_slug = CFG["weights_dataset"].split("/")[-1]
-model_path = find_input(weights_slug)
-if model_path and os.path.exists(os.path.join(model_path, "config.json")):
-    publish("weights-mounted", path=model_path)
-else:
-    publish("weights-download", model=CFG["hf_model_id"],
-            note="attach the weights dataset to skip this (~5 min parallel download)")
-    t = time.time()
+WEIGHTS = {"id": None}
+WEIGHT_FILES = ["*.safetensors", "*.json", "*.txt", "*.jinja", "tokenizer*", "vocab*", "merges*"]
+
+
+def ensure_weights():
+    """Point model_path at the weights CFG asks for: the mounted bf16 dataset, or the HF repo in
+    `weights_model_id`, downloaded into /dev/shm (RAM; /kaggle/working has only ~20 GB)."""
+    global model_path
     from huggingface_hub import snapshot_download
-    model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*"])
-    publish("weights-downloaded", secs=int(time.time() - t))
+    repo = CFG["weights_model_id"]
+    t = time.time()
+    try:
+        if repo:
+            publish("weights-download", model=repo, into="/dev/shm")
+            model_path = snapshot_download(repo, allow_patterns=WEIGHT_FILES,
+                                           local_dir="/dev/shm/weights/" + repo.replace("/", "--"))
+            publish("weights-downloaded", model=repo, secs=int(time.time() - t))
+        else:
+            path = find_input(CFG["weights_dataset"].split("/")[-1])
+            if path and os.path.exists(os.path.join(path, "config.json")):
+                model_path = path
+                publish("weights-mounted", path=model_path)
+            else:
+                publish("weights-download", model=CFG["hf_model_id"],
+                        note="attach the weights dataset to skip this (~5 min parallel download)")
+                model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=WEIGHT_FILES)
+                publish("weights-downloaded", secs=int(time.time() - t))
+    except Exception as e:  # noqa: BLE001
+        log(f"   weights failed: {e}")
+        return False
+    WEIGHTS["id"] = repo
+    return True
+
+
+banner(3, "Model weights", CFG["weights_model_id"] or "55 GB bf16 safetensors")
+if not ensure_weights():
+    fail("weights")
 
 
 # ---------------- 4. vLLM server ----------------
@@ -1370,6 +1410,8 @@ def server_args(cfg):
         args += ["--enable-prefix-caching"]
     if cfg["additional_config"]:
         args += ["--additional-config", json.dumps(cfg["additional_config"])]
+    if cfg["num_gpu_blocks_override"]:
+        args += ["--num-gpu-blocks-override", str(cfg["num_gpu_blocks_override"])]
     if cfg["max_num_batched_tokens"]:
         args += ["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])]
     if cfg["gpu_memory_utilization"]:
@@ -1790,14 +1832,14 @@ def start_config(target, reinstall):
     CFG.update(target)
     if CFG["prefix_caching"] and CFG["mtp_tokens"]:
         CFG["mtp_tokens"] = 0
-    EXPERIMENT = {k: CFG[k] for k in ("runtime_install", "quantization", "kv_cache_dtype", "prefix_caching",
-                                      "additional_config", "max_num_batched_tokens", "gpu_memory_utilization")
-                  if CFG[k]}
+    EXPERIMENT = {k: CFG[k] for k in EXPERIMENT_KEYS if CFG[k]}
+    if CFG["weights_model_id"] != WEIGHTS["id"] and not ensure_weights():
+        return None, f"weights {CFG['weights_model_id'] or CFG['weights_dataset']} are not available"
     if reinstall:
-        publish("install", reconfigure=True, runtime_install=CFG["runtime_install"])
-        if install_runtime(None if CFG["runtime_install"] else manifest.get("built")) is None or not runtime_ok():
+        publish("install", reconfigure=True, runtime=CFG["runtime"])
+        if install_runtime(None if CFG["runtime"] else manifest.get("built")) is None or not runtime_ok():
             return None, "runtime install failed"
-        if not CFG["runtime_install"]:
+        if not CFG["runtime"]:
             apply_scheduler_fix()
             if not apply_mtp_patch():
                 CFG["mtp_tokens"] = 0
@@ -1824,12 +1866,12 @@ def reconfigure(srv):
     log(f"   reconfigure: {json.dumps(new)}")
     publish("reconfigure", new=new)
     stop_server(srv)
-    srv, info = start_config(target, reinstall=target["runtime_install"] != old["runtime_install"])
+    srv, info = start_config(target, reinstall=target["runtime"] != old["runtime"])
     if srv is None:
         log(f"   reconfigure FAILED: {info} - restoring the previous settings")
         publish("reconfigure-failed", cause=str(info)[:500], new=new)
         RECONFIG["last"] = {"settings": new, "ok": False, "cause": str(info)[:500]}
-        srv, info = start_config(old, reinstall=target["runtime_install"] != old["runtime_install"])
+        srv, info = start_config(old, reinstall=target["runtime"] != old["runtime"])
         if srv is None:
             log(f"   the previous settings do not start either: {info}")
             publish("failed", step="reconfigure-restore", cause=str(info)[:500])
