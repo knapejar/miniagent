@@ -104,6 +104,15 @@ DEFAULTS = {
     "net_test": False,             # CPU smoke test: dummy HTTP server + tunnels + command channel
     "ssh_pubkey": "",              # authorized key for root; enables sshd behind its own tunnels
     "served_model_name": "qwen3.8-27b",
+    # ---- experiments (defaults = the proven setup above; see docs/experiments.md) ----
+    "runtime_install": [],         # uv pip install args replacing `vllm-tpu==<version>`, e.g. a
+                                   # tpu-inference main build; our 0.28.0 patches are then skipped
+    "quantization": "",            # e.g. "fp8": 8-bit weights quantized at load (~20 GiB HBM -> KV cache)
+    "kv_cache_dtype": "",          # e.g. "fp8": ~2x KV tokens if the TPU backend honours it
+    "prefix_caching": False,       # hybrid-model prefix caching (tpu-inference main only); forces MTP off
+    "additional_config": {},       # --additional-config JSON, e.g. {"custom_mamba_cache_multiplier": 3}
+    "max_num_batched_tokens": 0,   # 0 = vLLM default (2048 with MTP); 4096/8192 = faster prefill
+    "gpu_memory_utilization": 0,   # 0 = default (0.92 on this TPU); each +0.01 ~ +10k KV tokens
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
 }
@@ -114,6 +123,12 @@ if _cfg_file.exists():
     CFG.update(json.loads(_cfg_file.read_text()))
 if not CFG["api_key"]:
     CFG["api_key"] = "sk-" + secrets.token_hex(16)
+if CFG["prefix_caching"] and CFG["mtp_tokens"]:
+    # tpu-inference turns prefix caching off whenever speculative decoding is on (tpu_platform.py)
+    CFG["mtp_tokens"] = 0
+EXPERIMENT = {k: CFG[k] for k in ("runtime_install", "quantization", "kv_cache_dtype", "prefix_caching",
+                                  "additional_config", "max_num_batched_tokens", "gpu_memory_utilization")
+              if CFG[k]}
 
 PORT = 8000                          # front server: what every tunnel points at
 VLLM_PORT = 8001                     # vLLM itself, reached through the front server
@@ -614,6 +629,10 @@ HELP = """commands:
   tunnel [restart]   probe tunnels / restart them
   tunnel pinggy      (re)start the pinggy tunnel (port 443, no account)
   tunnel ngrok <url> <authtoken>   start ngrok with your static domain right now
+  reconfigure        show the reconfigurable settings
+  reconfigure {json} restart vLLM in this session with these settings, e.g.
+                     {"max_num_seqs": 8, "quantization": "fp8"}; the old ones come back if it fails
+  reconfigure reset  back to the settings the session started with
   sh <command>       run a shell command (unknown words run as shell too)
   stop               stop the server and end the Kaggle session"""
 
@@ -626,6 +645,13 @@ def shutdown(rc):
             p.terminate()
     time.sleep(3)
     os._exit(rc)
+
+
+RECONFIGURABLE = ("max_model_len", "max_num_seqs", "mtp_tokens", "text_only", "async_scheduling",
+                  "reasoning_effort_default", "min_token_bucket", "runtime_install", "quantization",
+                  "kv_cache_dtype", "prefix_caching", "additional_config", "max_num_batched_tokens",
+                  "gpu_memory_utilization")
+RECONFIG = {"pending": None, "start": {}, "last": None}
 
 
 def status_text():
@@ -713,6 +739,20 @@ def execute(text):
             else:
                 out = "\n".join(f"{n}: {t['url']} -> {probe_tunnel(t)}"
                                 for n, t in TUNNELS.items()) or "no tunnels"
+        elif word == "reconfigure":
+            arg = rest.strip()
+            if arg in ("", "show"):
+                out = json.dumps({"current": {k: CFG[k] for k in RECONFIGURABLE},
+                                  "pending": RECONFIG.get("pending"), "last": RECONFIG.get("last")}, indent=1)
+            else:
+                new = dict(RECONFIG["start"]) if arg == "reset" else json.loads(arg)
+                unknown = sorted(set(new) - set(RECONFIGURABLE))
+                if unknown:
+                    raise ValueError(f"not reconfigurable: {unknown}; allowed: {list(RECONFIGURABLE)}")
+                RECONFIG["pending"] = new
+                out = ("queued; within 15 s vLLM stops and restarts with " + json.dumps(new)
+                       + " (cold compile ~20-35 min, longer with a new runtime); if it fails the previous "
+                       "settings are restored. Watch with `status` / `log 40`.")
         elif word == "stop":
             publish("stopped", reason="stop-command")
             threading.Timer(2, shutdown, args=(0,)).start()
@@ -1066,6 +1106,11 @@ def apply_scheduler_fix():
         return False
 
 
+def runtime_versions():
+    r = subprocess.run([PY, "-c", "import importlib.metadata as m\nfor d in ('vllm', 'vllm-tpu', 'tpu-inference', 'tpu_inference', 'jax', 'torch'):\n    try: print(d, m.version(d))\n    except Exception: pass"], capture_output=True, text=True)
+    return dict(l.split(" ", 1) for l in r.stdout.splitlines() if " " in l)
+
+
 def runtime_ok():
     r = subprocess.run([PY, "-c", "import importlib.util as u, jax, torch\n"
                         "assert u.find_spec('vllm') and u.find_spec('tpu_inference')\n"
@@ -1085,6 +1130,14 @@ def install_runtime(built=None):
     dependency resolution to that day so the compile cache keeps matching."""
     ver = CFG["vllm_tpu_version"]
     shutil.rmtree(VENV, ignore_errors=True)
+    if CFG["runtime_install"]:
+        log("   building venv with uv from runtime_install:", " ".join(CFG["runtime_install"]))
+        if (sh([sys.executable, "-m", "pip", "install", "-q", "uv"], "pip") == 0
+                and sh([sys.executable, "-m", "uv", "venv", VENV, "--python", sys.executable, "-q"], "uv") == 0
+                and sh([sys.executable, "-m", "uv", "pip", "install", "--python", PY,
+                        "--torch-backend=cpu", *CFG["runtime_install"]], "uv") == 0):
+            return "uv-custom"
+        return None
     pin = ["--exclude-newer", f"{built}T23:59:59Z"] if built else []
     log("   building venv with uv" + (f" (packages as of {built})" if built else "") + "...")
     if (sh([sys.executable, "-m", "pip", "install", "-q", "uv"], "pip") == 0
@@ -1221,10 +1274,16 @@ runtime = install_runtime(manifest.get("built"))
 if runtime is None or not runtime_ok():
     fail("install")
 publish("installed", secs=int(time.time() - t), via=runtime)
-if not apply_scheduler_fix() and CFG["mtp_tokens"] > 0:
+if CFG["runtime_install"]:
+    log("   custom runtime: the vllm-tpu 0.28.0 scheduler fix and MTP patch are not applied")
+    publish("runtime-custom", install=CFG["runtime_install"], versions=runtime_versions())
+elif not apply_scheduler_fix() and CFG["mtp_tokens"] > 0:
     publish("scheduler-fix-failed", note="MTP stays on; concurrent requests may crash vLLM "
                                          "(it is restarted automatically)")
-if apply_mtp_patch():
+if CFG["runtime_install"]:
+    if CFG["mtp_tokens"] > 0:
+        log("   note: MTP on a custom runtime runs without our rollback patch")
+elif apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
     publish("mtp-patch-failed", note="disabling MTP: unsafe without the rollback patch")
@@ -1247,7 +1306,7 @@ n_entries = len(glob.glob(XLA_CACHE + "/*"))
 cache_configs = manifest.get("configs", [])
 this_config = [CFG["max_model_len"], CFG["max_num_seqs"], CFG["mtp_tokens"], CFG["text_only"]]
 if n_entries:
-    covered = (not cache_configs) or (this_config in cache_configs)
+    covered = ((not cache_configs) or (this_config in cache_configs)) and not EXPERIMENT
     publish("cache-restored", entries=n_entries, secs=int(time.time() - t),
             covers_this_config=covered)
     if not covered:
@@ -1303,6 +1362,18 @@ def server_args(cfg):
                  json.dumps({"method": "mtp", "num_speculative_tokens": cfg["mtp_tokens"]})]
     if cfg["tool_call_parser"]:
         args += ["--enable-auto-tool-choice", "--tool-call-parser", cfg["tool_call_parser"]]
+    if cfg["quantization"]:
+        args += ["--quantization", cfg["quantization"]]
+    if cfg["kv_cache_dtype"]:
+        args += ["--kv-cache-dtype", cfg["kv_cache_dtype"]]
+    if cfg["prefix_caching"]:
+        args += ["--enable-prefix-caching"]
+    if cfg["additional_config"]:
+        args += ["--additional-config", json.dumps(cfg["additional_config"])]
+    if cfg["max_num_batched_tokens"]:
+        args += ["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])]
+    if cfg["gpu_memory_utilization"]:
+        args += ["--gpu-memory-utilization", str(cfg["gpu_memory_utilization"])]
     if cfg["reasoning_effort_default"] != "xhigh":
         # The chat template defaults reasoning_effort to 'xhigh'; ship a copy with a
         # different default so the server-side default changes without client changes.
@@ -1662,6 +1733,10 @@ if CFG["fast_start"]:
             "cold (~1 min each) — attach the env dataset for this mode to make sense")
 banner(4, "Starting vLLM", f"TP=8, ctx {CFG['max_model_len']}, {CFG['max_num_seqs']} seqs, "
        f"MTP k={CFG['mtp_tokens']}, {'text-only' if CFG['text_only'] else 'multimodal'}")
+if EXPERIMENT:
+    expect_min += 15                  # graphs outside the compile cache: a cold compile
+    log(f"   EXPERIMENT: {json.dumps(EXPERIMENT)}")
+    publish("experiment", **EXPERIMENT)
 log(f"   expect ~{expect_min} min; progress lines below, full vLLM log in {RAW_LOG}")
 server = launch_server(CFG)
 
@@ -1709,11 +1784,76 @@ else:
     banner(6, "Self-test", "one short generation; the endpoint is usable meanwhile")
 self_test(CFG)
 
+def start_config(target, reinstall):
+    """Install (if the runtime changes) and start vLLM with `target`; the healthy server, or None."""
+    global EXPERIMENT
+    CFG.update(target)
+    if CFG["prefix_caching"] and CFG["mtp_tokens"]:
+        CFG["mtp_tokens"] = 0
+    EXPERIMENT = {k: CFG[k] for k in ("runtime_install", "quantization", "kv_cache_dtype", "prefix_caching",
+                                      "additional_config", "max_num_batched_tokens", "gpu_memory_utilization")
+                  if CFG[k]}
+    if reinstall:
+        publish("install", reconfigure=True, runtime_install=CFG["runtime_install"])
+        if install_runtime(None if CFG["runtime_install"] else manifest.get("built")) is None or not runtime_ok():
+            return None, "runtime install failed"
+        if not CFG["runtime_install"]:
+            apply_scheduler_fix()
+            if not apply_mtp_patch():
+                CFG["mtp_tokens"] = 0
+        publish("installed", reconfigure=True, versions=runtime_versions())
+    srv = launch_server(CFG)
+    t = time.time()
+    while time.time() - t < 5400:
+        if srv.poll() is not None:
+            cause, _, hint = server_death_report()
+            return None, (cause or f"vLLM exited rc={srv.returncode}") + (f" ({hint})" if hint else "")
+        if healthy(CFG):
+            return srv, int(time.time() - t)
+        time.sleep(15)
+    stop_server(srv)
+    return None, "not healthy after 90 min"
+
+
+def reconfigure(srv):
+    """Serve-loop side of the `reconfigure` command: switch settings without a new Kaggle session."""
+    new = RECONFIG["pending"]
+    RECONFIG["pending"] = None
+    old = {k: CFG[k] for k in RECONFIGURABLE}
+    target = {**old, **new}
+    log(f"   reconfigure: {json.dumps(new)}")
+    publish("reconfigure", new=new)
+    stop_server(srv)
+    srv, info = start_config(target, reinstall=target["runtime_install"] != old["runtime_install"])
+    if srv is None:
+        log(f"   reconfigure FAILED: {info} - restoring the previous settings")
+        publish("reconfigure-failed", cause=str(info)[:500], new=new)
+        RECONFIG["last"] = {"settings": new, "ok": False, "cause": str(info)[:500]}
+        srv, info = start_config(old, reinstall=target["runtime_install"] != old["runtime_install"])
+        if srv is None:
+            log(f"   the previous settings do not start either: {info}")
+            publish("failed", step="reconfigure-restore", cause=str(info)[:500])
+            hold_for_debug()
+            shutdown(1)
+    else:
+        RECONFIG["last"] = {"settings": new, "ok": True, "startup_secs": info}
+    url = primary_url()
+    publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+            model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
+            keepalive_min=CFG["keepalive_min"], startup_secs=info if isinstance(info, int) else None,
+            tunnels=tunnel_summary(), experiment=EXPERIMENT, reconfigured=RECONFIG["last"])
+    return srv
+
+
+RECONFIG["start"] = {k: CFG[k] for k in RECONFIGURABLE}
 t_serve = time.time()
 t_beat = t_serve
 restarts = 0
 while time.time() - t_serve < CFG["keepalive_min"] * 60:
     time.sleep(15)
+    if RECONFIG["pending"] is not None:
+        server = reconfigure(server)
+        continue
     if server.poll() is not None:
         # Restarting in place keeps the TPU slot; a new kernel means the queue again.
         restarts += 1
