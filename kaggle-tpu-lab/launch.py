@@ -778,6 +778,27 @@ GENERATION_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "
 NO_READ_TIMEOUT = ("pinggy", "ngrok")   # cloudflared quick tunnels cut a response silent for 120 s (524)
 
 
+CONTEXT_ERROR = re.compile(rb"maximum context length is (\d+) tokens.*?contains at least (\d+) input tokens", re.S)
+
+
+def clamp_max_tokens(body, error):
+    """The request body with max_tokens lowered so prompt + output fit the context, or None when the
+    error is something else or too little room is left to be useful."""
+    m = CONTEXT_ERROR.search(error)
+    if not m:
+        return None
+    room = int(m.group(1)) - int(m.group(2)) - 512
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    key = "max_tokens" if "max_tokens" in data else "max_completion_tokens" if "max_completion_tokens" in data else None
+    if not key or room < 1024 or data[key] <= room:
+        return None
+    data[key] = room
+    return json.dumps(data).encode()
+
+
 def blocking_generation(path, body):
     """A generation request answered in one piece: nothing is sent until the whole reply is done,
     so a long one outlives Cloudflare's 120 s read timeout. Streamed requests are not affected."""
@@ -873,6 +894,24 @@ def cmd_proxy(args):
                     cur["urls"] = []
                     time.sleep(5)
                     continue
+                if r.status == 400 and body and attempt < 3:
+                    error = r.read()
+                    smaller = clamp_max_tokens(body, error)
+                    if smaller:
+                        # prompt + max_tokens over the context (Claude Code's /compact asks for 32k
+                        # output on a ~230k prompt): retry with what still fits
+                        say(f"proxy: max_tokens lowered to fit the context ({len(smaller)} B body)")
+                        body = smaller
+                        conn.close()
+                        continue
+                    self.send_response(400)
+                    for k, v in r.getheaders():
+                        if k.lower() not in hop:
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(error)
+                    conn.close()
+                    return
                 if r.status == 524 and len(urls) > 1:
                     # the tunnel edge gave up waiting (Cloudflare: 120 s without a response byte);
                     # the server is fine, so try the same request over a tunnel without that limit
