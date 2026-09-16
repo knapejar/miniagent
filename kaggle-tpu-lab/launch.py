@@ -782,20 +782,19 @@ CONTEXT_ERROR = re.compile(rb"maximum context length is (\d+) tokens.*?contains 
 
 
 def clamp_max_tokens(body, error):
-    """The request body with max_tokens lowered so prompt + output fit the context, or None when the
-    error is something else or too little room is left to be useful."""
-    m = CONTEXT_ERROR.search(error)
-    if not m:
+    """The request body with a smaller max_tokens after vLLM's "maximum context length" 400, or None.
+    vLLM does not tell the real prompt size ("at least N input tokens" is just the limit minus the
+    requested output), so the output budget is halved per retry, down to 1024 tokens."""
+    if not CONTEXT_ERROR.search(error):
         return None
-    room = int(m.group(1)) - int(m.group(2)) - 512
     try:
         data = json.loads(body)
     except ValueError:
         return None
     key = "max_tokens" if "max_tokens" in data else "max_completion_tokens" if "max_completion_tokens" in data else None
-    if not key or room < 1024 or data[key] <= room:
+    if not key or data[key] <= 1024:
         return None
-    data[key] = room
+    data[key] = max(1024, data[key] // 2)
     return json.dumps(data).encode()
 
 
@@ -875,8 +874,9 @@ def cmd_proxy(args):
             headers["ngrok-skip-browser-warning"] = "1"
             last = "no live tunnel"
             blocking = blocking_generation(self.path, body)
-            avoid = set()
-            for attempt in range(4):
+            avoid, shrinks, attempt = set(), 0, -1
+            while attempt < 3:
+                attempt += 1
                 urls = resolve(force=attempt > 0 and not avoid)
                 if not urls:
                     time.sleep(15)
@@ -894,14 +894,16 @@ def cmd_proxy(args):
                     cur["urls"] = []
                     time.sleep(5)
                     continue
-                if r.status == 400 and body and attempt < 3:
+                if r.status == 400 and body and shrinks < 6:
                     error = r.read()
                     smaller = clamp_max_tokens(body, error)
                     if smaller:
                         # prompt + max_tokens over the context (Claude Code's /compact asks for 32k
                         # output on a ~230k prompt): retry with what still fits
-                        say(f"proxy: max_tokens lowered to fit the context ({len(smaller)} B body)")
+                        say("proxy: prompt + max_tokens over the context - retrying with half the output budget")
                         body = smaller
+                        shrinks += 1
+                        attempt -= 1                      # not a tunnel failure
                         conn.close()
                         continue
                     self.send_response(400)
