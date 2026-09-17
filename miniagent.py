@@ -23,13 +23,23 @@ from ui.render import Renderer
 
 VERSION = "0.2.0"
 
+
+def _truncate(text, limit=500):
+    """Truncate text to a maximum length, adding an ellipsis if cut."""
+    if not text:
+        return text
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
 HELP = """  commands
     /help              this help
     /plan              show the agent's pinned plan
     /stats             metrics of the last run
     /tools             tools and their schemas
     /hints [tool]      hints loaded for each tool (hints/*.json)
-    /context           what is currently taking up the context
+    /context          what is currently taking up the context
+    /history          full conversation with model answers and tool results
     /cwd [path]        show or change the working directory
     /effort <level>    default | none | low | medium | high | xhigh
     /kaggle            re-check the Kaggle model and start its proxy (--kaggle)
@@ -132,6 +142,25 @@ def handle_command(line, cfg, session, renderer, trace, last):
         rest = sum(len(m.get("content") or "") for m in session.messages[3:])
         print("    [3:] %-8s %6d chars  (%d messages, this is what gets cropped)"
               % ("run", rest, max(0, len(session.messages) - 3)))
+        if arg:
+            # Show the full conversation history including assistant answers.
+            print("  " + s.bold("/history - full conversation with model answers:")
+                     + s.dim(""))
+            for i, message in enumerate(session.messages):
+                role = message["role"]
+                content = message.get("content") or ""
+                if role == "assistant":
+                    print("    [step %d] assistant answer (%.1fs): %s"
+                          % (i + 3, session.elapsed_time or 0,
+                             _truncate(content, 500)))
+                elif role == "tool":
+                    print("    [step %d] tool result: %s"
+                          % (i + 3, _truncate(content, 500)))
+                elif role == "user" and i < 3:
+                    continue
+                else:
+                    print("    [step %d] %s: %s"
+                          % (i + 3, role, _truncate(content, 200)))
     elif cmd == "/cwd":
         if arg:
             import os

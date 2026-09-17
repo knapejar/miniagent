@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Conversation history, context management and the pinned plan.
 
 LM Studio does have a context overflow policy (Truncate Middle / Rolling
@@ -79,40 +78,9 @@ class Session(object):
         if text:
             self.messages.append({"role": "assistant", "content": text})
 
-    def add_observation(self, text):
-        # Qwen's chat template wraps a tool message in <tool_response> itself;
-        # wrapping it here too would nest the tags.
-        if self.tool_role == "tool" and self.dialect == "qwen":
-            content = text
-        else:
-            content = wrap_tool_response(text)
-        message = {"role": self.tool_role, "content": content}
-        if self.tool_role == "tool":
-            message["tool_call_id"] = "c%d" % len(self.messages)
-        self.messages.append(message)
-
-    def downgrade_tool_role(self):
-        """Some servers reject role='tool' without a structured tool_calls field."""
-        self.tool_role = "user"
-        for message in self.messages:
-            if message["role"] == "tool":
-                message["role"] = "user"
-                message.pop("tool_call_id", None)
-                if not message["content"].startswith("<tool_response>"):
-                    message["content"] = wrap_tool_response(message["content"])
-
-    # -------------------------------------------------------------- context
-    def total_chars(self):
-        return sum(len(m.get("content") or "") for m in self.messages)
-
-    def estimated_tokens(self):
-        return int(self.total_chars() / self.chars_per_token)
-
-    def calibrate(self, prompt_tokens):
-        """Learn the chars-per-token ratio from the server's real numbers -
-        counting content characters alone underestimates chat template overhead."""
-        if prompt_tokens > 0:
-            self.chars_per_token = max(1.0, float(self.total_chars()) / prompt_tokens)
+    def elapsed_time(self):
+        """Returns the time the current run has been going on, in seconds."""
+        return getattr(self, "_run_start", None)
 
     def should_crop(self):
         return self.estimated_tokens() > self.cfg.ctx * self.cfg.crop_at
@@ -121,23 +89,27 @@ class Session(object):
         """Truncate the middle. The head (system + task + plan) and the most
         recent messages stay; everything between them becomes one marker.
 
-        TODO: summarise instead of dropping, and never summarise the sections
-        currently being worked on (last opened file / running command).
+        Returns the dropped text, or an empty string when nothing was dropped.
         """
-        head = 3 if self.has_plan else 2
-        tail = self.cfg.keep_tail
-        if len(self.messages) <= head + tail + 1:
-            return 0
-        cut = self.messages[head:-tail]
-        dropped = sum(len(m.get("content") or "") for m in cut)
-        self.messages[head:-tail] = [{
-            "role": "user",
-            "content": "[context cropped: %d earlier steps omitted]" % len(cut)}]
+        if not self.should_crop():
+            return ""
+        # Build the boundary: head = system+task+plan, tail = last messages
+        head_end = 3
+        total = len(self.messages)
+        # Keep at least head + tail; the tail is everything after head_end
+        tail_start = total - 1
+        head = self.messages[:head_end]
+        tail = self.messages[tail_start:]
+        middle = self.messages[head_end:tail_start]
+        if not middle:
+            return ""
+        cut = middle[0]
+        dropped = cut.get("content") or ""
+        self.messages = head + tail
         self.cropped = True
         self.crops += 1
         return dropped
 
-    # ------------------------------------------------------------- reminder
     def reminder(self, step, max_steps):
         """Goal anchor appended to the end of an observation - the last thing the
         model reads before its next turn. Returns the text or an empty string."""
@@ -149,3 +121,15 @@ class Session(object):
         return ("\n\n[GOAL] %s\n[step %d/%d - keep going until the goal is fully done "
                 "and verified. Update the plan if anything changed status.]"
                 % (goal, step, max_steps))
+
+    def add_observation(self, text):
+        # Qwen's chat template wraps a tool message in
+        # itself; wrapping it here too would nest the tags.
+        if self.tool_role == "tool" and self.dialect == "qwen":
+            content = text
+        else:
+            content = wrap_tool_response(text)
+        message = {"role": self.tool_role, "content": content}
+        if self.tool_role == "tool":
+            message["tool_call_id"] = "c%d" % len(self.messages)
+        self.messages.append(message)
