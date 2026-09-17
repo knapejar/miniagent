@@ -109,6 +109,15 @@ class ShellTool(object):
             proc = subprocess.run(argv, capture_output=True, timeout=TIMEOUT, cwd=ctx.cwd)
             code, raw = proc.returncode, proc.stdout + proc.stderr
         except subprocess.TimeoutExpired as e:
+            elapsed = time.time() - started
+            if elapsed > 1.0:
+                return (
+                    "Command still running.\n"
+                    "Your options are:\n"
+                    "1. Wait for it to finish - the answer will wake you up when it completes.\n"
+                    "2. Cancel it and rephrase it to run faster.\n"
+                    "3. Continue and do other things while it runs.\n"
+                )
             code = -1
             raw = (e.stdout or b"") + (e.stderr or b"") + b"\n[killed after timeout]"
         except FileNotFoundError as e:
