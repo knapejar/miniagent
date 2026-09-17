@@ -82,6 +82,15 @@ class Session(object):
         """Returns the time the current run has been going on, in seconds."""
         return getattr(self, "_run_start", None)
 
+    def estimated_tokens(self):
+        """Estimates total tokens in the conversation based on character count."""
+        total_chars = self.total_chars()
+        return int(total_chars / self.chars_per_token)
+
+    def total_chars(self):
+        """Returns the total number of characters in all messages."""
+        return sum(len(str(msg.get("content", ""))) for msg in self.messages)
+
     def should_crop(self):
         return self.estimated_tokens() > self.cfg.ctx * self.cfg.crop_at
 
