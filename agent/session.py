@@ -91,6 +91,20 @@ class Session(object):
         """Returns the total number of characters in all messages."""
         return sum(len(str(msg.get("content", ""))) for msg in self.messages)
 
+    def calibrate(self, tokens):
+        """Calibrates the chars_per_token based on actual server token count.
+
+        Updates chars_per_token to better match the server's token estimation
+        so estimated_tokens() becomes more accurate.
+        """
+        if not self.messages:
+            return
+        # Only calibrate if we have actual token data
+        if tokens and self.total_chars():
+            # Adjust chars_per_token: target = total_chars / actual_tokens
+            self.chars_per_token = self.total_chars() / tokens
+            self.chars_per_token = max(self.chars_per_token, 1.0)
+
     def should_crop(self):
         return self.estimated_tokens() > self.cfg.ctx * self.cfg.crop_at
 
