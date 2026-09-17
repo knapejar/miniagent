@@ -128,6 +128,17 @@ def strip_think(text):
     return THINK_RE.sub("", text).strip()
 
 
+def extract_think(text):
+    """The reasoning strip_think drops: everything before the last </think>
+    (the opening tag is often implied) plus any complete <think> blocks."""
+    parts = []
+    if "</think>" in text:
+        head, text = text.rsplit("</think>", 1)
+        parts.append(head.replace("<think>", ""))
+    parts.extend(m[len("<think>"):-len("</think>")] for m in THINK_RE.findall(text))
+    return "\n".join(p.strip() for p in parts if p.strip())
+
+
 def parse_tool_call(text):
     """Return (name, args) or None.
 

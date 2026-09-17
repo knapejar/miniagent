@@ -38,13 +38,14 @@ class LLMError(RuntimeError):
 
 class Usage(object):
     def __init__(self, prompt_tokens=0, completion_tokens=0, reasoning_tokens=0,
-                 finish_reason=None, ttft=0.0, elapsed=0.0):
+                 finish_reason=None, ttft=0.0, elapsed=0.0, reasoning=""):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.reasoning_tokens = reasoning_tokens
         self.finish_reason = finish_reason
         self.ttft = ttft              # time to first token
         self.elapsed = elapsed
+        self.reasoning = reasoning    # the reasoning text itself, kept for the history
 
     @property
     def tps(self):
@@ -167,6 +168,7 @@ class LLMClient(object):
         choice = data["choices"][0]
         message = choice.get("message") or {}
         text = message.get("content") or ""
+        thought = message.get("reasoning_content") or message.get("reasoning") or ""
         finish = choice.get("finish_reason")
         if message.get("tool_calls") and "<tool_call>" not in text:
             call_text, complete = calls_to_text(message["tool_calls"], self._dialect)
@@ -175,6 +177,8 @@ class LLMClient(object):
                 finish = "length"
         if not self.server_stop:
             text = cut_after_call(text)
+        if on_delta and thought:
+            on_delta("reasoning", thought)
         if on_delta and text:
             on_delta("content", text)
         usage = data.get("usage") or {}
@@ -182,12 +186,12 @@ class LLMClient(object):
         elapsed = time.time() - started
         return self._close(text, finish), Usage(
             usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
-            details.get("reasoning_tokens", 0), finish, elapsed, elapsed)
+            details.get("reasoning_tokens", 0), finish, elapsed, elapsed, thought)
 
     def _chat_stream(self, messages, on_delta, cancel=None):
         started = time.time()
         ttft = 0.0
-        parts, reasoning_chars, chunks = [], 0, 0
+        parts, thoughts, reasoning_chars, chunks = [], [], 0, 0
         prompt_tokens = completion_tokens = reasoning_tokens = 0
         finish = None
         calls = {}             # index -> {"name", "arguments"} from structured tool_calls
@@ -237,6 +241,7 @@ class LLMClient(object):
                                 ttft = time.time() - started
                         if thought:
                             reasoning_chars += len(thought)
+                            thoughts.append(thought)
                             chunks += 1
                             if ttft == 0.0:
                                 ttft = time.time() - started
@@ -282,7 +287,8 @@ class LLMClient(object):
         if not reasoning_tokens and reasoning_chars:
             reasoning_tokens = max(1, reasoning_chars // 4)
         return self._close("".join(parts), finish), Usage(
-            prompt_tokens, completion_tokens, reasoning_tokens, finish, ttft, elapsed)
+            prompt_tokens, completion_tokens, reasoning_tokens, finish, ttft, elapsed,
+            "".join(thoughts))
 
     @staticmethod
     def _close(text, finish=None):

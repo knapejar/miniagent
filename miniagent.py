@@ -144,6 +144,13 @@ def handle_command(line, cfg, session, renderer, trace, last):
             if len(content) > 500:
                 content = content[:500] + " ..."
             print("  " + s.bold("[%d] %s" % (i, message["role"])))
+            thinking = (message.get("reasoning_content") or "").strip()
+            if thinking:
+                if len(thinking) > 500:
+                    thinking = thinking[:500] + " ..."
+                print("    " + s.grey("thinking:"))
+                for entry in thinking.splitlines():
+                    print("      " + s.grey(entry))
             for entry in content.splitlines():
                 print("    " + entry)
     elif cmd == "/edit":

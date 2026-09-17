@@ -77,9 +77,15 @@ class Session(object):
         if self.has_plan:
             self.messages[2] = {"role": "user", "content": PLAN_HEADER + text}
 
-    def add_assistant(self, text):
-        if text:
-            self.messages.append({"role": "assistant", "content": text})
+    def add_assistant(self, text, reasoning=""):
+        """Keep the reasoning next to the answer. OpenAI-compatible servers pass
+        `reasoning_content` to the chat template (Qwen renders it back as <think>),
+        and /history shows it."""
+        if text or reasoning:
+            message = {"role": "assistant", "content": text}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            self.messages.append(message)
 
     def add_observation(self, text):
         # Qwen's chat template wraps a tool message in <tool_response> itself;
@@ -105,7 +111,7 @@ class Session(object):
 
     # -------------------------------------------------------------- context
     def total_chars(self):
-        return sum(len(m.get("content") or "") for m in self.messages)
+        return sum(_chars(m) for m in self.messages)
 
     def estimated_tokens(self):
         return int(self.total_chars() / self.chars_per_token)
@@ -131,7 +137,7 @@ class Session(object):
         if len(self.messages) <= head + tail + 1:
             return 0
         cut = self.messages[head:-tail]
-        dropped = sum(len(m.get("content") or "") for m in cut)
+        dropped = sum(_chars(m) for m in cut)
         self.messages[head:-tail] = [{
             "role": "user",
             "content": "[context cropped: %d earlier steps omitted]" % len(cut)}]
@@ -151,3 +157,7 @@ class Session(object):
         return ("\n\n[GOAL] %s\n[step %d/%d - keep going until the goal is fully done "
                 "and verified. Update the plan if anything changed status.]"
                 % (goal, step, max_steps))
+
+
+def _chars(message):
+    return len(message.get("content") or "") + len(message.get("reasoning_content") or "")

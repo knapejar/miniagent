@@ -15,7 +15,7 @@ from .guards import FailureMemory, Progress, ResultRepeat, failed
 from .hints import Hints
 from .jobs import JOB_WAIT
 from .metrics import Metrics
-from .protocol import example_call, malformed, parse_tool_call, strip_think
+from .protocol import example_call, extract_think, malformed, parse_tool_call, strip_think
 from .secrets import redact
 from .tools.shell import auto_background
 
@@ -208,7 +208,9 @@ class AgentLoop(object):
 
             body = strip_think(raw)
             call = parse_tool_call(body)
-            self.session.add_assistant(body)
+            reasoning = "\n".join(t for t in (getattr(usage, "reasoning", ""),
+                                              extract_think(raw)) if t)
+            self.session.add_assistant(body, reasoning)
 
             if call is None:
                 # An empty reply or a cut-off at the token limit is NOT a finished
