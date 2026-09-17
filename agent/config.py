@@ -23,8 +23,8 @@ PROFILES = {
         "top_k": -1,
         # LM Studio ignores chat_template_kwargs; the only working switch for
         # reasoning is reasoning_effort. On large tasks the model loops forever
-        # inside <think>, so reasoning is off by default.
-        "effort": "none",
+        # inside <think>, so reasoning is low by default.
+        "effort": "low",
         "retries": 0,
         "outage_wait": 0,
     },
