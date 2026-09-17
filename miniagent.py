@@ -181,6 +181,10 @@ def main(argv=None):
         except KeyboardInterrupt:
             print()
             return 130
+    else:
+        from agent import lmstudio
+        say = Renderer(cfg, Metrics()).s.dim
+        lmstudio.setup(cfg, say=lambda text: print("  " + say(text)))
 
     tools = default_tools()
     session = Session(cfg, tools)
