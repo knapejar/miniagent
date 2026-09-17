@@ -12,13 +12,16 @@ import sys
 import threading
 
 ESC = "\x1b"
+CTRL_B = "\x02"
 
 
 class CancelWatcher(object):
-    """Sets `event` when the user presses ESC. No-op when stdin is not a TTY."""
+    """Sets `event` when the user presses ESC and `background` on ctrl+b (move the
+    command the agent is waiting for to the background). No-op when stdin is not a TTY."""
 
-    def __init__(self, event):
+    def __init__(self, event, background=None):
         self.event = event
+        self.background = background
         self._stop = threading.Event()
         self._thread = None
         self._restore = None
@@ -40,9 +43,12 @@ class CancelWatcher(object):
 
     def _run(self, reader):
         while not self._stop.is_set():
-            if reader(0.1) == ESC:
+            key = reader(0.1)
+            if key == ESC:
                 self.event.set()
                 return
+            if key == CTRL_B and self.background is not None:
+                self.background.set()
 
     def stop(self):
         self._stop.set()

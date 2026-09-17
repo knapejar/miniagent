@@ -144,12 +144,22 @@ class Renderer(object):
     def _ev_tool_call(self, d):
         tool = d.get("tool")
         summary = tool.summary(d["args"]) if tool else str(d["args"])[:100]
-        print("%s %s%s" % (self.s.cyan(BULLET), self.s.bold(d["name"]),
-                           self.s.dim("(" + summary + ")")))
+        hint = ""
+        if d["name"] == "wait":
+            # the model's decision about a running command, spelled out
+            summary = summary.replace("-> WAIT", "-> waits for it to end")
+            summary = summary.replace("-> BACKGROUND", "-> moves it to the background")
+            summary = summary.replace("-> KILL", "-> kills it")
+        if d["name"] in ("sh", "wait"):
+            hint = self.s.dim("   ctrl+b: run in background")
+        print("%s %s%s%s" % (self.s.cyan(BULLET), self.s.bold(d["name"]),
+                             self.s.dim("(" + summary + ")"), hint))
 
     def _ev_tool_result(self, d):
         lines = d["text"].splitlines() or ["(no output)"]
         colour = self.s.red if d["error"] else self.s.grey
+        if d["text"].startswith(("[RUNNING]", "[LAST WARNING]", "moved ", "killed ")):
+            colour = self.s.yellow
         for i, line in enumerate(lines[:RESULT_LINES]):
             prefix = "  %s  " % ELBOW if i == 0 else "     "
             print(prefix + colour(line[:200]))

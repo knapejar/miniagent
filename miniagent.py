@@ -16,6 +16,7 @@ from agent.loop import AgentLoop
 from agent.metrics import Metrics
 from agent.session import Session
 from agent.tools import default_tools
+from agent.tools.shell import kill_all
 from agent.trace import Trace
 from ui import ansi
 from ui.keys import CancelWatcher
@@ -23,34 +24,27 @@ from ui.render import Renderer
 
 VERSION = "0.2.0"
 
-
-def _truncate(text, limit=500):
-    """Truncate text to a maximum length, adding an ellipsis if cut."""
-    if not text:
-        return text
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
-
 HELP = """  commands
     /help              this help
     /plan              show the agent's pinned plan
     /stats             metrics of the last run
     /tools             tools and their schemas
     /hints [tool]      hints loaded for each tool (hints/*.json)
-    /context          what is currently taking up the context
-    /history          full conversation with model answers and tool results
+    /context           what is currently taking up the context
+    /history           the whole conversation, model answers and tool results
     /cwd [path]        show or change the working directory
     /effort <level>    default | none | low | medium | high | xhigh
     /kaggle            re-check the Kaggle model and start its proxy (--kaggle)
     /approve <mode>    auto | all | none
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
+    /edit <text>       replace the current task (e.g. after cancelling it)
     /trace             path to the JSONL trace
     /quit              exit
     !<command>         run a shell command directly, without the model
 
   esc during a run stops the agent immediately
+  ctrl+b moves a command the agent is waiting for to the background
 """
 
 
@@ -61,7 +55,7 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
                      approve_fn=renderer.approval, cancel=cancel)
     renderer.metrics = loop.metrics
     snapshot = {}
-    watcher = CancelWatcher(cancel).start()
+    watcher = CancelWatcher(cancel, session.background_key).start()
     try:
         for event, data in loop.run(task, on_delta=renderer.on_delta):
             renderer.handle(event, data)
@@ -142,25 +136,25 @@ def handle_command(line, cfg, session, renderer, trace, last):
         rest = sum(len(m.get("content") or "") for m in session.messages[3:])
         print("    [3:] %-8s %6d chars  (%d messages, this is what gets cropped)"
               % ("run", rest, max(0, len(session.messages) - 3)))
-        if arg:
-            # Show the full conversation history including assistant answers.
-            print("  " + s.bold("/history - full conversation with model answers:")
-                     + s.dim(""))
-            for i, message in enumerate(session.messages):
-                role = message["role"]
-                content = message.get("content") or ""
-                if role == "assistant":
-                    print("    [step %d] assistant answer (%.1fs): %s"
-                          % (i + 3, session.elapsed_time or 0,
-                             _truncate(content, 500)))
-                elif role == "tool":
-                    print("    [step %d] tool result: %s"
-                          % (i + 3, _truncate(content, 500)))
-                elif role == "user" and i < 3:
-                    continue
-                else:
-                    print("    [step %d] %s: %s"
-                          % (i + 3, role, _truncate(content, 200)))
+    elif cmd == "/history":
+        if len(session.messages) <= 1:
+            print("  " + s.dim("no conversation yet"))
+        for i, message in enumerate(session.messages[1:], 1):
+            content = (message.get("content") or "").strip()
+            if len(content) > 500:
+                content = content[:500] + " ..."
+            print("  " + s.bold("[%d] %s" % (i, message["role"])))
+            for entry in content.splitlines():
+                print("    " + entry)
+    elif cmd == "/edit":
+        if not arg:
+            print("  " + s.dim("/edit <text> replaces the current task"))
+        elif len(session.messages) < 2:
+            print("  " + s.dim("no task yet - just type it"))
+        else:
+            session.messages[1] = {"role": "user", "content": arg}
+            session.goal = arg
+            print("  " + s.dim("task replaced (%d chars)" % len(arg)))
     elif cmd == "/cwd":
         if arg:
             import os
@@ -228,6 +222,7 @@ def main(argv=None):
     if task:                                   # one-shot run
         snapshot = run_task(cfg, session, client, tools, trace, renderer, task)
         renderer.summary(snapshot)
+        kill_all(session)
         trace.close()
         return 0
 
@@ -247,10 +242,11 @@ def main(argv=None):
             continue
         if line.startswith("!"):
             from agent.tools.shell import ShellTool
-            print(renderer.s.grey(ShellTool().run(session, cmd=line[1:])))
+            print(renderer.s.grey(ShellTool().run_foreground(session, line[1:])))
             continue
         last = run_task(cfg, session, client, tools, trace, renderer, line)
 
+    kill_all(session)
     trace.close()
     print(renderer.s.dim("  bye"))
     return 0

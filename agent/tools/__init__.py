@@ -33,7 +33,7 @@ class Tool(object):
                          for k, v in args.items())
 
 
-from .shell import ShellTool                       # noqa: E402
+from .shell import ShellTool, WaitTool                    # noqa: E402
 from .files import ReadTool, WriteTool, EditTool   # noqa: E402
 from .search import GrepTool                       # noqa: E402
 from .plan import PlanTool                         # noqa: E402
@@ -42,7 +42,7 @@ from .web import WebSearchTool, BrowseTool         # noqa: E402
 
 
 def default_tools():
-    return [ShellTool(), ReadTool(), WriteTool(), EditTool(), GrepTool(),
+    return [ShellTool(), WaitTool(), ReadTool(), WriteTool(), EditTool(), GrepTool(),
             WebSearchTool(), BrowseTool(), PlanTool(), AskTool()]
 
 
@@ -50,6 +50,6 @@ def by_name(tools):
     return {t.name: t for t in tools}
 
 
-__all__ = ["Tool", "ShellTool", "ReadTool", "WriteTool", "EditTool", "GrepTool",
+__all__ = ["Tool", "ShellTool", "WaitTool", "ReadTool", "WriteTool", "EditTool", "GrepTool",
            "PlanTool", "AskTool", "WebSearchTool", "BrowseTool",
            "default_tools", "by_name"]

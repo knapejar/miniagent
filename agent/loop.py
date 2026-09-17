@@ -17,6 +17,7 @@ from .jobs import JOB_WAIT
 from .metrics import Metrics
 from .protocol import example_call, malformed, parse_tool_call, strip_think
 from .secrets import redact
+from .tools.shell import auto_background
 
 OBS_MAX_CHARS = 3000
 MAX_EMPTY_REPLIES = 3
@@ -50,6 +51,7 @@ class AgentLoop(object):
         self.metrics = Metrics()
         self.failures = getattr(session, "failures", None) or FailureMemory()
         session.failures = self.failures
+        session.cancel = cancel              # lets a waiting sh command notice esc
         self.repeats = ResultRepeat()
         self.progress = Progress()
         self.hints = Hints()
@@ -231,6 +233,8 @@ class AgentLoop(object):
                     self.session.add_observation(
                         correction + self.session.reminder(step, self.cfg.max_steps))
                     continue
+                for text in auto_background(self.session):
+                    yield "note", {"level": "info", "text": "undecided command: " + text[:140]}
                 delivered = self._deliver_jobs(step, wait=JOB_WAIT)
                 if delivered:
                     # Work it asked for is only now arriving; answering without
@@ -268,6 +272,10 @@ class AgentLoop(object):
                     + " and its values are plain text."
                     + self.session.reminder(step, self.cfg.max_steps))
                 continue
+            if name != "wait":
+                for text in auto_background(self.session):
+                    self._log("auto_background", step=step, text=text[:200])
+                    yield "note", {"level": "info", "text": "undecided command: " + text[:140]}
             yield "tool_call", {"name": name, "args": args, "tool": self.tools.get(name)}
 
             key = self._key(name, args)
