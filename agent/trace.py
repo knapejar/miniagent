@@ -8,9 +8,12 @@ import json
 import os
 import time
 
+from . import paths
+
 
 class Trace(object):
-    def __init__(self, directory="runs", name=None):
+    def __init__(self, directory=None, name=None):
+        directory = paths.runs_dir() if directory is None else directory
         self.path = None
         self._fh = None
         if directory:

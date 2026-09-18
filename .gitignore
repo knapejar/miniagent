@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
+# only if someone points --trace-dir back into the project; by default traces go
+# to ~/.miniagent/projects/<slug>/runs/
 runs/
+.miniagent/
 workspace/
 sandbox/
 /*.html

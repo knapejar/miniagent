@@ -3,6 +3,7 @@
 import argparse
 import os
 
+from . import paths
 from .protocol import DIALECTS, dialect_for
 
 EFFORTS = ("default", "none", "low", "medium", "high", "xhigh")
@@ -100,7 +101,9 @@ class Config(object):
         self.show_reasoning = kw.get("show_reasoning", True)
         self.redact = kw.get("redact", True)       # mask secrets in tool output
         self.async_web = kw.get("async_web", False)  # never block on web tools
-        self.trace_dir = kw.get("trace_dir", "runs")
+        # Traces go to ~/.miniagent/projects/<slug>/runs, next to the memory for
+        # the same project, so no run ever litters the directory it works in.
+        self.trace_dir = kw.get("trace_dir") or paths.runs_dir(self.workdir)
         self.run_name = kw.get("run_name", None)
         self.timeout = kw.get("timeout", 900)
 

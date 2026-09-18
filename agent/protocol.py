@@ -30,6 +30,8 @@ import json
 import os
 import re
 
+from . import paths
+
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
 ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
 FUNCTION_RE = re.compile(r"<function=([^>\n]+)>")
@@ -91,10 +93,11 @@ Rules:
   tool_call. No status tables, no checklists, no restating what you did.
 - If you are blocked by something you cannot do yourself, call ask instead of
   retrying a command that already failed.
-- Project memory lives in .miniagent/memory/INDEX.md (one line per note, nest a
-  subfolder with its own INDEX.md per topic once one file is not enough). Read a
-  note before rediscovering something; write one only for a fact worth reusing
-  later (a host, a login, a working command) - create the file yourself if missing.
+- Your state for this project lives in {state_dir}: memory/INDEX.md (one line per
+  note, nest a subfolder with its own INDEX.md per topic once one file is not
+  enough) and runs/*.jsonl (the trace of every past run here). Read a note, or
+  grep the old runs, before rediscovering something; write a note only for a fact
+  worth reusing later (a host, a login, a working command) - create it if missing.
 
 Working directory: {cwd}{secrets}{memory}"""
 
@@ -102,7 +105,7 @@ MEMORY_MAX_CHARS = 1500
 
 
 def _load_memory(cwd):
-    path = os.path.join(cwd, ".miniagent", "memory", "INDEX.md")
+    path = paths.memory_index(cwd)
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read().strip()
@@ -112,7 +115,7 @@ def _load_memory(cwd):
         return ""
     if len(text) > MEMORY_MAX_CHARS:
         text = text[:MEMORY_MAX_CHARS] + "\n... (truncated, read the file for the rest)"
-    return "\n\nProject memory (.miniagent/memory/INDEX.md):\n" + text
+    return "\n\nProject memory (%s):\n%s" % (path, text)
 
 
 def render_tools(tools, dialect="spark"):
@@ -139,6 +142,7 @@ def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names
     block = QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS
     return SYSTEM_TEMPLATE.format(tools_block=block.format(tools=render_tools(tools, dialect)),
                                   cwd=cwd, os_name=os_name, shell=shell, secrets=secrets,
+                                  state_dir=paths.project_dir(cwd),
                                   memory=_load_memory(cwd))
 
 

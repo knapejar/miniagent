@@ -16,13 +16,51 @@ from agent.secrets import has_secret, redact                          # noqa: E4
 from agent.session import Session                                     # noqa: E402
 from agent.tools import default_tools                                 # noqa: E402
 from agent.tools.shell import looks_like_powershell                   # noqa: E402
+from agent import paths                                               # noqa: E402
 
 # Paid for in every turn of the model - a budget, not a style rule. Raised from
 # 1100 when websearch and browse gained multi-target and background: 26 tokens
 # that turn four sequential searches (25.7s) into one call (4.7s). Raised again
-# to 1350 for the .miniagent/memory/ convention rule (agent/protocol.py).
+# to 1350 for the project-state convention rule (agent/protocol.py).
 SYSTEM_PROMPT_TOKEN_BUDGET = 1350
 
+
+class TestPaths(unittest.TestCase):
+    """State belongs in ~/.miniagent, never in the directory being worked on."""
+
+    def setUp(self):
+        self._home = os.environ.get(paths.ENV_HOME)
+        os.environ[paths.ENV_HOME] = os.path.join(os.path.abspath("."), "_home_for_tests")
+
+    def tearDown(self):
+        if self._home is None:
+            os.environ.pop(paths.ENV_HOME, None)
+        else:
+            os.environ[paths.ENV_HOME] = self._home
+
+    def test_slug_flattens_the_absolute_path(self):
+        self.assertEqual(paths.slug(os.path.abspath(os.sep)).count(os.sep), 0)
+        self.assertNotIn(":", paths.slug("."))
+        self.assertNotIn(" ", paths.slug("."))
+
+    def test_two_projects_get_two_slots(self):
+        here, up = paths.project_dir("."), paths.project_dir("..")
+        self.assertNotEqual(here, up)
+        self.assertTrue(here.startswith(paths.home()))
+
+    def test_memory_and_runs_sit_side_by_side(self):
+        self.assertEqual(os.path.dirname(paths.runs_dir(".")), paths.project_dir("."))
+        self.assertEqual(os.path.dirname(paths.memory_dir(".")), paths.project_dir("."))
+        self.assertEqual(paths.memory_index("."),
+                         os.path.join(paths.memory_dir("."), "INDEX.md"))
+
+    def test_the_trace_never_lands_in_the_working_directory(self):
+        cfg = Config(workdir=".")
+        self.assertTrue(cfg.trace_dir.startswith(paths.home()))
+        self.assertEqual(cfg.trace_dir, paths.runs_dir("."))
+
+    def test_an_explicit_trace_dir_still_wins(self):
+        self.assertEqual(Config(trace_dir="elsewhere").trace_dir, "elsewhere")
 
 class TestProtocol(unittest.TestCase):
     def test_native_spark_format(self):

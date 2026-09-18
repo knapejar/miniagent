@@ -273,8 +273,16 @@ back nothing new get a nudge.
 
 **Live metrics.** Tokens, tokens per second and elapsed time while it generates; a
 summary of steps, token split, time in tools versus generation, context crops and
-repeat loops when it finishes. Every run is written to `runs/*.jsonl`, which makes two
-models comparable on the same task.
+repeat loops when it finishes. Every run is written to a JSONL trace under
+`~/.miniagent/projects/<slug>/runs/`, which makes two models comparable on the same task.
+
+**Memory and history.** Nothing is written into the directory the agent works in.
+Per project, its state lives in `~/.miniagent/projects/<slug>/`, where the slug is the
+project's absolute path with the separators flattened to dashes
+(`C--Users-Jarda-REPO-Moje-miniagent`). `memory/INDEX.md` holds the notes the agent
+writes for itself and is loaded into the system prompt on every start; `runs/*.jsonl`
+holds every past trace, so the agent can grep its own history of this project.
+Set `MINIAGENT_HOME` to move the whole thing elsewhere.
 
 **Rendered answers.** Bold, italic, headings, lists, quotes, code fences, aligned
 tables and highlighted links, streamed as they arrive.
@@ -338,6 +346,7 @@ agent/
   secrets.py          credential masking
   metrics.py          tokens, tokens per second, timings
   trace.py            JSONL run trace
+  paths.py            where state lives: ~/.miniagent/projects/<slug>/
   tools/              sh, read, write, edit, grep, websearch, browse, plan, ask
 ui/
   ansi.py             colours, spinner, formatting
@@ -368,7 +377,8 @@ python miniagent.py -f tasks/hard/h08_markdown.txt --run-name cloud_h08 ^
        --url https://api.anthropic.com/v1 --model claude-sonnet-5 --api-key %API_KEY%
 ```
 
-Compare `runs/*.jsonl` — steps, tokens, crops, loops — and above all the independent
+Compare the traces in `~/.miniagent/projects/<slug>/runs/` — steps, tokens, crops,
+loops — and above all the independent
 checkers in `verify/`. An agent's own claim of success is not evidence: during testing
 one model wrote a test file with 108 asserts, never called a single test function,
 printed `ALL OK` and reported the task complete.
