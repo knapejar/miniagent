@@ -27,6 +27,7 @@ The server has a parser for it, but it only runs when the request carries
 the system prompt the way Qwen's template does, and the parser reads both.
 """
 import json
+import os
 import re
 
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
@@ -90,8 +91,28 @@ Rules:
   tool_call. No status tables, no checklists, no restating what you did.
 - If you are blocked by something you cannot do yourself, call ask instead of
   retrying a command that already failed.
+- Project memory lives in .miniagent/memory/INDEX.md (one line per note, nest a
+  subfolder with its own INDEX.md per topic once one file is not enough). Read a
+  note before rediscovering something; write one only for a fact worth reusing
+  later (a host, a login, a working command) - create the file yourself if missing.
 
-Working directory: {cwd}{secrets}"""
+Working directory: {cwd}{secrets}{memory}"""
+
+MEMORY_MAX_CHARS = 1500
+
+
+def _load_memory(cwd):
+    path = os.path.join(cwd, ".miniagent", "memory", "INDEX.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    if len(text) > MEMORY_MAX_CHARS:
+        text = text[:MEMORY_MAX_CHARS] + "\n... (truncated, read the file for the rest)"
+    return "\n\nProject memory (.miniagent/memory/INDEX.md):\n" + text
 
 
 def render_tools(tools, dialect="spark"):
@@ -117,7 +138,8 @@ def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names
                    + ", ".join(sorted(secret_names)))
     block = QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS
     return SYSTEM_TEMPLATE.format(tools_block=block.format(tools=render_tools(tools, dialect)),
-                                  cwd=cwd, os_name=os_name, shell=shell, secrets=secrets)
+                                  cwd=cwd, os_name=os_name, shell=shell, secrets=secrets,
+                                  memory=_load_memory(cwd))
 
 
 def strip_think(text):

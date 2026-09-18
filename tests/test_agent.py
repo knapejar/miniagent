@@ -19,8 +19,9 @@ from agent.tools.shell import looks_like_powershell                   # noqa: E4
 
 # Paid for in every turn of the model - a budget, not a style rule. Raised from
 # 1100 when websearch and browse gained multi-target and background: 26 tokens
-# that turn four sequential searches (25.7s) into one call (4.7s).
-SYSTEM_PROMPT_TOKEN_BUDGET = 1200
+# that turn four sequential searches (25.7s) into one call (4.7s). Raised again
+# to 1350 for the .miniagent/memory/ convention rule (agent/protocol.py).
+SYSTEM_PROMPT_TOKEN_BUDGET = 1350
 
 
 class TestProtocol(unittest.TestCase):
