@@ -29,6 +29,22 @@ PROFILES = {
         "retries": 0,
         "outage_wait": 0,
     },
+    # The same LM Studio, but on the GPU box WINGPU (desktop-h9tgll8), reached
+    # over Tailscale. It serves on 0.0.0.0:1234 and asks for no key.
+    "wingpu": {
+        "url": lambda: os.getenv("MINIAGENT_WINGPU_URL", "http://100.75.132.66:1234/v1"),
+        "model": lambda: os.getenv("MINIAGENT_WINGPU_MODEL", "spark-x2.5-4b"),
+        "api_key": lambda: os.getenv("MINIAGENT_WINGPU_KEY", "lmstudio"),
+        "ctx": 65536,
+        "max_tokens": 8192,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": -1,
+        "effort": "low",
+        # Tailscale re-resolves a route now and then; a couple of retries ride it out.
+        "retries": 2,
+        "outage_wait": 0,
+    },
     # Qwen3.8-27B on a Kaggle TPU, started by kaggle-tpu-lab (`launch.py serve`)
     # and reached through its local proxy (`launch.py proxy`). See agent/kaggle.py.
     "kaggle": {
