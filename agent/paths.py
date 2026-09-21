@@ -26,6 +26,16 @@ def home():
                            or os.path.join(os.path.expanduser("~"), ".miniagent"))
 
 
+def default_profile_file():
+    """One line holding the profile to use when none is given on the command line."""
+    return os.path.join(home(), "profile")
+
+
+def key_file(profile):
+    """Where a profile's API key may be kept instead of in the environment."""
+    return os.path.join(home(), "%s.key" % profile)
+
+
 def slug(cwd="."):
     """A project path flattened into one filename-safe component."""
     path = os.path.abspath(cwd)

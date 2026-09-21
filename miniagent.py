@@ -77,7 +77,11 @@ class MemoryJob(object):
         """Stop waiting for it and print whatever it got to say."""
         if not wait:
             self.cancel.set()
-        self.thread.join(timeout=20 if wait else 5)
+        try:
+            self.thread.join(timeout=5 if wait else 1)
+        except KeyboardInterrupt:           # ctrl+c means now, not in 20s
+            self.cancel.set()
+            self.thread.join(timeout=2)
         for event, data in self.events:
             self.renderer.handle(event, data)
         self.events = []
@@ -274,7 +278,7 @@ def main(argv=None):
 
     tools = default_tools()
     session = Session(cfg, tools)
-    client = LLMClient(cfg)
+    client = LLMClient(cfg, tools)
     trace = Trace(cfg.trace_dir, cfg.run_name)
     renderer = Renderer(cfg, Metrics())
 

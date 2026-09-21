@@ -216,6 +216,7 @@ class Renderer(object):
         self._stop_spinner()
         reason = {"final": self.s.green("done"),
                   "limit": self.s.yellow("step limit reached (raise --max-steps)"),
+                  "forced": self.s.yellow("answered from what was already known"),
                   "stalled": self.s.red("stalled (3 replies with no tool call)"),
                   "cancelled": self.s.yellow("cancelled with esc"),
                   "asked": self.s.cyan("waiting for your answer"),

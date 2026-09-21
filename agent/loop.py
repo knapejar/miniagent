@@ -23,6 +23,17 @@ from .tools.shell import auto_background
 
 OBS_MAX_CHARS = 3000
 MAX_EMPTY_REPLIES = 3
+
+# A reply with no tool call and no answer means the model spent its whole budget
+# inside <think>. Repeating the same ask gets the same spiral, so each correction
+# takes a step more thinking away: first a plain nudge with its reasoning intact,
+# then the same step with the thinking turned off, and last an answer forced out
+# of what it already has. A run ends with an answer, never empty-handed.
+FORCE_ANSWER = """[ANSWER NOW] Your last replies were all reasoning and no answer,
+so this run is out of thinking time. Do not call a tool and do not think any
+further. Write the answer to the task in plain prose from what you already
+found above. If something is still unknown, answer with what is known and say in
+one line what is missing."""
 OUTAGE_POLL = 30          # seconds between retries while the model server is down
 LOOP_WINDOW = 3            # identical calls in a row that count as a stall
 PLAN_NUDGE_AFTER = 15      # steps without a plan update before nudging
@@ -89,6 +100,7 @@ class AgentLoop(object):
         self._since_plan = 0
         self._recent = []
         self._empty = 0
+        self._no_think = False
         self._pending_crop = 0
 
     # ------------------------------------------------------------- helpers
@@ -99,25 +111,34 @@ class AgentLoop(object):
     def _cancelled(self):
         return self.cancel is not None and self.cancel.is_set()
 
-    def _call_model(self, on_delta):
-        """Call the model; on context overflow, crop and retry once."""
+    def _call_model(self, on_delta, effort=None):
+        """Call the model; on context overflow, crop and retry once.
+
+        `effort` overrides the reasoning effort for this one call - the loop turns
+        the thinking down when a reply came back empty, and back up right after."""
         if self.session.should_crop():
             dropped = self.session.crop()
             if dropped:
                 self.metrics.crops += 1
                 self._log("crop", chars=dropped)
                 self._pending_crop = dropped
+        # effort is only passed when it is overridden, so a client that does not
+        # know the argument (tests, other backends) still works.
+        extra = {"effort": effort} if effort else {}
         try:
-            text, usage = self.client.chat(self.session.messages, on_delta, self.cancel)
+            text, usage = self.client.chat(self.session.messages, on_delta, self.cancel,
+                                           **extra)
         except LLMError as e:
             if e.overflow and self.session.crop():
                 self.metrics.crops += 1
                 self._log("crop_on_overflow", err=str(e)[:200])
-                text, usage = self.client.chat(self.session.messages, on_delta, self.cancel)
+                text, usage = self.client.chat(self.session.messages, on_delta, self.cancel,
+                                               **extra)
             elif self.session.tool_role == "tool" and "tool" in str(e).lower():
                 self.session.downgrade_tool_role()
                 self._log("tool_role_fallback", err=str(e)[:200])
-                text, usage = self.client.chat(self.session.messages, on_delta, self.cancel)
+                text, usage = self.client.chat(self.session.messages, on_delta, self.cancel,
+                                               **extra)
             else:
                 raise
         self.session.calibrate(usage.prompt_tokens)
@@ -267,6 +288,53 @@ class AgentLoop(object):
         yield "memory_save", {"index": index, "wrote": wrote, "steps": steps,
                               "calls": calls, "text": reply}
 
+    # --------------------------------------------------------- forced answer
+    def _force_answer(self, step, on_delta, reason="stalled"):
+        """Last resort: make the model say what it has, with the thinking off.
+
+        A run that ends on a spiral or on the step limit still knows things the
+        user asked for - the answer was usually already in the observations. So
+        instead of ending empty, one thinking-free call turns what is in the
+        history into prose. Yields the same (final, end) pair a normal answer
+        does, so nothing downstream has to know this happened."""
+        self._log("force_answer", step=step, reason=reason)
+        yield "note", {"level": "warn",
+                       "text": "%s - answering from what is already known" % reason}
+        self.session.add_observation(FORCE_ANSWER)
+        try:
+            raw, _usage = self._call_model(on_delta, "none")
+        except (LLMError, OSError) as e:
+            self._log("force_failed", err="%s: %s" % (type(e).__name__, e))
+            raw = ""
+        # It may still answer with a tool call it was told not to make; the prose
+        # in front of it is the answer, and the call itself is dropped.
+        text = strip_think(raw)
+        call = parse_tool_call(text)
+        if call is not None:
+            text = text.split("<tool_call>")[0]
+        text = text.strip()
+        if not text:
+            # Even the forced call came back empty. The last thing the model saw
+            # is still worth more to the user than a blank screen.
+            text = ("I could not put this together into an answer - the model ran "
+                    "out of room to reply. This is the last thing it found:\n\n"
+                    + self._last_observation())
+            self._log("force_empty", step=step)
+        self.session.add_assistant(text)
+        self._log("final", step=step, text=text, metrics=self.metrics.snapshot())
+        yield "final", {"text": text}
+        yield "end", {"reason": "forced", "metrics": self.metrics.snapshot(),
+                      "memory_due": bool(getattr(self.cfg, "memory", True))}
+
+    def _last_observation(self):
+        for message in reversed(self.session.messages):
+            if message["role"] in ("tool", "user") and message is not self.session.messages[0]:
+                text = (message.get("content") or "").strip()
+                # the session wraps an observation in a tag, so look inside it
+                if text and not any(m in text for m in ("[ERROR]", "[ANSWER NOW]", "[MEMORY]")):
+                    return clip(text, 1200)
+        return "(nothing)"
+
     # ----------------------------------------------------------------- run
     def run(self, task, on_delta=None):
         """`on_delta(kind, text)` receives reply chunks as they arrive - the
@@ -274,6 +342,7 @@ class AgentLoop(object):
         generation finished and the live output and tokens/s would stop being live."""
         self.session.start(task)
         self._recent, self._empty, self._pending_crop = [], 0, 0
+        self._no_think = False
         self._since_plan = 0
         self.hints.reset()
         self._log("task", task=task, model=self.cfg.model, config=self.cfg.as_dict())
@@ -290,7 +359,8 @@ class AgentLoop(object):
             waited = 0
             while True:
                 try:
-                    raw, usage = self._call_model(on_delta)
+                    raw, usage = self._call_model(
+                        on_delta, "none" if self._no_think else None)
                     break
                 except LLMError as e:
                     limit = getattr(self.cfg, "outage_wait", 0) or 0
@@ -330,7 +400,7 @@ class AgentLoop(object):
             if call is None:
                 # An empty reply or a cut-off at the token limit is NOT a finished
                 # task - the model usually spent the whole budget on reasoning.
-                if not body or usage.finish_reason == "length":
+                if not body or usage.finish_reason in ("length", "think_cap"):
                     self._empty += 1
                     self.metrics.empty_replies += 1
                     self._log("empty_reply", step=step, finish=usage.finish_reason,
@@ -341,14 +411,17 @@ class AgentLoop(object):
                                            % (usage.finish_reason, usage.reasoning_tokens,
                                               self._empty, MAX_EMPTY_REPLIES)}
                     if self._empty >= MAX_EMPTY_REPLIES:
-                        self._log("stalled", step=step)
-                        yield "end", {"reason": "stalled", "metrics": self.metrics.snapshot()}
+                        for event in self._force_answer(step, on_delta):
+                            yield event
                         return
                     correction = ("[ERROR] Your last reply contained no <tool_call> and was "
                                   "cut off at the token limit. Keep your reasoning short, then "
                                   "emit exactly ONE <tool_call> now to make progress.")
                     self.session.add_observation(
                         correction + self.session.reminder(step, self.cfg.max_steps))
+                    # The nudge alone does not reach a model that never leaves
+                    # <think>; from the second try the step runs without thinking.
+                    self._no_think = self._empty >= 2
                     continue
                 for text in auto_background(self.session):
                     yield "note", {"level": "info", "text": "undecided command: " + text[:140]}
@@ -381,7 +454,7 @@ class AgentLoop(object):
                     "shorten the content." + self.session.reminder(step, self.cfg.max_steps))
                 continue
 
-            self._empty = 0
+            self._empty, self._no_think = 0, False
             name, args = call
             if malformed(args):
                 self._log("malformed_call", step=step, tool=name)
@@ -441,4 +514,6 @@ class AgentLoop(object):
             self.session.add_observation(observation + warning + reminder)
 
         self._log("limit", steps=self.cfg.max_steps, metrics=self.metrics.snapshot())
-        yield "end", {"reason": "limit", "metrics": self.metrics.snapshot()}
+        for event in self._force_answer(self.cfg.max_steps, on_delta,
+                                        "step limit reached"):
+            yield event

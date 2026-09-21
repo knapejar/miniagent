@@ -609,7 +609,7 @@ class TestTruncatedToolCall(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def chat(self, messages, on_delta=None, cancel=None):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
                 self.calls += 1
                 text = ("<tool_call>write<arg_key>path</arg_key><arg_value>x.html"
                         "</arg_value><arg_key>text</arg_key><arg_value><html")
@@ -665,6 +665,19 @@ class TestMalformedCall(unittest.TestCase):
         self.assertEqual(name, "sh")
         self.assertTrue(malformed(args))
 
+    def test_garbled_call_is_flagged_not_turned_into_a_tool_name(self):
+        """GLM-5.3 mixed JSON into the XML and the whole shard became the tool
+        name: "unknown tool 'sh<arg_key>cmd\":\"dir'", which it then retried."""
+        from agent.protocol import malformed
+        name, args = parse_tool_call('<tool_call>sh<arg_key>cmd":"dir')
+        self.assertEqual(name, "sh")
+        self.assertTrue(malformed(args))
+
+    def test_unclosed_call_keeps_its_arguments(self):
+        name, args = parse_tool_call(
+            "<tool_call>sh\n<arg_key>cmd</arg_key>\n<arg_value>dir")
+        self.assertEqual((name, args), ("sh", {"cmd": "dir"}))
+
     def test_clean_call_is_not_flagged(self):
         from agent.protocol import malformed
         _, args = parse_tool_call(
@@ -676,7 +689,7 @@ class TestMalformedCall(unittest.TestCase):
         from agent.loop import AgentLoop
 
         class NestedClient(object):
-            def chat(self, messages, on_delta=None, cancel=None):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
                 text = ("<tool_call>sh<arg_key>cmd</arg_key><arg_value>browse"
                         "<arg_key>mode</arg_key><arg_value>outline</arg_value>"
                         "<arg_key>url</arg_key><arg_value>https://x</arg_value></tool_call>")
@@ -717,7 +730,7 @@ class TestMemoryPass(unittest.TestCase):
             def __init__(self):
                 self.prompts = []
 
-            def chat(self, messages, on_delta=None, cancel=None):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
                 self.prompts.append(list(messages))
                 text = replies[min(len(self.prompts) - 1, len(replies) - 1)]
                 return text, Usage(10, 10, 0, "stop", 0.1, 0.1)
@@ -865,7 +878,7 @@ class TestMemoryPass(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def chat(self, messages, on_delta=None, cancel=None):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
                 self.calls += 1
                 if self.calls == 1:
                     return "answer", Usage(10, 10, 0, "stop", 0.1, 0.1)
@@ -1505,3 +1518,90 @@ class TestAsyncWebSwitch(unittest.TestCase):
     def test_without_the_flag_an_ordinary_call_still_blocks(self):
         self.assertIsNone(
             self.tool.background(self.ctx(False), {}, "label", lambda: "x"))
+
+
+class TestThinkingSpiral(unittest.TestCase):
+    """A model that never leaves <think> must still end the run with an answer,
+    and must be asked again with less thinking rather than the same nudge."""
+
+    def _loop(self, client, **kw):
+        from agent.loop import AgentLoop
+        cfg = Config(workdir=os.environ.get("TEMP", "."), max_steps=6, **kw)
+        return AgentLoop(cfg, Session(cfg, default_tools()), client, default_tools())
+
+    def test_spiral_ends_in_a_forced_answer(self):
+        from agent.llm import Usage
+
+        class Spiral(object):
+            """Burns the budget inside <think> until the thinking is switched off."""
+            def __init__(self):
+                self.efforts = []
+
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
+                self.efforts.append(effort)
+                if effort == "none":
+                    return "The semester starts on 14 September 2026.", Usage(
+                        10, 20, 0, "stop", 0.1, 0.1)
+                return "", Usage(10, 8192, 8180, "length", 0.1, 0.1)
+
+        client = Spiral()
+        loop = self._loop(client)
+        events = list(loop.run("GOAL"))
+        kinds = [name for name, _ in events]
+        final = [d["text"] for name, d in events if name == "final"]
+        end = [d for name, d in events if name == "end"][-1]
+
+        # the run ends with the answer, not with a stall
+        self.assertIn("final", kinds)
+        self.assertIn("14 September", final[0])
+        self.assertNotEqual(end["reason"], "stalled")
+        # the first try keeps its reasoning; the rescue turns the thinking off
+        self.assertEqual(client.efforts[:2], [None, None])
+        self.assertIn("none", client.efforts[2:])
+
+    def test_forced_answer_falls_back_to_the_last_observation(self):
+        from agent.llm import Usage
+
+        class Mute(object):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
+                return "", Usage(10, 8192, 8180, "length", 0.1, 0.1)
+
+        loop = self._loop(Mute())
+        loop.session.start("GOAL")
+        loop.session.add_observation("semester starts 14 September 2026")
+        final = [d["text"] for name, d in loop._force_answer(1, None) if name == "final"]
+        # the forced ask itself must not be mistaken for the last finding
+        self.assertIn("14 September 2026", final[0])
+
+    def test_step_limit_also_answers(self):
+        from agent.llm import Usage
+
+        class Busy(object):
+            """Always calls a tool, never answers - it would hit the step limit."""
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
+                if effort == "none":
+                    return "Here is what I found.", Usage(10, 20, 0, "stop", 0.1, 0.1)
+                return ("<tool_call>read<arg_key>path</arg_key>"
+                        "<arg_value>nope.txt</arg_value></tool_call>"), Usage(
+                            10, 20, 0, "stop", 0.1, 0.1)
+
+        events = list(self._loop(Busy()).run("GOAL"))
+        self.assertIn("final", [name for name, _ in events])
+        self.assertEqual([d for n, d in events if n == "end"][-1]["reason"], "forced")
+
+
+class TestThinkCap(unittest.TestCase):
+    """The cap is what keeps a spiral from costing minutes before it is noticed."""
+
+    def test_cap_scales_with_max_tokens_and_can_be_turned_off(self):
+        from agent.llm import LLMClient
+        self.assertEqual(LLMClient(Config(max_tokens=8192)).think_cap_chars, int(8192 * 4 * 0.6))
+        self.assertEqual(LLMClient(Config(max_tokens=8192, think_cap=0)).think_cap_chars, 0)
+
+    def test_effort_override_only_changes_that_one_call(self):
+        from agent.llm import LLMClient
+        cfg = Config(effort="high")
+        client = LLMClient(cfg)
+        self.assertEqual(client._body([], False, "none")["reasoning_effort"], "none")
+        self.assertEqual(client._body([], False)["reasoning_effort"], "high")
+        self.assertEqual(cfg.effort, "high")

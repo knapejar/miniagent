@@ -70,7 +70,7 @@ class TestShellCheckpoints(unittest.TestCase):
                        "</tool_call>",
                        "all done", "all done"]
 
-            def chat(self, messages, on_delta=None, cancel=None):
+            def chat(self, messages, on_delta=None, cancel=None, effort=None):
                 return self.replies.pop(0), Usage(10, 10, 0, "stop", 0.1, 0.1)
 
         cfg = Config(workdir=tempfile.gettempdir(), max_steps=5, memory=False)

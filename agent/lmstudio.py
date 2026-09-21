@@ -55,6 +55,12 @@ def _json(lms, *args):
 
 def setup(cfg, say=print):
     """Make cfg.model answer on cfg.url. Returns True when it does."""
+    # Something already serves this URL and takes cfg.model (a llama-server, for
+    # one): nothing to load. Its /models may list other ids, or none at all.
+    served = served_models(cfg)
+    if served is not None and (not served or cfg.model in served):
+        return True
+
     host = (urlparse(cfg.url).hostname or "").lower()
     if host not in ("127.0.0.1", "localhost", "::1"):
         return served_models(cfg) is not None

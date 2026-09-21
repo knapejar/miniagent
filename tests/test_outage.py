@@ -79,7 +79,7 @@ class FlakyClient(object):
         self.failures = failures
         self.calls = 0
 
-    def chat(self, messages, on_delta=None, cancel=None):
+    def chat(self, messages, on_delta=None, cancel=None, effort=None):
         self.calls += 1
         if self.calls <= self.failures:
             raise LLMError("connection lost mid-reply (ConnectionResetError)", transient=True)
@@ -108,6 +108,23 @@ class TestLoopWaitsOutOutage(unittest.TestCase):
         events = self.run_loop(client, outage_wait=0)
         self.assertEqual(client.calls, 1)
         self.assertTrue(any(n == "end" and d.get("reason") == "error" for n, d in events))
+
+
+class EscDuringConnect(unittest.TestCase):
+    """A server that accepts but never answers must not hold esc hostage."""
+
+    def test_cancel_returns_while_urlopen_is_still_blocked(self):
+        import threading, time
+        from agent.llm import Cancelled
+        cfg = Config(url="http://127.0.0.1:1/v1", model="m", timeout=30, retries=0)
+        client = LLMClient(cfg, [])
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+        started = time.time()
+        with mock.patch("urllib.request.urlopen", lambda *a, **k: time.sleep(30)):
+            with self.assertRaises(Cancelled):
+                client._open(mock.Mock(), cancel)
+        self.assertLess(time.time() - started, 5)
 
 
 if __name__ == "__main__":

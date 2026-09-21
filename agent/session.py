@@ -49,7 +49,11 @@ class Session(object):
         self.chars_per_token = CHARS_PER_TOKEN
         self.cropped = False           # flag that forces a goal reminder
         self.crops = 0
-        self.tool_role = "tool"
+        # role="tool" needs a matching assistant tool_calls field, which we do
+        # not send: the history carries the call as text. A server that checks
+        # answers 400 "orphan_tool_message", so the native dialect starts where
+        # downgrade_tool_role() would have landed anyway, one request earlier.
+        self.tool_role = "user" if self.dialect == "native" else "tool"
         self.jobs = JobRunner()
         self.background_key = threading.Event()   # ctrl+b, set by ui/keys.py
 

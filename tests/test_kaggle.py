@@ -380,3 +380,34 @@ class TestKaggleSetup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestThinkCapStream(unittest.TestCase):
+    """The spiral that started this: a model that never leaves <think> and returns
+    an empty reply after minutes of generation. Cut it as soon as the reasoning
+    passes its share of the budget, so the loop can ask again with less thinking."""
+
+    def _run(self, reasoning_chunks, **cfg_kw):
+        events = [{"choices": [{"delta": {"reasoning_content": c}}]}
+                  for c in reasoning_chunks]
+        events.append({"choices": [{"delta": {"content": "late answer"},
+                                    "finish_reason": "stop"}]})
+        stream = FakeStream(events)
+        client = LLMClient(Config(max_tokens=100, **cfg_kw))   # cap = 100*4*0.6 = 240 chars
+        client._request = lambda *a, **kw: stream
+        return client.chat([]) + (stream,)
+
+    def test_runaway_reasoning_is_cut(self):
+        text, used, stream = self._run(["x" * 100] * 6)
+        self.assertEqual(used.finish_reason, "think_cap")
+        self.assertEqual(text, "")
+        self.assertLess(stream.read_lines, len(stream.lines))   # abandoned early
+
+    def test_reasoning_within_the_cap_is_left_alone(self):
+        text, used, _ = self._run(["x" * 50, "x" * 50])
+        self.assertEqual(used.finish_reason, "stop")
+        self.assertEqual(text, "late answer")
+
+    def test_cap_off_lets_it_think_as_long_as_it_likes(self):
+        text, used, _ = self._run(["x" * 100] * 6, think_cap=0)
+        self.assertEqual(text, "late answer")

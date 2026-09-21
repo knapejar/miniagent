@@ -34,12 +34,18 @@ from . import paths
 
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
 ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
+# Fallback for a call whose closing tags never came - generation stopped on the
+# limit, or the model mixed JSON into the XML. Tried only when the strict form
+# matched nothing, so a nested call still reads as one value and stays flagged.
+LOOSE_ARG_RE = re.compile(
+    r"<arg_key>(.*?)(?:</arg_key>|(?=<arg_value>))\s*<arg_value>(.*?)"
+    r"(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)", re.S)
 FUNCTION_RE = re.compile(r"<function=([^>\n]+)>")
 # A value ends at its closing tag - or, when the model forgot it, at the next
 # parameter, the end of the function, or the end of the text.
 PARAM_RE = re.compile(
     r"<parameter=([^>\n]+)>(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.S)
-DIALECTS = ("spark", "qwen")
+DIALECTS = ("spark", "qwen", "native")
 THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 
 PLAN_HEADER = ("[PLAN - your own notes, pinned here and kept across context cropping. "
@@ -128,8 +134,20 @@ def render_tools(tools, dialect="spark"):
 
 
 def dialect_for(model):
-    """The tool-call format a model was trained on, guessed from its name."""
-    return "qwen" if "qwen" in (model or "").lower() else "spark"
+    """How to call tools on this model.
+
+    "native" - send the OpenAI `tools` field and let the server's own parser do
+    it. That is right for every ordinary backend and is therefore the default:
+    writing a text protocol into the prompt of a model trained on a different
+    one is what made GLM-5.3 answer `<tool_call>sh<arg_key>cmd":"dir` forever.
+    The two text dialects stay for the servers that have no parser: llama.cpp
+    has none for Spark-X2.5, and vLLM only runs qwen3_coder's when the request
+    carries tools - which would then push the model into Hermes JSON.
+    """
+    name = (model or "").lower()
+    if "qwen" in name:
+        return "qwen"
+    return "spark" if "spark" in name else "native"
 
 
 def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names=(),
@@ -139,8 +157,15 @@ def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names
         secrets = ("\nSecrets available as environment variables, referenced as %NAME% in sh. "
                    "Their values are never shown to you and must never be typed out: "
                    + ", ".join(sorted(secret_names)))
-    block = QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS
-    return SYSTEM_TEMPLATE.format(tools_block=block.format(tools=render_tools(tools, dialect)),
+    if dialect == "native":
+        # The specs travel in the request's `tools` field and the server renders
+        # them with the model's own template; repeating them here would only cost
+        # tokens and give the model a second, conflicting format to imitate.
+        block = ""
+    else:
+        block = (QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS).format(
+            tools=render_tools(tools, dialect))
+    return SYSTEM_TEMPLATE.format(tools_block=block,
                                   cwd=cwd, os_name=os_name, shell=shell, secrets=secrets,
                                   state_dir=paths.project_dir(cwd),
                                   memory=_load_memory(cwd))
@@ -180,16 +205,27 @@ def parse_tool_call(text):
         pairs = [(key, _param_value(value))
                  for key, value in PARAM_RE.findall(body, function.end())]
         return function.group(1).strip().strip('"'), _merge(pairs)
-    pairs = ARG_RE.findall(body)
+    pairs = ARG_RE.findall(body) or LOOSE_ARG_RE.findall(body)
     if pairs:
-        name = body.split("<arg_key>", 1)[0].strip().strip('"')
-        return name, _merge(pairs)
+        return _name(body.split("<arg_key>", 1)[0]), _merge(pairs)
     try:
         obj = json.loads(body.strip())
         return obj.get("name"), obj.get("arguments") or obj.get("parameters") or {}
     except Exception:
         stripped = body.strip()
-        return (stripped.split()[0], {}) if stripped else None
+        if not stripped:
+            return None
+        # Markup we could not turn into a single argument: hand the leftover to
+        # malformed() so the model is told the format broke, instead of getting
+        # "unknown tool 'sh<arg_key>cmd\":\"dir'" and retrying it forever.
+        return _name(stripped), {"raw": stripped} if _has_markup(stripped) else {}
+
+
+def _name(text):
+    """The tool name is the first token, before any markup the model leaked into
+    it: GLM has emitted `sh<arg_key>cmd":"dir`, which as a name matches nothing
+    and told the model only that the tool does not exist."""
+    return re.split(r"[<\s]", text.strip().strip('"'), 1)[0].strip('"')
 
 
 def _param_value(value):
@@ -219,7 +255,12 @@ def _merge(pairs):
     return args
 
 
-MARKUP = ("<arg_key>", "<arg_value>", "<tool_call>", "<function=", "<parameter=")
+MARKUP = ("<arg_key>", "<arg_value>", "</arg_key>", "</arg_value>", "<tool_call>",
+          "<function=", "<parameter=")
+
+
+def _has_markup(text):
+    return any(marker in text for marker in MARKUP)
 
 
 def malformed(args):
@@ -227,8 +268,7 @@ def malformed(args):
     or otherwise broken. Executing it runs a fragment: one such call reached the
     shell as a command and came back as "< was unexpected at this time.", which
     tells the model nothing about what it did wrong."""
-    return any(marker in str(value) for value in (args or {}).values()
-               for marker in MARKUP)
+    return any(_has_markup(str(value)) for value in (args or {}).values())
 
 
 def format_tool_call(name, args, dialect="spark"):
