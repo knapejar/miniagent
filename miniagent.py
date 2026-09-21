@@ -19,7 +19,7 @@ from agent.tools import default_tools
 from agent.tools.shell import kill_all
 from agent.trace import Trace
 from ui import ansi
-from ui.keys import CancelWatcher
+from ui.keys import CancelWatcher, push_back
 from ui.render import Renderer
 
 VERSION = "0.2.0"
@@ -256,12 +256,11 @@ def main(argv=None):
     typed = ""
     while True:
         try:
-            # Whatever was typed while the agent worked is echoed back in front
-            # of the cursor, so the next task carries on from it.
-            sys.stdout.write(renderer.s.cyan("› ") + typed)
-            sys.stdout.flush()
-            line = (typed + input()).strip()
+            # Whatever was typed while the agent worked goes back into the
+            # terminal's input queue, so it arrives as an ordinary editable line.
+            echo = "" if push_back(typed) else typed
             typed = ""
+            line = (echo + input(renderer.s.cyan("› ") + echo)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break

@@ -1134,6 +1134,14 @@ class TestMarkdown(unittest.TestCase):
         stream.close()
         return "".join(out)
 
+    def test_a_bold_url_does_not_swallow_its_own_markers(self):
+        """The bare-URL pattern used to eat the closing **, and the orphaned
+        opening pair then broke bold for the rest of the answer."""
+        out = self.render("see **https://x.cz/a/** and **bold** after\n")
+        self.assertNotIn("*", out)
+        self.assertIn("https://x.cz/a/", out)
+        self.assertIn("bold", out)
+
     def test_bold_and_italic(self):
         out = self.render("a **strong** and *slanted* word", _Marking())
         self.assertIn("<b>strong</b>", out)
@@ -1377,6 +1385,26 @@ class TestTypeAhead(unittest.TestCase):
     def test_control_characters_are_not_buffered(self):
         watcher = self.drive(["\r", "\n", "\t", "a"])
         self.assertEqual(watcher.typed(), "a")
+
+    def test_empty_push_back_is_a_success(self):
+        from ui.keys import push_back
+        self.assertTrue(push_back(""))          # nothing to hand over, nothing to echo
+
+    def test_push_back_reports_failure_instead_of_raising(self):
+        """The caller echoes the text itself when the terminal will not take it."""
+        from ui.keys import push_back
+        self.assertFalse(push_back("text"))     # pytest's stdin is not a console
+
+    @unittest.skipUnless(os.name == "nt", "windows console structures")
+    def test_the_console_records_match_the_win32_layout(self):
+        """A wrong size would make WriteConsoleInputW read past each record."""
+        import ctypes
+        from ui.keys import input_record_type
+        record = input_record_type()
+        self.assertEqual(ctypes.sizeof(record), 20)
+        buffer = (record * 2)()
+        buffer[0].Event.KeyEvent.uChar.UnicodeChar = "x"
+        self.assertEqual(buffer[0].Event.KeyEvent.uChar.UnicodeChar, "x")
 
 
 class TestAsyncWebSwitch(unittest.TestCase):

@@ -15,7 +15,9 @@ LINK = re.compile(r"!?\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
 BOLD_ITALIC = re.compile(r"\*\*\*(.+?)\*\*\*")
 BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 ITALIC = re.compile(r"(?<![\*\w])\*([^\*\n]+)\*(?!\*)|(?<![_\w])_([^_\n]+)_(?![_\w])")
-BARE_URL = re.compile(r"(?<![\(\[<])\bhttps?://[^\s<>\)\]\"']+")
+# `*` is excluded so a bold URL (**https://x/**) does not swallow its own closing
+# markers - the stray `**` left behind then broke bold for the rest of the answer.
+BARE_URL = re.compile(r"(?<![\(\[<])\bhttps?://[^\s<>\)\]\"'*]+")
 HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 NUMBERED = re.compile(r"^(\s*)(\d+[.)])\s+(.*)$")
