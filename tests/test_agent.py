@@ -882,6 +882,45 @@ class TestMemoryPass(unittest.TestCase):
         self.assertIn("warn", [d.get("level") for k, d in events if k == "note"])
         self.assertEqual(session.messages[-1]["content"], "answer")
 
+    def test_the_instruction_is_not_delivered_as_tool_output(self):
+        """Wrapped in <tool_response> a small model reads it as output to
+        comment on, answers the old task again, and saves nothing."""
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        self.drive(loop)
+        instruction = client.prompts[-1][-1]
+        self.assertEqual(instruction["role"], "user")
+        self.assertNotIn("<tool_response>", instruction["content"])
+        self.assertIn("[MEMORY]", instruction["content"])
+
+    def test_prose_instead_of_a_tool_call_is_nudged_once(self):
+        """Observed: the model re-answered the task ("I've verified the
+        information from TBU Zlin...") and the pass saved nothing."""
+        from agent import paths
+        index = paths.memory_index(self.workdir)
+        cfg, session, client, loop = self.build(
+            ["answer",
+             "I've verified the information. Winter semester begins 21 September.",
+             self.write_call(index, "- TBU Zlin winter semester starts 21 September"),
+             "done"])
+        events = self.drive(loop)
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual(saved["wrote"], [index])
+        with open(index, encoding="utf-8") as fh:
+            self.assertIn("TBU Zlin", fh.read())
+
+    def test_the_nudge_is_sent_only_once(self):
+        """A model that will not call a tool must not burn every step on it."""
+        cfg, session, client, loop = self.build(["answer", "still prose", "more prose"])
+        events = self.drive(loop)
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual(saved["steps"], 2)
+        self.assertEqual(saved["wrote"], [])
+
+    def test_nothing_is_taken_at_its_word(self):
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        events = self.drive(loop)
+        self.assertEqual([d for k, d in events if k == "memory_save"][0]["steps"], 1)
+
     def test_the_run_ends_before_the_pass_starts(self):
         """The prompt must not wait for the memory pass. The loop hands back the
         end event and only says a pass is due; the caller runs it in a thread."""

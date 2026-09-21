@@ -36,23 +36,28 @@ PLAN_NUDGE = ("\n\n[PLAN] You have not updated the plan for %d steps. "
 MEMORY_MAX_STEPS = 4
 MEMORY_MAX_CHARS = 4000
 MEMORY_TOOLS = ("read", "write", "edit", "grep")
-MEMORY_PROMPT = """[MEMORY] The task is finished and the answer is delivered.
-Before this run ends, update this project's memory for the next one.
+MEMORY_PROMPT = """[MEMORY] This is not a new task and it is not the old one.
+The answer is already delivered - do not answer it again. Your one job now is to
+write this project's memory file, and a tool call is the only way to do it.
 
-Its index is %s and this is what it says right now:
+The file is %s and this is what it holds right now:
 ---
 %s
 ---
-Write down only what stays true and would save a future run real work: a host, a
-path, a login, a command that works, a layout decision, a dead end not worth
-retrying. One line per note. Do not record what this task did, what you just
-answered, or anything that is obvious from the code itself.
+Call write on that exact path with the whole file: the lines above that are
+still true, plus anything from this run worth having next time - a fact that was
+looked up and may be wanted again, a host, a path, a login, a command that
+works, a decision, a dead end not worth retrying. One line per note. Do not
+write down what you did this run, and do not restate your answer as prose.
 
-Write the whole updated file back in one call - keep the lines that are still
-true. Keep it under %d characters; when a topic outgrows that,
-put it in its own file next to the index and leave one line pointing at it.
-Tools: %s. Nothing else is available here.
-If there is nothing worth keeping, call no tool and reply with the one word NOTHING."""
+Keep it under %d characters; when a topic outgrows that, put it in its own file
+next to the index and leave one line pointing at it. Tools: %s - nothing else
+exists here. Reply with the single word NOTHING only when every line you would
+write is already in the file above."""
+
+MEMORY_NUDGE = """[MEMORY] That was prose, not a memory update, and nothing was
+saved. Call write on %s now with the full contents of the file, or reply with
+exactly NOTHING if there is truly nothing to add."""
 
 
 def clip(text, limit=OBS_MAX_CHARS):
@@ -211,8 +216,9 @@ class AgentLoop(object):
                     current = fh.read().strip() or "(empty)"
             except OSError:
                 current = "(does not exist yet - write creates it)"
-            self.session.add_observation(
+            self.session.add_user(
                 MEMORY_PROMPT % (index, current, MEMORY_MAX_CHARS, ", ".join(MEMORY_TOOLS)))
+            nudged = False
             for steps in range(1, MEMORY_MAX_STEPS + 1):
                 if self._cancelled():
                     break
@@ -221,7 +227,14 @@ class AgentLoop(object):
                 self.session.add_assistant(reply, extract_think(text))
                 call = parse_tool_call(text)
                 if call is None:
-                    break
+                    # The model finished a task one message ago, and the system
+                    # prompt tells it to end with plain prose; left alone it does
+                    # that here too and nothing is saved. Ask once, plainly.
+                    if wrote or nudged or reply.strip().upper().startswith("NOTHING"):
+                        break
+                    nudged = True
+                    self.session.add_user(MEMORY_NUDGE % index)
+                    continue
                 name, args = call
                 if name not in MEMORY_TOOLS:
                     out = ("error: %s is not available in the memory pass. Use %s."

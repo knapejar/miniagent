@@ -104,6 +104,13 @@ class Session(object):
                 message["reasoning_content"] = reasoning
             self.messages.append(message)
 
+    def add_user(self, text):
+        """An instruction from the operator's side of the conversation. An
+        instruction delivered as a tool observation instead arrives wrapped in
+        <tool_response>, and a small model reads that as output to comment on
+        rather than as something it has been told to do."""
+        self.messages.append({"role": "user", "content": text})
+
     def add_observation(self, text):
         # Qwen's chat template wraps a tool message in <tool_response> itself;
         # wrapping it here too would nest the tags.
