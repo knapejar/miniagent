@@ -84,6 +84,27 @@ set MINIAGENT_URL=http://192.168.1.10:1234/v1
 set MINIAGENT_MODEL=qwen3-coder-30b
 ```
 
+### Ternary Bonsai 2 27B (`--profile bonsai`)
+
+[Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+fits in 16 GB of VRAM with room for a 32k context. Its PTQ1_0 tensors only load in
+the [PrismML llama.cpp fork](https://github.com/prism-ml/llama.cpp) — LM Studio
+cannot open them. Start the server first, then point miniagent at it:
+
+```bat
+llama-server.exe -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -ngl 99 -c 32768 ^
+  --parallel 1 -ctk q8_0 -ctv q8_0 -fa on --port 8080 -a bonsai2-27b
+
+python miniagent.py --profile bonsai
+python miniagent.py --profile bonsai --set-default   :: remember it
+```
+
+`MINIAGENT_BONSAI_URL` and `MINIAGENT_BONSAI_MODEL` override the defaults
+(`http://127.0.0.1:8080/v1`, `bonsai2-27b`). Note that SearXNG below also wants
+port 8080 — give one of the two another port.
+
+`--profile` without a name lists every profile.
+
 ### Web search (optional, recommended)
 
 Search engines block automated queries from a home address within a handful of
