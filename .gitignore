@@ -11,3 +11,5 @@ sandbox/
 .idea/
 .vscode/
 .note_do_not_commit
+.env
+*.key
