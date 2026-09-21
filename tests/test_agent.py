@@ -197,6 +197,61 @@ class TestSession(unittest.TestCase):
         s.crop()
         self.assertIn("MEMORY", s.messages[2]["content"])
 
+    def test_second_task_is_appended_not_overwritten(self):
+        """The prefix in front of a new task has to stay byte-identical, or the
+        server re-prefills the whole history instead of reusing its KV cache."""
+        s = self.make()
+        s.start("FIRST")
+        self.fill(s, 3)
+        before = list(s.messages)
+        s.start("SECOND")
+        self.assertEqual(s.messages[:len(before)], before)      # prefix untouched
+        self.assertEqual(s.messages[-1]["content"], "SECOND")
+        self.assertEqual(s.anchor, len(s.messages) - 1)
+        self.assertEqual(s.goal, "SECOND")
+
+    def test_crop_keeps_the_appended_task(self):
+        s = self.make()
+        s.start("FIRST")
+        self.fill(s, 3)
+        s.start("SECOND")
+        self.fill(s)
+        s.crop()
+        self.assertEqual(s.messages[s.anchor]["content"], "SECOND")
+        self.assertIn("context cropped", s.messages[3]["content"])
+        self.assertIn("[GOAL] SECOND", s.reminder(1, 50))
+
+    def test_anchor_index_survives_crop_from_the_tail(self):
+        """An anchor still inside keep_tail is not cut, but its index shifts."""
+        s = self.make()
+        s.start("FIRST")
+        self.fill(s)
+        s.start("SECOND")
+        self.fill(s, 2)
+        s.crop()
+        self.assertEqual(s.messages[s.anchor]["content"], "SECOND")
+
+    def test_set_goal_replaces_the_current_task(self):
+        s = self.make()
+        s.start("FIRST")
+        self.fill(s, 2)
+        s.start("SECOND")
+        s.set_goal("THIRD")
+        self.assertEqual(s.messages[s.anchor]["content"], "THIRD")
+        self.assertEqual(s.goal, "THIRD")
+        self.assertEqual(s.messages[1]["content"], "FIRST")
+
+    def test_reset_puts_the_anchor_back(self):
+        s = self.make()
+        s.start("FIRST")
+        self.fill(s, 2)
+        s.start("SECOND")
+        s.reset()
+        s.start("AGAIN")
+        self.assertEqual(s.anchor, 1)
+        self.assertEqual(s.messages[1]["content"], "AGAIN")
+        self.assertTrue(s.messages[2]["content"].startswith(PLAN_HEADER))
+
     def test_calibration(self):
         s = self.make()
         s.start("GOAL")

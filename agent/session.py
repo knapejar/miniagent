@@ -8,9 +8,16 @@ broken since 0.4.0. So we manage the context ourselves.
 History layout:
 
     [0] system   - system prompt with the tool specs
-    [1] user     - the ORIGINAL task (goal anchor, cropping never touches it)
+    [1] user     - the FIRST task of the session
     [2] user     - the PLAN (agent's pinned memory, never cropped)
     [3:]         - the run itself, cropped from the middle when it overflows
+
+A later task is appended to the end instead of overwriting [1]. Rewriting a
+message near the front would change the token prefix there, and the server's KV
+cache is only reusable as an unbroken prefix from token 0 - so the whole history
+behind it would be prefilled again. Appending keeps the prefix intact and a new
+task costs only its own tokens. `anchor` is the index of the task being worked
+on now; cropping protects it wherever it sits.
 """
 import os
 import threading
@@ -36,6 +43,7 @@ class Session(object):
                                                   secret_names=self.secret_names,
                                                   dialect=self.dialect)}]
         self.goal = ""
+        self.anchor = 1                # index of the task being worked on now
         self.has_plan = False
         self.plan_text = ""
         self.chars_per_token = CHARS_PER_TOKEN
@@ -47,17 +55,19 @@ class Session(object):
 
     # --------------------------------------------------------------- basics
     def start(self, task):
-        """Record the task and pin the plan slot behind it."""
+        """Record the task and pin the plan slot behind it.
+
+        The first task of a session lands at [1]; every later one is appended,
+        so the prefix in front of it - and the server's KV cache for it - stays
+        valid and the new task starts without a full prefill.
+        """
         self.goal = task
         self.messages.append({"role": "user", "content": task})
+        self.anchor = len(self.messages) - 1
         if not self.has_plan:
             self.messages.insert(2, {"role": "user",
                                      "content": PLAN_HEADER + (self.plan_text or "(empty)")})
             self.has_plan = True
-        else:
-            # The anchor at [1] is what cropping protects; it has to be the task
-            # being worked on now, not the first one of the session.
-            self.messages[1] = {"role": "user", "content": task}
 
     def reset(self, keep_plan=True):
         """Drop the conversation. The system prompt stays, the plan optionally."""
@@ -67,10 +77,17 @@ class Session(object):
         self.has_plan = False
         self.plan_text = plan
         self.goal = ""
+        self.anchor = 1
         self.cropped = False
         if getattr(self, "failures", None):
             self.failures.counts.clear()
         return dropped
+
+    def set_goal(self, text):
+        """Replace the task being worked on, in place (`/edit`)."""
+        self.goal = text
+        if self.anchor < len(self.messages):
+            self.messages[self.anchor] = {"role": "user", "content": text}
 
     def set_plan(self, text):
         self.plan_text = text
@@ -126,8 +143,9 @@ class Session(object):
         return self.estimated_tokens() > self.cfg.ctx * self.cfg.crop_at
 
     def crop(self):
-        """Truncate the middle. The head (system + task + plan) and the most
-        recent messages stay; everything between them becomes one marker.
+        """Truncate the middle. The head (system + first task + plan), the
+        current task and the most recent messages stay; everything between them
+        becomes one marker.
 
         TODO: summarise instead of dropping, and never summarise the sections
         currently being worked on (last opened file / running command).
@@ -136,11 +154,23 @@ class Session(object):
         tail = self.cfg.keep_tail
         if len(self.messages) <= head + tail + 1:
             return 0
-        cut = self.messages[head:-tail]
+        low, high = head, len(self.messages) - tail
+        # A task appended after the first one sits inside the cut region; it is
+        # the goal anchor, so it survives and moves just behind the marker.
+        anchored = low <= self.anchor < high
+        cut = self.messages[low:high]
+        if anchored:
+            cut = cut[:self.anchor - low] + cut[self.anchor - low + 1:]
         dropped = sum(_chars(m) for m in cut)
-        self.messages[head:-tail] = [{
-            "role": "user",
-            "content": "[context cropped: %d earlier steps omitted]" % len(cut)}]
+        keep = [{"role": "user",
+                 "content": "[context cropped: %d earlier steps omitted]" % len(cut)}]
+        if anchored:
+            keep.append(self.messages[self.anchor])
+        elif self.anchor >= high:                    # anchor still in the tail
+            self.anchor -= (high - low) - len(keep)
+        self.messages[low:high] = keep
+        if anchored:
+            self.anchor = low + 1
         self.cropped = True
         self.crops += 1
         return dropped

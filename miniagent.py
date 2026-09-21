@@ -156,11 +156,10 @@ def handle_command(line, cfg, session, renderer, trace, last):
     elif cmd == "/edit":
         if not arg:
             print("  " + s.dim("/edit <text> replaces the current task"))
-        elif len(session.messages) < 2:
+        elif not session.goal:
             print("  " + s.dim("no task yet - just type it"))
         else:
-            session.messages[1] = {"role": "user", "content": arg}
-            session.goal = arg
+            session.set_goal(arg)
             print("  " + s.dim("task replaced (%d chars)" % len(arg)))
     elif cmd == "/cwd":
         if arg:
