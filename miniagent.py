@@ -49,21 +49,59 @@ HELP = """  commands
 """
 
 
+class MemoryJob(object):
+    """The memory pass, running while the prompt is already up.
+
+    Its events are collected instead of printed: the user is typing on that
+    line, and writing over it from a thread would scribble across what they
+    have half-written. They are flushed above the next prompt instead.
+    """
+
+    def __init__(self, loop, renderer):
+        self.loop = loop
+        self.renderer = renderer
+        self.cancel = threading.Event()
+        self.events = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            for event, data in self.loop.memory_pass(self.cancel):
+                self.events.append((event, data))
+        except Exception as e:                  # never take the session down with it
+            self.events.append(("note", {"level": "warn",
+                                         "text": "memory pass failed: %s" % e}))
+
+    def finish(self, wait=True):
+        """Stop waiting for it and print whatever it got to say."""
+        if not wait:
+            self.cancel.set()
+        self.thread.join(timeout=20 if wait else 5)
+        for event, data in self.events:
+            self.renderer.handle(event, data)
+        self.events = []
+
+
 def run_task(cfg, session, client, tools, trace, renderer, task):
-    """Handle one task. Returns (metrics snapshot, whatever the user typed while
-    it ran) - the key watcher owns the keyboard during a run, so anything typed
+    """Handle one task. Returns (metrics snapshot, text typed during the run,
+    the memory job still running in the background or None).
+
+    The key watcher owns the keyboard for the whole run, so anything typed
     would otherwise be swallowed instead of reaching the next prompt."""
     cancel = threading.Event()
     loop = AgentLoop(cfg, session, client, tools, trace,
                      approve_fn=renderer.approval, cancel=cancel)
     renderer.metrics = loop.metrics
-    snapshot = {}
+    snapshot, memory = {}, None
     watcher = CancelWatcher(cancel, session.background_key).start()
     try:
         for event, data in loop.run(task, on_delta=renderer.on_delta):
             renderer.handle(event, data)
             if event == "end":
                 snapshot = data.get("metrics") or {}
+                if data.get("memory_due") and not cancel.is_set():
+                    memory = MemoryJob(loop, renderer)
     except KeyboardInterrupt:
         renderer._stop_spinner()
         print("\n  " + renderer.s.yellow("interrupted"))
@@ -76,7 +114,7 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
         snapshot = loop.metrics.snapshot()
     finally:
         watcher.stop()
-    return snapshot, watcher.typed()
+    return snapshot, watcher.typed(), memory
 
 
 def connect_kaggle(cfg, renderer):
@@ -245,7 +283,10 @@ def main(argv=None):
     os.chdir(cfg.workdir)
 
     if task:                                   # one-shot run
-        snapshot, _typed = run_task(cfg, session, client, tools, trace, renderer, task)
+        snapshot, _typed, memory = run_task(cfg, session, client, tools, trace,
+                                            renderer, task)
+        if memory:
+            memory.finish()                    # nothing else to do; let it land
         renderer.summary(snapshot)
         kill_all(session)
         trace.close()
@@ -254,9 +295,11 @@ def main(argv=None):
     renderer.banner(session)
     last = None
     typed = ""
+    memory = None
     while True:
         try:
-            # Whatever was typed while the agent worked goes back into the
+            # The memory pass may still be running; the prompt does not wait for
+            # it. Whatever was typed while the agent worked goes back into the
             # terminal's input queue, so it arrives as an ordinary editable line.
             echo = "" if push_back(typed) else typed
             typed = ""
@@ -264,6 +307,11 @@ def main(argv=None):
         except (EOFError, KeyboardInterrupt):
             print()
             break
+        if memory:
+            # Submitting something is the signal to stop waiting for it: report
+            # what it managed, and cut it short if it is still going.
+            memory.finish(wait=not line or line.startswith("/"))
+            memory = None
         if not line:
             continue
         if line.startswith("/"):
@@ -274,8 +322,11 @@ def main(argv=None):
             from agent.tools.shell import ShellTool
             print(renderer.s.grey(ShellTool().run_foreground(session, line[1:])))
             continue
-        last, typed = run_task(cfg, session, client, tools, trace, renderer, line)
+        last, typed, memory = run_task(cfg, session, client, tools, trace,
+                                       renderer, line)
 
+    if memory:
+        memory.finish(wait=False)
     kill_all(session)
     trace.close()
     print(renderer.s.dim("  bye"))

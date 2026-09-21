@@ -287,12 +287,15 @@ Set `MINIAGENT_HOME` to move the whole thing elsewhere.
 The notes do not appear by themselves: once the answer is delivered, a short
 **memory pass** runs, with the single job of updating `INDEX.md` and only the file
 tools to do it with. The current index is handed to it in the prompt, so it writes
-straight back instead of spending a round trip reading it. It shows a live
-`updating memory …` line while it works and leaves one collapsed line behind
-(`/memory` shows what it wrote); `esc` skips it without touching the answer, and
-anything typed while it runs lands in front of the next prompt instead of being
-swallowed. Its own messages are dropped from the history afterwards. It costs one
-model call per finished task - `--no-memory` turns it off.
+straight back instead of spending a round trip reading it.
+
+It runs **in the background**: the prompt comes up the moment the answer is
+finished and you type into it as usual, while the pass works behind it. Nothing
+is printed over the line you are typing on - the result lands above the next
+prompt as one collapsed line, and `/memory` shows what it wrote. Submitting the
+next task cuts the pass short if it is still going. Its own messages are dropped
+from the history afterwards. It costs one model call per finished task, and
+`--no-memory` turns it off.
 
 **Rendered answers.** Bold, italic, headings, lists, quotes, code fences, aligned
 tables and highlighted links, streamed as they arrive.

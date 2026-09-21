@@ -178,9 +178,13 @@ class AgentLoop(object):
                     "tool, or move to the next subgoal." % LOOP_WINDOW)
         return ""
 
-    def _memory_pass(self):
+    def memory_pass(self, cancel=None):
         """One short bounded run after the final answer: the agent writes down
         what the next run in this project would want to know.
+
+        It is driven by the caller, after the loop has ended, so it can run in a
+        thread while the prompt is already up and the user is typing. `cancel`
+        is its own event - the run's own esc watcher is gone by then.
 
         It runs on the same message list, so the prompt prefix in front of it is
         unchanged and the server reuses its KV cache instead of prefilling the
@@ -188,7 +192,11 @@ class AgentLoop(object):
         the memory chatter would otherwise ride along in every later task.
         Nothing in here may break the run: the answer is already delivered.
         """
-        if not getattr(self.cfg, "memory", True) or self._cancelled():
+        if not getattr(self.cfg, "memory", True):
+            return
+        run_cancel, self.cancel = self.cancel, cancel   # the pass cancels on its own
+        if self._cancelled():
+            self.cancel = run_cancel
             return
         saved = list(self.session.messages)
         index = paths.memory_index(self.session.cwd)
@@ -236,10 +244,8 @@ class AgentLoop(object):
             # Restore the history whatever happened - _call_model may also have
             # cropped it, so put the list back rather than trimming an index.
             self.session.messages[:] = saved
-        if self._cancelled():
-            # esc during the pass skips the bookkeeping, not the answer - the run
-            # is already finished, so the cancel flag must not leak into the next one.
-            self.cancel.clear()
+            stopped, self.cancel = self._cancelled(), run_cancel
+        if stopped:
             self._log("memory_cancelled", index=index, wrote=wrote, steps=steps)
             yield "memory_cancelled", {"index": index, "wrote": wrote}
             return
@@ -341,9 +347,12 @@ class AgentLoop(object):
                     continue
                 self._log("final", step=step, text=body, metrics=self.metrics.snapshot())
                 yield "final", {"text": body}
-                for event in self._memory_pass():
-                    yield event
-                yield "end", {"reason": "final", "metrics": self.metrics.snapshot()}
+                # The memory pass is NOT run here. It would hold the keyboard and
+                # the screen for a couple of seconds after the answer, and the
+                # prompt is what the user wants at that moment; the caller runs
+                # `memory_pass()` in the background instead.
+                yield "end", {"reason": "final", "metrics": self.metrics.snapshot(),
+                              "memory_due": bool(getattr(self.cfg, "memory", True))}
                 return
 
             if usage.finish_reason == "length":

@@ -172,22 +172,16 @@ class Renderer(object):
               self.s.dim(" (%d chars, /plan to show it)" % len(d["text"])))
 
     def _ev_memory_start(self, d):
-        """The pass costs a model call or two after the answer is already on
-        screen; without a live line that reads as a freeze."""
-        self._t0 = time.time()
-        self.spinner = Spinner(self.s, self.lock,
-                               lambda: "updating memory … %.0fs   (esc to skip, "
-                                       "or just keep typing)" % (time.time() - self._t0))
-        self.spinner.start()
+        """No spinner here: the pass runs in the background with the prompt
+        already up, and a live line would be drawn straight over what the user
+        is typing. Its result is printed later, above the next prompt."""
 
     def _ev_memory_cancelled(self, d):
-        self._stop_spinner()
         print("  " + self.s.dim("memory update skipped"))
 
     def _ev_memory_save(self, d):
         """One collapsed line. The pass runs after the answer is printed, so its
         own steps stay out of the transcript; /memory shows what it wrote."""
-        self._stop_spinner()
         if d["wrote"]:
             files = ", ".join(sorted(set(os.path.basename(f) for f in d["wrote"])))
             print("  " + self.s.magenta("memory updated") +

@@ -736,16 +736,28 @@ class TestMemoryPass(unittest.TestCase):
         return ("<tool_call>write<arg_key>path</arg_key><arg_value>%s</arg_value>"
                 "<arg_key>text</arg_key><arg_value>%s</arg_value></tool_call>" % (path, text))
 
+    @staticmethod
+    def drive(loop, task="GOAL", cancel=None):
+        """Run the task, then the memory pass the way the REPL drives it: the
+        pass is not part of loop.run() any more, so that the prompt does not
+        have to wait for it."""
+        events = list(loop.run(task))
+        due = any(d.get("memory_due") for k, d in events if k == "end")
+        if due:
+            events += list(loop.memory_pass(cancel))
+        return events
+
     def test_memory_is_written_after_the_final_answer(self):
         from agent import paths
         index = paths.memory_index(self.workdir)
         cfg, session, client, loop = self.build(
             ["done, here is the answer", self.write_call(index, "- the GPU box is wingpu"),
              "NOTHING"])
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         kinds = [k for k, _ in events]
-        self.assertEqual(kinds[-1], "end")
-        self.assertIn("memory_save", kinds)
+        # The run ends first; the pass is what follows, off the critical path.
+        self.assertEqual(kinds[-1], "memory_save")
+        self.assertLess(kinds.index("end"), kinds.index("memory_start"))
         self.assertLess(kinds.index("final"), kinds.index("memory_save"))
         with open(index, encoding="utf-8") as fh:
             self.assertIn("wingpu", fh.read())
@@ -762,34 +774,32 @@ class TestMemoryPass(unittest.TestCase):
         with open(index, "w", encoding="utf-8") as fh:
             fh.write("- wingpu is the GPU box\n")
         cfg, session, client, loop = self.build(["answer", "NOTHING"])
-        list(loop.run("GOAL"))
+        list(self.drive(loop))
         prompt = client.prompts[-1][-1]["content"]
         self.assertIn("wingpu is the GPU box", prompt)
 
     def test_a_missing_index_is_announced_not_an_error(self):
         cfg, session, client, loop = self.build(["answer", "NOTHING"])
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         self.assertIn("does not exist yet", client.prompts[-1][-1]["content"])
         saved = [d for k, d in events if k == "memory_save"][0]
         self.assertEqual([c for c in saved["calls"] if c["error"]], [])
 
-    def test_esc_during_the_pass_skips_it_and_keeps_the_answer(self):
+    def test_the_pass_can_be_stopped_on_its_own(self):
+        """Its cancel is separate from the run's: the run is over by then, and
+        submitting the next task is what cuts the pass short."""
         import threading
-        from agent.loop import AgentLoop
-        cfg = Config(workdir=self.workdir, max_steps=3)
-        session = Session(cfg, default_tools())
-        cancel = threading.Event()
-        client = self.scripted(["answer", "NOTHING"])
-        loop = AgentLoop(cfg, session, client, default_tools(), cancel=cancel)
-        kinds = []
-        for kind, _ in loop.run("GOAL"):
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        run_cancel = loop.cancel
+        stop = threading.Event()
+        kinds = [k for k, _ in loop.run("GOAL")]
+        for kind, _ in loop.memory_pass(stop):
             kinds.append(kind)
             if kind == "memory_start":
-                cancel.set()
+                stop.set()
         self.assertIn("memory_cancelled", kinds)
         self.assertNotIn("memory_save", kinds)
-        self.assertEqual(kinds[-1], "end")
-        self.assertFalse(cancel.is_set())       # must not leak into the next task
+        self.assertIs(loop.cancel, run_cancel)   # the run's event is put back
         self.assertEqual(session.messages[-1]["content"], "answer")
 
     def test_memory_messages_do_not_stay_in_the_history(self):
@@ -798,7 +808,7 @@ class TestMemoryPass(unittest.TestCase):
         index = paths.memory_index(self.workdir)
         cfg, session, client, loop = self.build(
             ["answer", self.write_call(index, "- ZYZZY was here"), "NOTHING"])
-        list(loop.run("GOAL"))
+        list(self.drive(loop))
         blob = "\n".join(m.get("content") or "" for m in session.messages)
         self.assertNotIn("[MEMORY]", blob)
         self.assertNotIn("ZYZZY", blob)
@@ -807,7 +817,7 @@ class TestMemoryPass(unittest.TestCase):
     def test_memory_pass_keeps_the_prompt_prefix(self):
         """It runs on the same message list, so the server keeps its KV cache."""
         cfg, session, client, loop = self.build(["answer", "NOTHING"])
-        list(loop.run("GOAL"))
+        list(self.drive(loop))
         answer, memory = client.prompts[0], client.prompts[1]
         self.assertEqual(memory[:len(answer)], answer)
         self.assertIn("[MEMORY]", memory[-1]["content"])
@@ -815,7 +825,7 @@ class TestMemoryPass(unittest.TestCase):
     def test_nothing_to_save_writes_no_file(self):
         from agent import paths
         cfg, session, client, loop = self.build(["answer", "NOTHING"])
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         saved = [d for k, d in events if k == "memory_save"][0]
         self.assertEqual(saved["wrote"], [])
         self.assertFalse(os.path.exists(paths.memory_index(self.workdir)))
@@ -824,7 +834,7 @@ class TestMemoryPass(unittest.TestCase):
         cfg, session, client, loop = self.build(
             ["answer", "<tool_call>sh<arg_key>cmd</arg_key><arg_value>echo hi</arg_value>"
                        "</tool_call>", "NOTHING"])
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         saved = [d for k, d in events if k == "memory_save"][0]
         self.assertEqual([c["name"] for c in saved["calls"]], ["sh"])
         self.assertTrue(saved["calls"][0]["error"])
@@ -836,13 +846,13 @@ class TestMemoryPass(unittest.TestCase):
         index = paths.memory_index(self.workdir)
         cfg, session, client, loop = self.build(
             ["answer", self.write_call(index, "- a fact"), "NOTHING"])
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         after = events[[k for k, _ in events].index("final"):]
         self.assertEqual([k for k, _ in after if k in ("tool_call", "tool_result")], [])
 
     def test_no_memory_flag_skips_the_pass(self):
         cfg, session, client, loop = self.build(["answer"], memory=False)
-        kinds = [k for k, _ in loop.run("GOAL")]
+        kinds = [k for k, _ in self.drive(loop)]
         self.assertNotIn("memory_save", kinds)
         self.assertEqual(len(client.prompts), 1)
 
@@ -864,27 +874,47 @@ class TestMemoryPass(unittest.TestCase):
         cfg = Config(workdir=self.workdir, max_steps=3)
         session = Session(cfg, default_tools())
         loop = AgentLoop(cfg, session, Flaky(), default_tools())
-        events = list(loop.run("GOAL"))
+        events = list(self.drive(loop))
         kinds = [k for k, _ in events]
         self.assertIn("final", kinds)
-        self.assertEqual(kinds[-1], "end")
+        self.assertLess(kinds.index("end"), kinds.index("note"))
+        self.assertNotIn("memory_save", kinds)
         self.assertIn("warn", [d.get("level") for k, d in events if k == "note"])
         self.assertEqual(session.messages[-1]["content"], "answer")
 
-    def test_a_cancelled_run_skips_the_pass(self):
+    def test_the_run_ends_before_the_pass_starts(self):
+        """The prompt must not wait for the memory pass. The loop hands back the
+        end event and only says a pass is due; the caller runs it in a thread."""
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        events = list(loop.run("GOAL"))
+        self.assertEqual([k for k, _ in events][-1], "end")
+        self.assertNotIn("memory_start", [k for k, _ in events])
+        self.assertTrue(events[-1][1]["memory_due"])
+        self.assertEqual(len(client.prompts), 1)        # the pass has not run yet
+
+    def test_no_memory_leaves_nothing_for_the_caller_to_run(self):
+        cfg, session, client, loop = self.build(["answer"], memory=False)
+        events = list(loop.run("GOAL"))
+        self.assertFalse(events[-1][1]["memory_due"])
+
+    def test_a_cancelled_run_is_not_offered_a_pass(self):
+        """esc during the task means stop, not stop-and-then-take-notes."""
         import threading
+        from agent.llm import Usage
         from agent.loop import AgentLoop
+        cancel = threading.Event()
+
+        class Escaping(object):
+            def chat(self, messages, on_delta=None, cancel_event=None):
+                cancel.set()                     # as if esc were pressed mid-reply
+                return "answer", Usage(10, 10, 0, "stop", 0.1, 0.1)
+
         cfg = Config(workdir=self.workdir, max_steps=3)
         session = Session(cfg, default_tools())
-        cancel = threading.Event()
-        client = self.scripted(["answer"])
-        loop = AgentLoop(cfg, session, client, default_tools(), cancel=cancel)
-        events = []
-        for event in loop.run("GOAL"):
-            events.append(event[0])
-            if event[0] == "final":
-                cancel.set()
-        self.assertNotIn("memory_save", events)
+        loop = AgentLoop(cfg, session, Escaping(), default_tools(), cancel=cancel)
+        events = list(loop.run("GOAL"))
+        ends = [d for k, d in events if k == "end"]
+        self.assertFalse(any(d.get("memory_due") for d in ends), ends)
 
 
 class TestSearchTiming(unittest.TestCase):
