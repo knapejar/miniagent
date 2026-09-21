@@ -102,10 +102,10 @@ class TestKaggleProfile(unittest.TestCase):
     def test_local_profile_is_unchanged(self):
         cfg = Config()
         self.assertEqual((cfg.dialect, cfg.ctx, cfg.temperature, cfg.effort),
-                         ("spark", 65536, 1.0, "none"))
+                         ("spark", 65536, 1.0, "low"))
         body = LLMClient(cfg)._body([], True)
         self.assertEqual(body["stop"], ["</tool_call>"])
-        self.assertEqual(body["reasoning_effort"], "none")
+        self.assertEqual(body["reasoning_effort"], "low")
 
     def test_sampling_is_left_to_the_model_generation_config(self):
         body = self.body()
