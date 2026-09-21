@@ -39,6 +39,7 @@ HELP = """  commands
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
     /edit <text>       replace the current task (e.g. after cancelling it)
+    /memory            notes the agent keeps for this project
     /trace             path to the JSONL trace
     /quit              exit
     !<command>         run a shell command directly, without the model
@@ -49,7 +50,9 @@ HELP = """  commands
 
 
 def run_task(cfg, session, client, tools, trace, renderer, task):
-    """Handle one task. Returns the metrics snapshot."""
+    """Handle one task. Returns (metrics snapshot, whatever the user typed while
+    it ran) - the key watcher owns the keyboard during a run, so anything typed
+    would otherwise be swallowed instead of reaching the next prompt."""
     cancel = threading.Event()
     loop = AgentLoop(cfg, session, client, tools, trace,
                      approve_fn=renderer.approval, cancel=cancel)
@@ -73,7 +76,7 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
         snapshot = loop.metrics.snapshot()
     finally:
         watcher.stop()
-    return snapshot
+    return snapshot, watcher.typed()
 
 
 def connect_kaggle(cfg, renderer):
@@ -102,6 +105,22 @@ def handle_command(line, cfg, session, renderer, trace, last):
             print()
         else:
             print("  " + s.dim("the plan is empty - the agent writes it with the plan tool"))
+    elif cmd == "/memory":
+        from agent import paths
+        path = paths.memory_index(session.cwd)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError:
+            text = ""
+        if text:
+            print()
+            print("  " + s.bold("project memory") + s.dim("  " + path))
+            for entry in text.splitlines():
+                print("    " + entry)
+            print()
+        else:
+            print("  " + s.dim("memory is empty (%s)" % path))
     elif cmd == "/stats":
         if last:
             renderer.summary(last)
@@ -226,7 +245,7 @@ def main(argv=None):
     os.chdir(cfg.workdir)
 
     if task:                                   # one-shot run
-        snapshot = run_task(cfg, session, client, tools, trace, renderer, task)
+        snapshot, _typed = run_task(cfg, session, client, tools, trace, renderer, task)
         renderer.summary(snapshot)
         kill_all(session)
         trace.close()
@@ -234,9 +253,15 @@ def main(argv=None):
 
     renderer.banner(session)
     last = None
+    typed = ""
     while True:
         try:
-            line = input(renderer.s.cyan("› ")).strip()
+            # Whatever was typed while the agent worked is echoed back in front
+            # of the cursor, so the next task carries on from it.
+            sys.stdout.write(renderer.s.cyan("› ") + typed)
+            sys.stdout.flush()
+            line = (typed + input()).strip()
+            typed = ""
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -250,7 +275,7 @@ def main(argv=None):
             from agent.tools.shell import ShellTool
             print(renderer.s.grey(ShellTool().run_foreground(session, line[1:])))
             continue
-        last = run_task(cfg, session, client, tools, trace, renderer, line)
+        last, typed = run_task(cfg, session, client, tools, trace, renderer, line)
 
     kill_all(session)
     trace.close()

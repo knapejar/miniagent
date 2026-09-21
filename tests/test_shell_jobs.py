@@ -73,7 +73,7 @@ class TestShellCheckpoints(unittest.TestCase):
             def chat(self, messages, on_delta=None, cancel=None):
                 return self.replies.pop(0), Usage(10, 10, 0, "stop", 0.1, 0.1)
 
-        cfg = Config(workdir=tempfile.gettempdir(), max_steps=5)
+        cfg = Config(workdir=tempfile.gettempdir(), max_steps=5, memory=False)
         loop = AgentLoop(cfg, self.session, Client(), default_tools())
         events = list(loop.run("GOAL"))
         notes = [d["text"] for name, d in events if name == "note"]

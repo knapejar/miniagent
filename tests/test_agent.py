@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Core tests.  Run with:  python -m unittest discover -s tests -v"""
 import os
+import shutil
 import sys
 import threading
 import time
@@ -691,6 +692,201 @@ class TestMalformedCall(unittest.TestCase):
         self.assertTrue(any("malformed" in n for n in notes), notes)
 
 
+
+class TestMemoryPass(unittest.TestCase):
+    """The short run after the answer whose only job is to update the memory."""
+
+    def setUp(self):
+        from agent import paths
+        self.home = os.path.join(os.environ.get("TEMP", "."), "miniagent_memhome")
+        shutil.rmtree(self.home, ignore_errors=True)
+        os.environ[paths.ENV_HOME] = self.home
+        self.workdir = os.path.join(os.environ.get("TEMP", "."), "miniagent_tests")
+        os.makedirs(self.workdir, exist_ok=True)
+
+    def tearDown(self):
+        from agent import paths
+        os.environ.pop(paths.ENV_HOME, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def scripted(self, replies):
+        """A client that answers with `replies` in order, repeating the last one."""
+        from agent.llm import Usage
+
+        class Scripted(object):
+            def __init__(self):
+                self.prompts = []
+
+            def chat(self, messages, on_delta=None, cancel=None):
+                self.prompts.append(list(messages))
+                text = replies[min(len(self.prompts) - 1, len(replies) - 1)]
+                return text, Usage(10, 10, 0, "stop", 0.1, 0.1)
+
+        return Scripted()
+
+    def build(self, replies, **kw):
+        from agent.loop import AgentLoop
+        cfg = Config(workdir=self.workdir, max_steps=3, **kw)
+        session = Session(cfg, default_tools())
+        client = self.scripted(replies)
+        return cfg, session, client, AgentLoop(cfg, session, client, default_tools())
+
+    @staticmethod
+    def write_call(path, text):
+        return ("<tool_call>write<arg_key>path</arg_key><arg_value>%s</arg_value>"
+                "<arg_key>text</arg_key><arg_value>%s</arg_value></tool_call>" % (path, text))
+
+    def test_memory_is_written_after_the_final_answer(self):
+        from agent import paths
+        index = paths.memory_index(self.workdir)
+        cfg, session, client, loop = self.build(
+            ["done, here is the answer", self.write_call(index, "- the GPU box is wingpu"),
+             "NOTHING"])
+        events = list(loop.run("GOAL"))
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds[-1], "end")
+        self.assertIn("memory_save", kinds)
+        self.assertLess(kinds.index("final"), kinds.index("memory_save"))
+        with open(index, encoding="utf-8") as fh:
+            self.assertIn("wingpu", fh.read())
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual(saved["wrote"], [index])
+        self.assertLess(kinds.index("memory_start"), kinds.index("memory_save"))
+
+    def test_the_current_index_is_handed_over_instead_of_read(self):
+        """Reading it cost a round trip and failed loudly on the first run, when
+        the file is simply not there yet."""
+        from agent import paths
+        index = paths.memory_index(self.workdir)
+        os.makedirs(os.path.dirname(index), exist_ok=True)
+        with open(index, "w", encoding="utf-8") as fh:
+            fh.write("- wingpu is the GPU box\n")
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        list(loop.run("GOAL"))
+        prompt = client.prompts[-1][-1]["content"]
+        self.assertIn("wingpu is the GPU box", prompt)
+
+    def test_a_missing_index_is_announced_not_an_error(self):
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        events = list(loop.run("GOAL"))
+        self.assertIn("does not exist yet", client.prompts[-1][-1]["content"])
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual([c for c in saved["calls"] if c["error"]], [])
+
+    def test_esc_during_the_pass_skips_it_and_keeps_the_answer(self):
+        import threading
+        from agent.loop import AgentLoop
+        cfg = Config(workdir=self.workdir, max_steps=3)
+        session = Session(cfg, default_tools())
+        cancel = threading.Event()
+        client = self.scripted(["answer", "NOTHING"])
+        loop = AgentLoop(cfg, session, client, default_tools(), cancel=cancel)
+        kinds = []
+        for kind, _ in loop.run("GOAL"):
+            kinds.append(kind)
+            if kind == "memory_start":
+                cancel.set()
+        self.assertIn("memory_cancelled", kinds)
+        self.assertNotIn("memory_save", kinds)
+        self.assertEqual(kinds[-1], "end")
+        self.assertFalse(cancel.is_set())       # must not leak into the next task
+        self.assertEqual(session.messages[-1]["content"], "answer")
+
+    def test_memory_messages_do_not_stay_in_the_history(self):
+        """They would ride along in every later task and eat the context."""
+        from agent import paths
+        index = paths.memory_index(self.workdir)
+        cfg, session, client, loop = self.build(
+            ["answer", self.write_call(index, "- ZYZZY was here"), "NOTHING"])
+        list(loop.run("GOAL"))
+        blob = "\n".join(m.get("content") or "" for m in session.messages)
+        self.assertNotIn("[MEMORY]", blob)
+        self.assertNotIn("ZYZZY", blob)
+        self.assertEqual(session.messages[-1]["content"], "answer")
+
+    def test_memory_pass_keeps_the_prompt_prefix(self):
+        """It runs on the same message list, so the server keeps its KV cache."""
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        list(loop.run("GOAL"))
+        answer, memory = client.prompts[0], client.prompts[1]
+        self.assertEqual(memory[:len(answer)], answer)
+        self.assertIn("[MEMORY]", memory[-1]["content"])
+
+    def test_nothing_to_save_writes_no_file(self):
+        from agent import paths
+        cfg, session, client, loop = self.build(["answer", "NOTHING"])
+        events = list(loop.run("GOAL"))
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual(saved["wrote"], [])
+        self.assertFalse(os.path.exists(paths.memory_index(self.workdir)))
+
+    def test_other_tools_are_refused_in_the_memory_pass(self):
+        cfg, session, client, loop = self.build(
+            ["answer", "<tool_call>sh<arg_key>cmd</arg_key><arg_value>echo hi</arg_value>"
+                       "</tool_call>", "NOTHING"])
+        events = list(loop.run("GOAL"))
+        saved = [d for k, d in events if k == "memory_save"][0]
+        self.assertEqual([c["name"] for c in saved["calls"]], ["sh"])
+        self.assertTrue(saved["calls"][0]["error"])
+        self.assertIn("not available in the memory pass", saved["calls"][0]["text"])
+
+    def test_the_pass_does_not_render_as_steps_of_its_own(self):
+        """It runs after the answer; its tool calls must not land in the transcript."""
+        from agent import paths
+        index = paths.memory_index(self.workdir)
+        cfg, session, client, loop = self.build(
+            ["answer", self.write_call(index, "- a fact"), "NOTHING"])
+        events = list(loop.run("GOAL"))
+        after = events[[k for k, _ in events].index("final"):]
+        self.assertEqual([k for k, _ in after if k in ("tool_call", "tool_result")], [])
+
+    def test_no_memory_flag_skips_the_pass(self):
+        cfg, session, client, loop = self.build(["answer"], memory=False)
+        kinds = [k for k, _ in loop.run("GOAL")]
+        self.assertNotIn("memory_save", kinds)
+        self.assertEqual(len(client.prompts), 1)
+
+    def test_a_failing_memory_pass_does_not_lose_the_answer(self):
+        from agent.llm import LLMError
+        from agent.loop import AgentLoop
+        from agent.llm import Usage
+
+        class Flaky(object):
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, on_delta=None, cancel=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return "answer", Usage(10, 10, 0, "stop", 0.1, 0.1)
+                raise LLMError("server gone")
+
+        cfg = Config(workdir=self.workdir, max_steps=3)
+        session = Session(cfg, default_tools())
+        loop = AgentLoop(cfg, session, Flaky(), default_tools())
+        events = list(loop.run("GOAL"))
+        kinds = [k for k, _ in events]
+        self.assertIn("final", kinds)
+        self.assertEqual(kinds[-1], "end")
+        self.assertIn("warn", [d.get("level") for k, d in events if k == "note"])
+        self.assertEqual(session.messages[-1]["content"], "answer")
+
+    def test_a_cancelled_run_skips_the_pass(self):
+        import threading
+        from agent.loop import AgentLoop
+        cfg = Config(workdir=self.workdir, max_steps=3)
+        session = Session(cfg, default_tools())
+        cancel = threading.Event()
+        client = self.scripted(["answer"])
+        loop = AgentLoop(cfg, session, client, default_tools(), cancel=cancel)
+        events = []
+        for event in loop.run("GOAL"):
+            events.append(event[0])
+            if event[0] == "final":
+                cancel.set()
+        self.assertNotIn("memory_save", events)
+
+
 class TestSearchTiming(unittest.TestCase):
     """A dead engine used to cost a full 25s timeout, twice, on every search."""
 
@@ -1137,6 +1333,50 @@ class TestRepeatedArgumentKeys(unittest.TestCase):
         tool = {t.name: t for t in default_tools()}["browse"]
         self.assertEqual(tool.targets(args["url"]),
                          ["https://a.example", "https://b.example"])
+
+
+class TestTypeAhead(unittest.TestCase):
+    """The watcher owns the keyboard while the agent works. Keys that are not
+    esc or ctrl+b used to be swallowed; they are kept for the next prompt now."""
+
+    def drive(self, keys):
+        """Run the reader loop once per key, then stop it."""
+        import threading
+        from ui.keys import CancelWatcher
+        watcher = CancelWatcher(threading.Event(), threading.Event())
+        pending = list(keys)
+
+        def reader(_timeout):
+            if pending:
+                return pending.pop(0)
+            watcher._stop.set()
+            return None
+
+        watcher._run(reader)
+        return watcher
+
+    def test_typed_text_survives_a_run(self):
+        watcher = self.drive(list("next task"))
+        self.assertEqual(watcher.typed(), "next task")
+        self.assertEqual(watcher.typed(), "")       # taking it clears it
+
+    def test_backspace_edits_the_buffer(self):
+        watcher = self.drive(list("abcd") + ["\x08", "\x08"] + list("xy"))
+        self.assertEqual(watcher.typed(), "abxy")
+
+    def test_esc_still_cancels_and_does_not_type(self):
+        watcher = self.drive(list("ab") + ["\x1b"] + list("cd"))
+        self.assertTrue(watcher.event.is_set())
+        self.assertEqual(watcher.typed(), "ab")
+
+    def test_ctrl_b_still_backgrounds(self):
+        watcher = self.drive(list("a") + ["\x02"])
+        self.assertTrue(watcher.background.is_set())
+        self.assertEqual(watcher.typed(), "a")
+
+    def test_control_characters_are_not_buffered(self):
+        watcher = self.drive(["\r", "\n", "\t", "a"])
+        self.assertEqual(watcher.typed(), "a")
 
 
 class TestAsyncWebSwitch(unittest.TestCase):

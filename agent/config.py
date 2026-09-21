@@ -117,6 +117,8 @@ class Config(object):
         self.show_reasoning = kw.get("show_reasoning", True)
         self.redact = kw.get("redact", True)       # mask secrets in tool output
         self.async_web = kw.get("async_web", False)  # never block on web tools
+        # After the answer, one short run that updates the project's memory.
+        self.memory = kw.get("memory", True)
         # Traces go to ~/.miniagent/projects/<slug>/runs, next to the memory for
         # the same project, so no run ever litters the directory it works in.
         self.trace_dir = kw.get("trace_dir") or paths.runs_dir(self.workdir)
@@ -182,6 +184,8 @@ def parse_args(argv=None):
     g.add_argument("--no-redact", action="store_true", help="do not mask secrets in output")
     g.add_argument("--async-web", action="store_true",
                    help="websearch and browse never block; results arrive later")
+    g.add_argument("--no-memory", action="store_true",
+                   help="skip the memory pass that runs after the answer")
     g.add_argument("--run-name", help="name of the trace file")
     p.add_argument("-v", "--version", action="version", version="miniagent 0.2.0")
 
@@ -198,6 +202,6 @@ def parse_args(argv=None):
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
                  approve=a.approve, stream=not a.no_stream, color=not a.no_color,
                  show_reasoning=not a.no_reasoning, redact=not a.no_redact,
-                 async_web=a.async_web, run_name=a.run_name,
+                 async_web=a.async_web, memory=not a.no_memory, run_name=a.run_name,
                  spawn_proxy=not a.no_proxy, wait=a.wait, **given)
     return cfg, task

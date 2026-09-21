@@ -13,6 +13,7 @@ import threading
 
 ESC = "\x1b"
 CTRL_B = "\x02"
+BACKSPACE = ("\x08", "\x7f")
 
 
 class CancelWatcher(object):
@@ -25,6 +26,7 @@ class CancelWatcher(object):
         self._stop = threading.Event()
         self._thread = None
         self._restore = None
+        self._typed = []
 
     @property
     def active(self):
@@ -49,6 +51,19 @@ class CancelWatcher(object):
                 return
             if key == CTRL_B and self.background is not None:
                 self.background.set()
+            elif key in BACKSPACE:
+                if self._typed:
+                    self._typed.pop()
+            elif key and key >= " " and key != "\x7f":
+                # Anything else the user types while the agent works is kept, not
+                # eaten: the REPL puts it back in front of the next prompt.
+                self._typed.append(key)
+
+    def typed(self):
+        """What the user typed while the agent was working, and forget it."""
+        text = "".join(self._typed).strip()
+        self._typed = []
+        return text
 
     def stop(self):
         self._stop.set()

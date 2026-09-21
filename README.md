@@ -284,6 +284,16 @@ writes for itself and is loaded into the system prompt on every start; `runs/*.j
 holds every past trace, so the agent can grep its own history of this project.
 Set `MINIAGENT_HOME` to move the whole thing elsewhere.
 
+The notes do not appear by themselves: once the answer is delivered, a short
+**memory pass** runs, with the single job of updating `INDEX.md` and only the file
+tools to do it with. The current index is handed to it in the prompt, so it writes
+straight back instead of spending a round trip reading it. It shows a live
+`updating memory …` line while it works and leaves one collapsed line behind
+(`/memory` shows what it wrote); `esc` skips it without touching the answer, and
+anything typed while it runs lands in front of the next prompt instead of being
+swallowed. Its own messages are dropped from the history afterwards. It costs one
+model call per finished task - `--no-memory` turns it off.
+
 **Rendered answers.** Bold, italic, headings, lists, quotes, code fences, aligned
 tables and highlighted links, streamed as they arrive.
 
@@ -295,7 +305,7 @@ stops the agent mid-token.
 ## Interactive commands
 
 ```
-/help   /plan    /stats   /tools   /hints   /context   /cwd
+/help   /plan    /memory  /stats   /tools   /hints   /context   /cwd
 /effort /approve /steps   /clear   /trace   /kaggle  /quit
 
 !<command>    run a shell command directly, without the model

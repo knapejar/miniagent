@@ -5,11 +5,13 @@ The loop is a generator of events and prints nothing itself. That keeps the UI
 swappable (terminal, log, tests) without touching the logic, and makes the loop
 straightforward to test.
 
-Events: step, delta, usage, tool_call, tool_result, plan, crop, note, final, end.
+Events: step, delta, usage, tool_call, tool_result, plan, crop, note, final,
+        memory_save, end.
 """
 import json
 import time
 
+from . import paths
 from .llm import LLMError
 from .guards import FailureMemory, Progress, ResultRepeat, failed
 from .hints import Hints
@@ -27,6 +29,30 @@ PLAN_NUDGE_AFTER = 15      # steps without a plan update before nudging
 PLAN_NUDGE = ("\n\n[PLAN] You have not updated the plan for %d steps. "
               "Call the plan tool now: record what already works and must not be "
               "touched, and what is left.")
+
+# The memory pass: one short run after the answer, whose only job is to write
+# down what the next run would want to know. It is bounded and it can only
+# touch files - a plan or an ask here would have nothing to act on.
+MEMORY_MAX_STEPS = 4
+MEMORY_MAX_CHARS = 4000
+MEMORY_TOOLS = ("read", "write", "edit", "grep")
+MEMORY_PROMPT = """[MEMORY] The task is finished and the answer is delivered.
+Before this run ends, update this project's memory for the next one.
+
+Its index is %s and this is what it says right now:
+---
+%s
+---
+Write down only what stays true and would save a future run real work: a host, a
+path, a login, a command that works, a layout decision, a dead end not worth
+retrying. One line per note. Do not record what this task did, what you just
+answered, or anything that is obvious from the code itself.
+
+Write the whole updated file back in one call - keep the lines that are still
+true. Keep it under %d characters; when a topic outgrows that,
+put it in its own file next to the index and leave one line pointing at it.
+Tools: %s. Nothing else is available here.
+If there is nothing worth keeping, call no tool and reply with the one word NOTHING."""
 
 
 def clip(text, limit=OBS_MAX_CHARS):
@@ -152,6 +178,76 @@ class AgentLoop(object):
                     "tool, or move to the next subgoal." % LOOP_WINDOW)
         return ""
 
+    def _memory_pass(self):
+        """One short bounded run after the final answer: the agent writes down
+        what the next run in this project would want to know.
+
+        It runs on the same message list, so the prompt prefix in front of it is
+        unchanged and the server reuses its KV cache instead of prefilling the
+        whole conversation again. The messages it adds are dropped afterwards -
+        the memory chatter would otherwise ride along in every later task.
+        Nothing in here may break the run: the answer is already delivered.
+        """
+        if not getattr(self.cfg, "memory", True) or self._cancelled():
+            return
+        saved = list(self.session.messages)
+        index = paths.memory_index(self.session.cwd)
+        wrote, calls, reply, steps = [], [], "", 0
+        yield "memory_start", {"index": index}
+        try:
+            # The index goes in verbatim. Making the model read it first cost a
+            # round trip, and on the first run the read failed on a file that is
+            # simply not there yet, which reads like a bug in the transcript.
+            try:
+                with open(index, encoding="utf-8") as fh:
+                    current = fh.read().strip() or "(empty)"
+            except OSError:
+                current = "(does not exist yet - write creates it)"
+            self.session.add_observation(
+                MEMORY_PROMPT % (index, current, MEMORY_MAX_CHARS, ", ".join(MEMORY_TOOLS)))
+            for steps in range(1, MEMORY_MAX_STEPS + 1):
+                if self._cancelled():
+                    break
+                text, _ = self._call_model(None)     # not streamed - the answer is done
+                reply = strip_think(text)
+                self.session.add_assistant(reply, extract_think(text))
+                call = parse_tool_call(text)
+                if call is None:
+                    break
+                name, args = call
+                if name not in MEMORY_TOOLS:
+                    out = ("error: %s is not available in the memory pass. Use %s."
+                           % (name, ", ".join(MEMORY_TOOLS)))
+                else:
+                    out, _seconds = self._run_tool(name, args, self._key(name, args))
+                    if name in ("write", "edit") and not out.startswith("error:"):
+                        wrote.append(args.get("path") or index)
+                observation = clip(redact(out, self.cfg.redact))
+                # The pass reports itself as one collapsed line, not as steps of
+                # its own - the task is already answered and this is bookkeeping.
+                calls.append({"name": name, "text": observation[:200],
+                              "error": observation.startswith("error:")})
+                self.session.add_observation(observation)
+        except (LLMError, OSError) as e:
+            self._log("memory_failed", err="%s: %s" % (type(e).__name__, e))
+            yield "note", {"level": "warn", "text": "memory pass failed: %s" % str(e)[:120]}
+            return
+        finally:
+            # Restore the history whatever happened - _call_model may also have
+            # cropped it, so put the list back rather than trimming an index.
+            self.session.messages[:] = saved
+        if self._cancelled():
+            # esc during the pass skips the bookkeeping, not the answer - the run
+            # is already finished, so the cancel flag must not leak into the next one.
+            self.cancel.clear()
+            self._log("memory_cancelled", index=index, wrote=wrote, steps=steps)
+            yield "memory_cancelled", {"index": index, "wrote": wrote}
+            return
+        self._log("memory", index=index, wrote=wrote, steps=steps, calls=calls,
+                  reply=reply[:300])
+        yield "memory_save", {"index": index, "wrote": wrote, "steps": steps,
+                              "calls": calls, "text": reply}
+
     # ----------------------------------------------------------------- run
     def run(self, task, on_delta=None):
         """`on_delta(kind, text)` receives reply chunks as they arrive - the
@@ -245,6 +341,8 @@ class AgentLoop(object):
                     continue
                 self._log("final", step=step, text=body, metrics=self.metrics.snapshot())
                 yield "final", {"text": body}
+                for event in self._memory_pass():
+                    yield event
                 yield "end", {"reason": "final", "metrics": self.metrics.snapshot()}
                 return
 

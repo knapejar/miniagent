@@ -90,7 +90,8 @@ class TestLoopWaitsOutOutage(unittest.TestCase):
     def run_loop(self, client, outage_wait):
         workdir = os.path.join(os.environ.get("TEMP", "."), "miniagent_outage")
         os.makedirs(workdir, exist_ok=True)
-        cfg = Config(workdir=workdir, max_steps=3, outage_wait=outage_wait)
+        cfg = Config(workdir=workdir, max_steps=3, outage_wait=outage_wait,
+                     memory=False)   # this is about the outage, not the memory pass
         session = Session(cfg, default_tools())
         with mock.patch.object(loop_mod, "OUTAGE_POLL", 0):
             return list(loop_mod.AgentLoop(cfg, session, client, default_tools()).run("GOAL"))
