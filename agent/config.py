@@ -33,7 +33,7 @@ PROFILES = {
     # over Tailscale. It serves on 0.0.0.0:1234 and asks for no key.
     "wingpu": {
         "url": lambda: os.getenv("MINIAGENT_WINGPU_URL", "http://100.75.132.66:1234/v1"),
-        "model": lambda: os.getenv("MINIAGENT_WINGPU_MODEL", "spark-x2.5-4b"),
+        "model": lambda: os.getenv("MINIAGENT_WINGPU_MODEL", "spark-x2.5-4b-uncensored"),
         "api_key": lambda: os.getenv("MINIAGENT_WINGPU_KEY", "lmstudio"),
         "ctx": 65536,
         "max_tokens": 8192,
@@ -46,7 +46,7 @@ PROFILES = {
         "outage_wait": 0,
     },
     # Ternary Bonsai 2 27B on the PrismML llama.cpp fork, the only runtime that
-    # loads its PTQ1_0 tensors - LM Studio cannot. Start the server first, from
+    # loads its PTQ1_0 tensors - LM Studio cannot. agent/llamacpp.py starts it, from
     # C:\Users\Jarda\llama-prism:
     #   llama-server.exe -m <...>-PTQ1_0.gguf -ngl 99 -c 32768 --parallel 1
     #                    -ctk q8_0 -ctv q8_0 -fa on --port 8080 -a bonsai2-27b
@@ -63,6 +63,23 @@ PROFILES = {
         "top_p": None,
         "top_k": None,
         # llama-server has no reasoning_effort switch; the model thinks as it will.
+        "effort": "low",
+        "retries": 0,
+        "outage_wait": 0,
+    },
+    # Limite 1B Violetto: an unknown architecture to LM Studio, so it runs on its
+    # own llama.cpp build, started by agent/llamacpp.py. A math-only model with
+    # no tool training - here to try, not to work with.
+    "limite": {
+        "url": lambda: os.getenv("MINIAGENT_LIMITE_URL", "http://127.0.0.1:8081/v1"),
+        "model": lambda: os.getenv("MINIAGENT_LIMITE_MODEL", "limite-1b"),
+        "api_key": lambda: "",
+        "ctx": 32768,
+        "max_tokens": 8192,
+        # Model card: temperature 0.6, top_p 0.95.
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": None,
         "effort": "low",
         "retries": 0,
         "outage_wait": 0,
@@ -200,7 +217,7 @@ class Config(object):
         self.keep_tail = kw.get("keep_tail", 8)    # messages the crop keeps at the end
         self.remind_every = kw.get("remind_every", 6)
 
-        self.approve = kw.get("approve", "auto")   # auto | all | none
+        self.approve = kw.get("approve", "none")   # auto | all | none
         self.stream = kw.get("stream", True)
         self.color = kw.get("color", True)
         self.show_reasoning = kw.get("show_reasoning", True)
@@ -267,7 +284,8 @@ def parse_args(argv=None):
     g.add_argument("--crop-at", type=float, default=0.7)
     g.add_argument("--keep-tail", type=int, default=8)
     g.add_argument("--remind-every", type=int, default=6)
-    g.add_argument("--approve", choices=["auto", "all", "none"], default="auto")
+    g.add_argument("--approve", choices=["auto", "all", "none"], default=None,
+                   help="auto | all | none (default: none = run everything)")
 
     g = p.add_argument_group("output")
     g.add_argument("--no-stream", action="store_true", help="disable streaming")
@@ -296,11 +314,12 @@ def parse_args(argv=None):
             task = fh.read().strip()
     given = {name: getattr(a, name) for name in
              ("url", "model", "api_key", "effort", "ctx", "max_tokens",
-              "temperature", "top_p", "top_k", "think_cap") if getattr(a, name) is not None}
+              "temperature", "top_p", "top_k", "think_cap",
+              "approve") if getattr(a, name) is not None}
     cfg = Config(profile=profile, dialect=a.dialect,
                  workdir=a.workdir, max_steps=a.max_steps,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
-                 approve=a.approve, stream=not a.no_stream, color=not a.no_color,
+                 approve=a.approve or "none", stream=not a.no_stream, color=not a.no_color,
                  show_reasoning=not a.no_reasoning, redact=not a.no_redact,
                  async_web=a.async_web, memory=not a.no_memory, run_name=a.run_name,
                  spawn_proxy=not a.no_proxy, wait=a.wait, **given)

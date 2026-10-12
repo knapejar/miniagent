@@ -89,7 +89,10 @@ set MINIAGENT_MODEL=qwen3-coder-30b
 [Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 fits in 16 GB of VRAM with room for a 32k context. Its PTQ1_0 tensors only load in
 the [PrismML llama.cpp fork](https://github.com/prism-ml/llama.cpp) — LM Studio
-cannot open them. Start the server first, then point miniagent at it:
+cannot open them. When nothing answers on the URL, miniagent starts
+`~\llama-prism\llama-server.exe` on the model itself (paths via
+`MINIAGENT_BONSAI_SERVER` / `MINIAGENT_BONSAI_GGUF`, log in `llama-server.log`
+next to it) and leaves it running. By hand it is:
 
 ```bat
 llama-server.exe -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -ngl 99 -c 32768 ^
@@ -102,6 +105,17 @@ python miniagent.py --profile bonsai --set-default   :: remember it
 `MINIAGENT_BONSAI_URL` and `MINIAGENT_BONSAI_MODEL` override the defaults
 (`http://127.0.0.1:8080/v1`, `bonsai2-27b`). Note that SearXNG below also wants
 port 8080 — give one of the two another port.
+
+### Limite 1B Violetto (`--profile limite`)
+
+The `limite` architecture is in no llama.cpp release. Build upstream
+`58367713` with Tdamre's
+[`limite.patch`](https://huggingface.co/Tdamre/limite-1b-violetto-GGUF-LiteRT/tree/main/runtime)
+into `~\llama-limite\src\build` (CUDA, `llama-server` target); miniagent then
+starts it on `127.0.0.1:8081` the same way as bonsai (`MINIAGENT_LIMITE_SERVER`,
+`MINIAGENT_LIMITE_GGUF`). The model's own template refuses tools and custom
+system prompts, so it runs under plain `chatml`. It is a math-only model, so
+expect it to be poor at agent work.
 
 `--profile` without a name lists every profile.
 
@@ -351,7 +365,7 @@ esc           stop the agent immediately
     --dialect NAME       auto | spark | qwen (tool-call format)
     --effort LEVEL       default | none | low | medium | high | xhigh
     --temperature F      default 1.0
-    --approve MODE       auto | all | none
+    --approve MODE       auto | all | none (default none: no confirmations)
     --crop-at F          share of the context that triggers cropping
     --remind-every N     steps between goal reminders
     --no-stream          disable streaming
