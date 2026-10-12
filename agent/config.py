@@ -142,7 +142,10 @@ class Config(object):
         self.think_cap = kw.get("think_cap", 0.6)
 
         self.crop_at = kw.get("crop_at", 0.7)      # share of ctx that triggers cropping
-        self.keep_tail = kw.get("keep_tail", 8)    # messages the crop keeps at the end
+        self.keep_tail = kw.get("keep_tail", 12)   # messages the crop keeps at the end
+        # A plan item turning DONE starts the next one in a clean context, once the
+        # run has grown past this share of ctx; 0 turns it off (loop.py).
+        self.checkpoint_at = kw.get("checkpoint_at", 0.3)
         self.remind_every = kw.get("remind_every", 6)
 
         self.approve = kw.get("approve", "none")   # auto | all | none
@@ -245,7 +248,10 @@ def parse_args(argv=None):
     g = p.add_argument_group("loop")
     g.add_argument("--max-steps", type=int, default=60)
     g.add_argument("--crop-at", type=float, default=0.7)
-    g.add_argument("--keep-tail", type=int, default=8)
+    g.add_argument("--keep-tail", type=int, default=12)
+    g.add_argument("--checkpoint-at", type=float, default=0.3, metavar="SHARE",
+                   help="when a plan item turns DONE past this share of the context, "
+                        "drop what it took to get there (0 = never)")
     g.add_argument("--remind-every", type=int, default=6)
     g.add_argument("--approve", choices=["auto", "all", "none"], default=None,
                    help="auto | all | none (default: none = run everything)")
@@ -293,6 +299,7 @@ def parse_args(argv=None):
     cfg = Config(profile=profile,
                  workdir=a.workdir, max_steps=a.max_steps,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
+                 checkpoint_at=a.checkpoint_at,
                  approve=a.approve or "none", stream=not a.no_stream, color=not a.no_color,
                  show_reasoning=not a.no_reasoning, redact=not a.no_redact,
                  async_web=a.async_web, memory=not a.no_memory, run_name=a.run_name,

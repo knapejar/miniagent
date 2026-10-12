@@ -26,6 +26,7 @@ import re
 HINTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hints")
 ANY = "any"
 MAX_PER_RUN = 2          # the same hint twice is help, five times is noise
+CONTENT = ("read", "grep", "browse", "websearch")   # tools that return found text
 
 
 class Hints(object):
@@ -41,6 +42,10 @@ class Hints(object):
     def match(self, tool, observation):
         """Text of the first hint that applies to this tool, or an empty string."""
         if not observation:
+            return ""
+        if tool in CONTENT and not observation.startswith("error"):
+            # their output is somebody's text: 41 of 125 hints in the traces fired
+            # on a file or page that merely mentioned an error message
             return ""
         for entry in self.entries:
             if entry["tool"] not in (ANY, tool):

@@ -1313,6 +1313,18 @@ class TestHints(unittest.TestCase):
     def test_hints_only_apply_to_their_own_tool(self):
         self.assertEqual(self.fired("browse", "error: 'old' not found in file"), "")
 
+    def test_a_file_that_mentions_an_error_gets_no_hint(self):
+        # a read of hints.py "matched" No such file or directory
+        self.assertEqual(self.fired("read", '    1\t"when": "No such file or directory"'), "")
+        self.assertTrue(self.fired("read", "error: [Errno 2] No such file or directory: 'x'"))
+
+    def test_successive_successful_edits_are_not_a_stall(self):
+        from agent.guards import Progress
+        progress = Progress()
+        warnings = [progress.push("edit", {"path": "a.py", "old": "x = %d" % i, "new": "y"},
+                                  "edited a.py") for i in range(5)]
+        self.assertEqual(warnings, [""] * 5)
+
     def test_an_extra_directory_can_be_merged_in(self):
         import json
         import tempfile

@@ -78,6 +78,8 @@ CODE_EXT = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", "
             ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php", ".lua", ".swift", ".sh",
             ".ps1", ".bat", ".cmd", ".asm")
 EXIT = re.compile(r"exit=(-?\d+)")
+# A plan line marked done; one more of them than before is a checkpoint.
+DONE = re.compile(r"(?im)^.*?(\bDONE\b|\[x\]|✓|✅)")
 
 MEMORY_NUDGE = """[MEMORY] That was prose, not a memory update, and nothing was
 saved. Call write on %s now with the full contents of the file, or reply with
@@ -119,6 +121,7 @@ class AgentLoop(object):
         self._last_exit = None       # how the last run of the code ended
         self._last_cmd = ""          # the last sh command, for a wait that finishes it
         self._checked = False        # the CHECK is asked once per task
+        self._done = 0               # plan lines marked done so far
 
     # ------------------------------------------------------------- helpers
     def _log(self, event, **fields):
@@ -137,7 +140,7 @@ class AgentLoop(object):
             dropped = self.session.crop()
             if dropped:
                 self.metrics.crops += 1
-                self._log("crop", chars=dropped)
+                self._log("crop", chars=dropped, kind=self.session.last_crop)
                 self._pending_crop = dropped
         # effort is only passed when it is overridden, so a client that does not
         # know the argument (tests, other backends) still works.
@@ -398,6 +401,7 @@ class AgentLoop(object):
         self._no_think = False
         self._since_plan = 0
         self._changed, self._last_exit, self._last_cmd, self._checked = [], None, "", False
+        self._done = len(DONE.findall(self.session.plan_text))
         self.hints.reset()
         self._log("task", task=task, model=self.cfg.model, config=self.cfg.as_dict())
 
@@ -449,12 +453,15 @@ class AgentLoop(object):
             call = parse_tool_call(body)
             reasoning = "\n".join(t for t in (getattr(usage, "reasoning", ""),
                                               extract_think(raw)) if t)
-            self.session.add_assistant(body, reasoning)
+            # An empty reply or a cut-off at the token limit is NOT a finished
+            # task - the model usually spent the whole budget on reasoning. That
+            # spiral is not kept: three of them once grew the context from 8k to
+            # 33k tokens, and shown its spiral again the model spirals on.
+            empty = call is None and (not body or usage.finish_reason in ("length", "think_cap"))
+            self.session.add_assistant(body, "" if empty else reasoning)
 
             if call is None:
-                # An empty reply or a cut-off at the token limit is NOT a finished
-                # task - the model usually spent the whole budget on reasoning.
-                if not body or usage.finish_reason in ("length", "think_cap"):
+                if empty:
                     self._empty += 1
                     self.metrics.empty_replies += 1
                     self._log("empty_reply", step=step, finish=usage.finish_reason,
@@ -545,10 +552,16 @@ class AgentLoop(object):
             self._track(name, args, observation)
             yield "tool_result", {"name": name, "text": observation, "seconds": seconds,
                                   "error": observation.startswith("error:")}
+            checkpoint = False
             if name == "plan":
                 self._since_plan = 0
                 yield "plan", {"text": self.session.plan_text}
                 self._log("plan", step=step, text=self.session.plan_text)
+                done = len(DONE.findall(self.session.plan_text))
+                share = getattr(self.cfg, "checkpoint_at", 0)
+                checkpoint = done > self._done and share and \
+                    self.session.estimated_tokens() > self.cfg.ctx * share
+                self._done = max(self._done, done)
             else:
                 self._since_plan += 1
 
@@ -578,6 +591,12 @@ class AgentLoop(object):
             if reminder:
                 self._log("goal_reminded", step=step)
             self.session.add_observation(observation + warning + reminder)
+            if checkpoint:
+                freed = self.session.checkpoint()
+                if freed:
+                    self.metrics.crops += 1
+                    self._log("checkpoint", step=step, chars=freed, done=self._done)
+                    yield "crop", {"chars": freed, "n": self.metrics.crops}
 
         self._log("limit", steps=self.cfg.max_steps, metrics=self.metrics.snapshot())
         for event in self._force_answer(self.cfg.max_steps, on_delta,

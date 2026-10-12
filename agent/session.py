@@ -32,6 +32,10 @@ from .secrets import collect_env, register
 
 CHARS_PER_TOKEN = 3.4      # starting guess, calibrated against the server
 CROP_MAX_FILES = 25         # files listed in the crop marker
+ELIDE_TARGET = 0.6          # shrinking alone must get under this share of the crop point
+ELIDE_KEEP = 300            # chars an old long observation keeps
+STALE = "[stale: this read of %s was dropped - the file changed or was read again later]"
+DROPPED = "\n...[%d chars dropped to save room - run the call again if you need them]"
 
 
 class Session(object):
@@ -51,6 +55,7 @@ class Session(object):
         self.chars_per_token = CHARS_PER_TOKEN
         self.cropped = False           # flag that forces a goal reminder
         self.crops = 0
+        self.last_crop = ""            # "elided" or "cut"
         self.touched = {}              # path -> {tool: count} of cropped steps
         self.undo = {}                 # path -> what it held before each change (tools/files.py)
         self.backup_dir = None         # where the task's first copies of changed files go
@@ -215,19 +220,74 @@ class Session(object):
     def should_crop(self):
         return self.estimated_tokens() > self.cfg.ctx * self.cfg.crop_at
 
-    def crop(self):
-        """Truncate the middle. The head (system + first task + plan), the
-        current task and the most recent messages stay; everything between them
-        becomes one marker.
+    def crop(self, keep_tail=None):
+        """Make room, cheapest first. Between the head (system + first task +
+        plan) and the most recent messages, what is stale is shrunk in place:
+        old reasoning, reads of a file that changed or was read again since,
+        long tool output. The calls stay, so the run still reads as what was
+        done in which order. Only when that is not enough is the middle cut.
 
-        The marker lists the files those steps read and changed, so the model
-        comes out of a crop knowing which files it already touched and that
-        their content is no longer in front of it.
+        `keep_tail` cuts regardless, keeping that many messages: a checkpoint.
+        Returns the characters freed; `last_crop` says which it was.
         """
         head = 3 if self.has_plan else 2
-        tail = self.cfg.keep_tail
+        tail = self.cfg.keep_tail if keep_tail is None else keep_tail
         if len(self.messages) <= head + tail + 1:
             return 0
+        freed = self._elide(head, len(self.messages) - tail)
+        self.last_crop = "elided"
+        if keep_tail is None and freed and \
+                self.estimated_tokens() <= self.cfg.ctx * self.cfg.crop_at * ELIDE_TARGET:
+            self._pin_plan()
+            self.cropped = True
+            self.crops += 1
+            return freed
+        self.last_crop = "cut"
+        return freed + self._cut(head, tail)
+
+    def _elide(self, low, high):
+        """Shrink, in place, what in messages[low:high] is no longer worth its room."""
+        calls = {}
+        for i, message in enumerate(self.messages):
+            call = message["role"] == "assistant" and parse_tool_call(message.get("content") or "")
+            if call:
+                calls[i] = call
+        freed = 0
+        for i in range(low, high):
+            message = self.messages[i]
+            if message["role"] == "assistant":
+                # a 4B model once carried 15k tokens of three failed spirals along
+                freed += len(message.pop("reasoning_content", None) or "")
+                continue
+            call = calls.get(i - 1)
+            if not call or i == self.anchor:
+                continue
+            text = message.get("content") or ""
+            wrapped = text.startswith("<tool_response>")
+            inner = text[len("<tool_response>"):-len("</tool_response>")] if wrapped else text
+            path = str((call[1] or {}).get("path") or "")
+            if call[0] == "read" and path and any(
+                    j > i and later[0] in ("read", "edit", "write")
+                    and self._short(str((later[1] or {}).get("path") or "")) == self._short(path)
+                    for j, later in calls.items()):
+                short = STALE % path
+            elif len(inner) > ELIDE_KEEP * 2:
+                short = inner[:ELIDE_KEEP] + DROPPED % (len(inner) - ELIDE_KEEP)
+            else:
+                continue
+            if len(short) >= len(inner):
+                continue
+            freed += len(inner) - len(short)
+            message["content"] = wrap_tool_response(short) if wrapped else short
+        return freed
+
+    def checkpoint(self):
+        """A plan item just became DONE: what it took to get there is history.
+        Everything behind the head goes into one marker but the plan call and its
+        answer, so the next item starts in a small, clean context."""
+        return self.crop(keep_tail=2)
+
+    def _cut(self, head, tail):
         low, high = head, len(self.messages) - tail
         # A task appended after the first one sits inside the cut region; it is
         # the goal anchor, so it survives and moves just behind the marker.

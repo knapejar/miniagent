@@ -73,6 +73,11 @@ class Progress(object):
         return name + "|" + " ".join(sorted(set(words))[:12])
 
     def push(self, name, args, observation=""):
+        if name in ("edit", "write") and not (observation or "").startswith("error"):
+            # a change that went in is progress, however alike the calls look:
+            # successive edits of one file were told to "change what you are doing"
+            self.barren = 0
+            return ""
         shape = self._shape(name, args)
         self.shapes.append(shape)
         del self.shapes[:-self.window]

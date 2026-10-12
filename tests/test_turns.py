@@ -34,7 +34,10 @@ class Scripted(object):
 
     def chat(self, messages, on_delta=None, cancel=None, effort=None):
         self.seen.append(list(messages))
-        return self.replies.pop(0), Usage(10, 10, 0, "stop", 0.1, 0.1)
+        self.efforts = getattr(self, "efforts", []) + [effort]
+        reply = self.replies.pop(0)
+        text, finish = reply if isinstance(reply, tuple) else (reply, "stop")
+        return text, Usage(0, 10, 0, finish, 0.1, 0.1)    # 0: no calibration
 
 
 def call(name, **args):
@@ -122,6 +125,92 @@ class TestCheckBeforeFinal(unittest.TestCase):
                           "done", "done")
         events, _ = self.run_loop(client)
         self.assertTrue(any(e == "note" and "held back" in d["text"] for e, d in events))
+
+
+class TestContext(unittest.TestCase):
+    """Room is made cheapest first; a finished plan item starts the next clean."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def session(self, **kw):
+        cfg = Config(workdir=self.root, ctx=kw.get("ctx", 20000), keep_tail=4, crop_at=0.7,
+                     remind_every=0, memory=False, checkpoint_at=kw.get("checkpoint_at", 0.3))
+        s = Session(cfg, default_tools())
+        s.start("GOAL")
+        return s
+
+    def step(self, s, reply, observation, reasoning=""):
+        s.add_assistant(reply, reasoning)
+        s.add_observation(observation)
+
+    def test_stale_reads_and_old_reasoning_go_before_anything_is_cut(self):
+        s = self.session()
+        self.step(s, call("read", path="a.py"), "A" * 6000, "r" * 10000)
+        self.step(s, call("edit", path="a.py", old="x", new="y"), "edited a.py", "r" * 10000)
+        self.step(s, call("read", path="b.py"), "B" * 6000, "r" * 10000)
+        self.step(s, call("sh", cmd="python t.py"), "exit=0\n" + "t" * 3000)
+        for i in range(2):
+            self.step(s, call("sh", cmd="echo %d" % i), "exit=0 %d" % i)
+        s.crop()
+        self.assertEqual(s.last_crop, "elided")
+        contents = [m["content"] for m in s.messages]
+        self.assertTrue(any("[stale: this read of a.py" in c for c in contents))
+        self.assertTrue(any(c.endswith("B" * 300 + "\n...[5700 chars dropped to save room - run "
+                                       "the call again if you need them]</tool_response>")
+                            for c in contents))
+        self.assertFalse(any(m.get("reasoning_content") for m in s.messages))
+        self.assertTrue(any(call("read", path="a.py") == c for c in contents))   # the call stays
+        self.assertFalse(any("context cropped" in c for c in contents))
+
+    def test_when_shrinking_is_not_enough_the_middle_is_cut(self):
+        s = self.session(ctx=4000)
+        for i in range(10):
+            self.step(s, call("sh", cmd="echo %d" % i), "out %d " % i + "x" * 400)
+        s.crop()
+        self.assertEqual(s.last_crop, "cut")
+        self.assertIn("context cropped", s.messages[3]["content"])
+
+    def test_a_checkpoint_keeps_only_the_plan_call(self):
+        s = self.session()
+        self.step(s, call("read", path="a.py"), "A" * 100)
+        self.step(s, call("plan", text="1. read - DONE"), "plan updated")
+        s.set_plan("1. read - DONE")
+        s.checkpoint()
+        self.assertEqual([m["role"] for m in s.messages[3:]], ["user", "assistant", s.tool_role])
+        self.assertIn("a.py: read 1x", s.messages[3]["content"])
+        self.assertIn("1. read - DONE", s.messages[2]["content"])
+
+    def test_the_loop_checkpoints_when_a_plan_item_turns_done(self):
+        put(self.root, "big.py", "x = 1\n" * 1500)
+        client = Scripted(call("plan", text="1. read big.py\n2. say done"),
+                          call("read", path="big.py"),
+                          call("plan", text="1. read big.py - DONE\n2. say done"), "done")
+        cfg = Config(workdir=self.root, ctx=6000, max_steps=6, memory=False, checkpoint_at=0.3)
+        session = Session(cfg, default_tools())
+        events = list(AgentLoop(cfg, session, client, default_tools()).run("GOAL"))
+        self.assertTrue(any(e == "crop" for e, _ in events))
+        self.assertIn("big.py: read 1x", session.messages[3]["content"])
+        self.assertNotIn("x = 1\n" * 50, "".join(m["content"] for m in client.seen[-1]))
+
+    def test_no_checkpoint_while_the_run_is_small_or_when_off(self):
+        for share in (0.3, 0):
+            client = Scripted(call("plan", text="1. a - DONE"), "done")
+            cfg = Config(workdir=self.root, ctx=100000, max_steps=4, memory=False,
+                         checkpoint_at=share)
+            events = list(AgentLoop(cfg, Session(cfg, default_tools()), client,
+                                    default_tools()).run("GOAL"))
+            self.assertFalse(any(e == "crop" for e, _ in events))
+
+    def test_an_empty_reply_leaves_no_spiral_behind(self):
+        client = Scripted(("<think>" + "hmm " * 2000 + "</think>", "think_cap"), "done")
+        cfg = Config(workdir=self.root, max_steps=4, memory=False)
+        session = Session(cfg, default_tools())
+        list(AgentLoop(cfg, session, client, default_tools()).run("GOAL"))
+        self.assertFalse(any("hmm" in (m.get("reasoning_content") or "") for m in session.messages))
 
 
 class TestReading(unittest.TestCase):
