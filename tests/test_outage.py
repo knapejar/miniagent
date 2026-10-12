@@ -16,10 +16,11 @@ from agent.config import Config                                       # noqa: E4
 from agent.llm import LLMClient, LLMError, Usage                      # noqa: E402
 from agent.session import Session                                     # noqa: E402
 from agent.tools import default_tools                                 # noqa: E402
+from test_kaggle import setUpModule, tearDownModule  # noqa: E402,F401 - the kaggle profile
 
 
 class BrokenStream(object):
-    """Yields some lines, then the connection is reset (what the Kaggle proxy did)."""
+    """Yields some lines, then the connection is reset (what a tunnel proxy did)."""
 
     def __init__(self, lines, error):
         self.lines, self.error = lines, error

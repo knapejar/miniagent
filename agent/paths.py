@@ -32,9 +32,15 @@ def default_profile_file():
     return os.path.join(home(), "profile")
 
 
-def key_file(profile):
-    """Where a profile's API key may be kept instead of in the environment."""
-    return os.path.join(home(), "%s.key" % profile)
+def profiles_dir():
+    """Your own profiles, one JSON file per provider (see agent/config.py)."""
+    return os.path.join(home(), "profiles")
+
+
+def key_file(name):
+    """Where a profile's (or a provider's) API key may be kept instead of in the
+    environment."""
+    return os.path.join(home(), "%s.key" % name)
 
 
 def slug(cwd="."):

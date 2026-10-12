@@ -42,10 +42,7 @@ class Session(object):
         register(env_secrets.values())
         self.secret_names = sorted(env_secrets)
         self.dialect = getattr(cfg, "dialect", "spark")
-        self.messages = [{"role": "system",
-                          "content": build_system(tools, self.cwd,
-                                                  secret_names=self.secret_names,
-                                                  dialect=self.dialect)}]
+        self.messages = [self._system()]
         self.goal = ""
         self.anchor = 1                # index of the task being worked on now
         self.has_plan = False
@@ -64,6 +61,18 @@ class Session(object):
         # the session must keep landing in the project it was started in.
         self.file = os.path.join(paths.sessions_dir(self.cwd),
                                  time.strftime("%Y%m%d_%H%M%S") + ".json")
+
+    def _system(self):
+        return {"role": "system", "content": build_system(
+            self.tools, self.cwd, secret_names=self.secret_names, dialect=self.dialect)}
+
+    def set_dialect(self, dialect):
+        """Another model took over (/model): its tool-call format goes into the
+        system prompt, and the conversation so far carries on."""
+        self.dialect = dialect
+        self.messages[0] = self._system()
+        if dialect == "native" and self.tool_role == "tool":
+            self.downgrade_tool_role()
 
     # --------------------------------------------------------------- basics
     def start(self, task):
@@ -119,10 +128,7 @@ class Session(object):
         self.file = path
         self.cwd = state["cwd"]
         self.messages = state["messages"]
-        self.messages[0] = {"role": "system",
-                            "content": build_system(self.tools, self.cwd,
-                                                    secret_names=self.secret_names,
-                                                    dialect=self.dialect)}
+        self.messages[0] = self._system()
         self.goal, self.anchor = state["goal"], state["anchor"]
         self.has_plan, self.plan_text = state["has_plan"], state["plan_text"]
         if self.tool_role == "user":            # saved under a dialect that sent role=tool

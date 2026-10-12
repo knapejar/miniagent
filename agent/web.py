@@ -172,7 +172,7 @@ def _scrape(url, engine_host, limit, data=None):
 
 def searxng_base():
     """Where SearXNG listens, or None when MINIAGENT_SEARX=off. The kaggle
-    profile turns it off when the model's proxy holds the same port (8080)."""
+    connector turns it off when the model's proxy holds the same port (8080)."""
     base = os.getenv("MINIAGENT_SEARX", "http://127.0.0.1:8080")
     return None if base.strip().lower() in ("", "off", "none", "0") else base
 

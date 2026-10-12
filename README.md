@@ -7,33 +7,22 @@ running on your own machine, with no API key and nothing leaving the computer.
 Built and tuned against [Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B)
 in [LM Studio](https://lmstudio.ai/) on Windows 11. It speaks the ordinary
 OpenAI-compatible API, so llama.cpp, Ollama, vLLM, SGLang or a remote endpoint work
-just as well.
+just as well — see [Profiles](#profiles).
 
-It also drives **Qwen3.8-27B on a free Kaggle TPU**, served by
-[`kaggle-tpu-lab/`](kaggle-tpu-lab/) in this repository: `python miniagent.py --kaggle`.
-See [Qwen3.8 on a Kaggle TPU](#qwen38-on-a-kaggle-tpu).
-
-## What is where
+miniagent is only the harness. Serving models is somebody else's job: it talks to
+whatever endpoint a profile points at, and at most starts a local server for it.
 
 | Path | What |
 |---|---|
 | `miniagent.py`, `agent/`, `ui/`, `hints/`, `tests/` | the agent (runs on your PC, standard library only) — [Layout](#layout) |
 | `tasks/`, `verify/` | benchmark tasks and their checkers |
 | `searxng/` | settings for a local SearXNG (web search) |
-| [`kaggle-tpu-lab/`](kaggle-tpu-lab/) | the model side on a free Kaggle TPU: **Qwen3.8-27B** (vllm-tpu, `qwen38-27b/`) and **GLM-5.3-Flash** (own JAX engine, `glm53-flash/`); `launch.py serve [--model glm53-flash]` / proxy / cmd / ssh / stop, the shared control plane `common/ktl_control.py`, [operations runbook](kaggle-tpu-lab/docs/operations.md). Merged with its history from `knapejar/kaggle-tpu-lab` and upstream [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab) |
-| `miniagent-kaggle.cmd`, `kaggle-tpu-lab/qwen38-27b/tools/claude-qwen.cmd` | shortcuts: miniagent / Claude Code on the Kaggle model |
-
-The same kernels also run under **DeployMan** (a separate local tool for launching services
-on free-tier machines) as `services/qwen38-api/` and `services/glm53-api/`: a copy of the
-kernel built with `python kaggle-tpu-lab/tools/build_kernel.py <model> <file>` plus a shared
-`run.py`, with a queue-time history (`deployman stats`) and an SSH tunnel that is up from the
-kernel's first seconds. Change a kernel here, then rebuild it there.
 
 ```
   ▐▛███▜▌   miniagent 0.2.0
  ▝▜█████▛▘  an agent for local models
 
-  model    spark-x2.5-4b   @ http://127.0.0.1:1234/v1
+  model    spark-x2.5-4b   local @ http://127.0.0.1:1234/v1
   context  65.5k   crop at 70%   reasoning: none   max steps: 60
   cwd      C:\projects\demo
   tools    ask, browse, edit, grep, plan, read, sh, websearch, write   approval: auto
@@ -66,60 +55,89 @@ Issue #2378, opened by wszbdy on 7 September 2026.
 git clone https://github.com/knapejar/miniagent.git
 cd miniagent
 
-:: start a model
-lms server start --port 1234
-lms load spark-x2.5-4b --context-length 65536 -y
-
-python miniagent.py                          :: interactive
-python miniagent.py "delete the old logs"    :: one shot
+python miniagent.py                          :: interactive, pick the model with /model
+python miniagent.py --profile local          :: interactive on Spark-X2.5-4B right away
+python miniagent.py "delete the old logs"    :: one shot (on local unless --profile says otherwise)
 python miniagent.py -f task.txt -C C:\work   :: a task from a file, in another directory
 ```
 
-Point it somewhere else with flags or environment variables:
+Interactive miniagent starts with **no model picked** — unless `--profile` names one
+or a default was stored. `/model` lists every profile with its state and switches to
+the one you pick; picking `local` starts the LM Studio server and loads
+Spark-X2.5-4B (`lms server start`, `lms load`) when they are not up yet:
 
-```bat
-python miniagent.py --url http://127.0.0.1:1234/v1 --model my-model --ctx 32768
-
-set MINIAGENT_URL=http://192.168.1.10:1234/v1
-set MINIAGENT_MODEL=qwen3-coder-30b
+```
+› /model
+  model  ·  ↑↓ enter esc
+› lmstudio  local                spark-x2.5-4b            127.0.0.1:1234         starts LM Studio on pick
+  lmstudio  gpubox               qwen3-coder-30b          192.168.1.10:1234      no answer
+  hosted    big                  some-model-70b           api.example.com        ready
 ```
 
-### Ternary Bonsai 2 27B (`--profile bonsai`)
+`ready` answers now; `starts … on pick` / `loads on pick` is brought up when chosen;
+anything else (`no answer`, `no API key …`, `missing …`) says what is in the way.
+A task typed before any model is picked opens the same list first.
 
-[Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-fits in 16 GB of VRAM with room for a 32k context. Its PTQ1_0 tensors only load in
-the [PrismML llama.cpp fork](https://github.com/prism-ml/llama.cpp) — LM Studio
-cannot open them. When nothing answers on the URL, miniagent starts
-`~\llama-prism\llama-server.exe` on the model itself (paths via
-`MINIAGENT_BONSAI_SERVER` / `MINIAGENT_BONSAI_GGUF`, log in `llama-server.log`
-next to it) and leaves it running. By hand it is:
+## Profiles
 
-```bat
-llama-server.exe -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -ngl 99 -c 32768 ^
-  --parallel 1 -ctk q8_0 -ctv q8_0 -fa on --port 8080 -a bonsai2-27b
+A profile is one model on one backend. miniagent ships exactly one, **`local`**:
+Spark-X2.5-4B in LM Studio on `127.0.0.1:1234` (`MINIAGENT_URL`, `MINIAGENT_MODEL`
+and `MINIAGENT_KEY` override its endpoint, model and key).
 
-python miniagent.py --profile bonsai
-python miniagent.py --profile bonsai --set-default   :: remember it
+Everything else is yours, kept out of this repository: one JSON file per provider in
+`~/.miniagent/profiles/` (a folder link to a private repository of profiles works
+too). The file's name is the provider, its top-level keys are shared by all of its
+profiles, and a profile's own keys win:
+
+```json
+~/.miniagent/profiles/hosted.json
+{
+  "url": "https://api.example.com/v1",
+  "api_key_env": "EXAMPLE_API_KEY",
+  "headers": {"X-Data-Retention": "none"},
+  "ctx": 131072,
+  "retries": 2,
+  "profiles": {
+    "big":   {"model": "some-model-70b"},
+    "small": {"model": "some-model-8b", "effort": "medium"}
+  }
+}
 ```
 
-`MINIAGENT_BONSAI_URL` and `MINIAGENT_BONSAI_MODEL` override the defaults
-(`http://127.0.0.1:8080/v1`, `bonsai2-27b`). Note that SearXNG below also wants
-port 8080 — give one of the two another port.
+| key | default | what |
+|---|---|---|
+| `url`, `model` | `http://127.0.0.1:1234/v1`, — | the OpenAI-compatible endpoint and model id |
+| `api_key` | — | else `~/.miniagent/<profile>.key`, else `~/.miniagent/<provider>.key` |
+| `connector` | `lmstudio` | what brings the backend up, see below |
+| `ctx`, `max_tokens` | 65536, 8192 | context window, generation limit per step |
+| `temperature`, `top_p`, `top_k` | not sent | sampling; unset leaves it to the server |
+| `effort` | `low` | `default` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` |
+| `effort_in_template` | `false` | send the effort as Qwen3.8 `chat_template_kwargs` (vLLM) |
+| `dialect` | `auto` | tool-call format: `spark` \| `qwen` \| `native`, by default from the model name |
+| `headers` | `{}` | extra HTTP headers the provider asks for |
+| `retries`, `outage_wait` | 0, 0 | retries on tunnel errors; seconds to wait out a server outage |
+| `<key>_env` | | an environment variable that replaces `<key>` when set |
+| `note` | | free text for you; miniagent ignores it |
 
-### Limite 1B Violetto (`--profile limite`)
+Connectors (`agent/connectors/`) make the backend answer before the first step:
 
-The `limite` architecture is in no llama.cpp release. Build upstream
-`58367713` with Tdamre's
-[`limite.patch`](https://huggingface.co/Tdamre/limite-1b-violetto-GGUF-LiteRT/tree/main/runtime)
-into `~\llama-limite\src\build` (CUDA, `llama-server` target); miniagent then
-starts it on `127.0.0.1:8081` the same way as bonsai (`MINIAGENT_LIMITE_SERVER`,
-`MINIAGENT_LIMITE_GGUF`). The model's own template refuses tools and custom
-system prompts, so it runs under plain `chatml`. It is a math-only model, so
-expect it to be poor at agent work.
+- **`lmstudio`** — for a local URL, starts the LM Studio server and loads the model
+  with `lms`; for any other URL (a hosted API, a GPU box) it only checks the server answers.
+- **`llamacpp`** — a model LM Studio cannot load, on its own llama.cpp build: `server`
+  (path to `llama-server`), `gguf` and `server_args`. Starts it when nothing answers and
+  leaves it running.
+- **`kaggle`** — a model served on a Kaggle TPU by kaggle-tpu-lab: reads its launch
+  state, starts its local proxy, takes the model name and context limit from
+  `/v1/models`. Options: `--wait`, `--no-proxy`; `KAGGLE_TPU_LAB` points at its `launch.py`.
 
-`--profile` without a name lists every profile.
+```bat
+python miniagent.py --profile                       :: list the profiles and their state
+python miniagent.py --profile big --set-default     :: remember one (MINIAGENT_PROFILE wins)
+python miniagent.py --profile big --ctx 32768       :: flags win over the profile
+python miniagent.py --url http://127.0.0.1:8000/v1 --model my-model   :: no profile file at all
+```
 
-### Web search (optional, recommended)
+## Web search (optional, recommended)
 
 Search engines block automated queries from a home address within a handful of
 requests. A SearXNG running on your own machine asks around twenty engines on your
@@ -139,137 +157,10 @@ use and a wide engine list. miniagent finds it automatically on `127.0.0.1:8080`
 falls back to direct engines, and `BRAVE_API_KEY` or `TAVILY_API_KEY` are used first
 when present.
 
-The kaggle-tpu-lab proxy also listens on 8080. With `--kaggle` SearXNG is skipped
-unless `MINIAGENT_SEARX` is set, so run SearXNG on another port there
-(`-p 127.0.0.1:8888:8080` and `set MINIAGENT_SEARX=http://127.0.0.1:8888`).
-
-## Qwen3.8 on a Kaggle TPU
-
-[kaggle-tpu-lab](kaggle-tpu-lab/) serves Qwen3.8-27B (bf16,
-up to 262k context, ~130 tok/s) with vLLM on Kaggle's free TPU v5e-8 and opens public
-tunnels to it. miniagent runs here, on your machine — its tools touch your files and
-your shell — and only the model runs on Kaggle.
-
-```
-miniagent ──► http://127.0.0.1:8080/v1 ──► tunnel (cloudflared / pinggy / ngrok) ──► front server ──► vLLM on the Kaggle TPU
-               launch.py proxy
-               (adds the API key, follows whichever tunnel is live)
-```
-
-### Run it
-
-miniagent finds `launch.py` in `kaggle-tpu-lab\` of this repository (or in `KAGGLE_TPU_LAB`,
-if set):
-
-```bat
-:: 1. start the model - once per session, it takes a TPU slot plus ~22 min
-cd kaggle-tpu-lab
-python launch.py serve            :: pushes the kernel; Ctrl-C detaches, it keeps running
-python launch.py status -f        :: follow it until "YOUR ENDPOINT IS LIVE"
-
-:: 2. start the agent
-cd ..
-python miniagent.py --kaggle                        :: interactive
-python miniagent.py --kaggle "fix the failing test" :: one shot
-python miniagent.py --kaggle --wait -f task.txt     :: wait for the kernel, then run
-miniagent-kaggle.cmd                                :: the same as --kaggle
-
-:: 3. end the session, so it stops using TPU quota
-cd kaggle-tpu-lab
-python launch.py stop
-```
-
-That is all the setup there is. With `--kaggle`, before the first step, miniagent:
-
-1. reads `%USERPROFILE%\.kaggle-tpu-lab.json`, written by `launch.py serve` — the kernel,
-   its ntfy progress topic and the API key;
-2. reads that ntfy topic to see whether the kernel is live, still starting, or ended.
-   It only reads; nothing is sent to the kernel. A kernel that is still queued or
-   compiling is reported and the prompt opens anyway — type `/kaggle` once it is live,
-   or start with `--wait`;
-3. starts `launch.py proxy` in the background when nothing listens on
-   `127.0.0.1:8080` yet (log in `runs\proxy.log`) and stops it again on exit. A proxy
-   you already run yourself is simply used;
-4. reads the served model name and context limit from `/v1/models`;
-5. skips SearXNG, whose default port the proxy holds.
-
-The banner then shows the backend:
-
-```
-  model    qwen3.8-27b   @ http://127.0.0.1:8080/v1
-  backend  kaggle-tpu-lab   you/qwen38-tpu-serve   proxy started by miniagent
-  context  131.1k   crop at 70%   reasoning: medium   max steps: 60
-```
-
-### What differs from the local profile
-
-| | `--profile local` (default) | `--kaggle` |
-|---|---|---|
-| endpoint | `MINIAGENT_URL`, `http://127.0.0.1:1234/v1` | `MINIAGENT_KAGGLE_URL`, `http://127.0.0.1:8080/v1` |
-| model | `spark-x2.5-4b` | `qwen3.8-27b`, confirmed from `/v1/models` |
-| API key | `MINIAGENT_KEY` | from `.kaggle-tpu-lab.json` (the proxy adds it anyway) |
-| tool-call format | Spark `<arg_key>` | Qwen `<function=…><parameter=…>` |
-| context | 65 536 | 131 072, capped at the server's `max_model_len` |
-| max tokens per step | 8 192 | 16 384 (room for reasoning) |
-| sampling | temperature 1.0, top_p 0.95 | not sent — the model's own generation config |
-| reasoning | `reasoning_effort`, off | `chat_template_kwargs`, medium |
-| stop on `</tool_call>` | server side | client side, on the answer only |
-| retries | none | 3, on tunnel errors (502/503/504/52x/530) and refused connections |
-
-Why each one:
-
-- **Tool-call format.** Qwen3.8 was trained on the `qwen3_coder` XML, not Spark's. vLLM
-  parses that format only when a request carries `tools`, and miniagent never sends
-  them (see `agent/protocol.py`), so the system prompt describes the format the way
-  Qwen's chat template does and miniagent parses it. Values keep their indentation,
-  and tool results are not wrapped in `<tool_response>` twice, because the template
-  already wraps them. The parser reads both formats, so `--dialect` only changes the prompt.
-- **Reasoning.** Qwen3.8 has the levels `low`, `medium` and `xhigh`, set through
-  `chat_template_kwargs`. The top-level `reasoning_effort` is validated by vLLM
-  against OpenAI's values (there is no `xhigh`) and the template does not read it, so
-  it is not sent. `--effort none` turns thinking off, `high` (or `xhigh`) is
-  the top level, and `/effort` changes it mid-session.
-- **Stop sequence.** The model thinks before it calls a tool. A server-side stop on
-  `</tool_call>` would also fire when it merely mentions the tag while reasoning. So
-  miniagent watches the answer instead: after a complete call it lets the turn end
-  normally, which keeps the token counts, and it abandons the stream when the model
-  starts writing the tool's result itself.
-- **Context 131k.** vllm-tpu 0.28 has no prefix caching for this model, so each step
-  re-reads the whole prompt at ~10k tok/s. At 131k a step stays under ~10 s. `--ctx 262144`
-  uses the full window.
-- **Retries.** Pinggy URLs rotate hourly. While the proxy re-resolves a tunnel it
-  answers 502, and a step waits 10, 20 and 30 s before it gives up.
-
-### Kaggle options and settings
-
-```
---kaggle                 same as --profile kaggle (or set MINIAGENT_PROFILE=kaggle)
---wait                   wait until the kernel is live and the endpoint answers
---no-proxy               never start launch.py proxy; run it yourself
---url URL                a tunnel URL directly, e.g. https://xxxx.trycloudflare.com/v1
---dialect spark|qwen     override the tool-call format
---effort LEVEL           none | low | medium | high | xhigh
-
-KAGGLE_TPU_LAB           kaggle-tpu-lab directory (or its launch.py)
-KAGGLE_TPU_LAB_STATE     launch state file, default %USERPROFILE%\.kaggle-tpu-lab.json
-MINIAGENT_KAGGLE_URL     endpoint, default http://127.0.0.1:8080/v1
-MINIAGENT_KAGGLE_MODEL   model name, default qwen3.8-27b
-MINIAGENT_KAGGLE_KEY     API key, default: from the state file
-```
-
-### When something does not work
-
-| symptom | what to do |
-|---|---|
-| `the Kaggle kernel is not live yet` | it is queued for a TPU or still compiling: `python launch.py status -f`, then `/kaggle` |
-| `the Kaggle kernel has ended` | `python launch.py serve` starts a new one, then restart miniagent: a proxy it started still follows the old launch |
-| `the proxy did not start` | the last lines of `runs\proxy.log` are printed. Port taken? Use `--url http://127.0.0.1:8081/v1` |
-| `HTTP 502: kaggle-tpu-lab proxy: no live tunnel` | no tunnel answers. `python launch.py cmd tunnel` probes them, `python launch.py cmd tunnel pinggy` restarts pinggy |
-| the API answers `503 server_unavailable` | vLLM is compiling, restarting or crashed; the kernel is still reachable: `python launch.py cmd status`, `cmd log 120`, `python launch.py ssh` — see [the runbook](kaggle-tpu-lab/docs/operations.md#4-recovery-runbook) |
-| a step ends with `no tool call (finish=length …)` | the reasoning used up the budget: `/effort low` or `--max-tokens 32768` |
-
-The endpoint is public and protected only by the API key. miniagent masks the key in
-everything it prints and traces, and never shows it to the model.
+A model server on port 8080 (llama-server's default, the kaggle proxy) collides with it;
+the kaggle connector then skips SearXNG unless `MINIAGENT_SEARX` is set. Run SearXNG on
+another port in that case (`-p 127.0.0.1:8888:8080` and
+`set MINIAGENT_SEARX=http://127.0.0.1:8888`).
 
 ## Tools
 
@@ -344,7 +235,7 @@ stops the agent mid-token.
 
 ```
 /help   /plan    /memory  /stats   /tools   /hints   /context   /cwd
-/effort /approve /steps   /clear   /trace   /kaggle  /quit
+/effort /approve /steps   /clear   /trace   /model   /resume  /quit
 
 !<command>    run a shell command directly, without the model
 esc           stop the agent immediately
@@ -355,8 +246,8 @@ esc           stop the agent immediately
 ```
 -f, --task-file FILE     read the task from a file
 -C, --workdir DIR        working directory for the agent
-    --kaggle             Qwen3.8-27B on a Kaggle TPU, see above
-    --profile NAME       local | kaggle
+    --profile [NAME]     the model to use; without a name, list them with their state
+    --set-default        remember --profile for next time
     --url URL            OpenAI-compatible endpoint
     --model NAME         model identifier
     --ctx N              context window (default 65536)
@@ -380,9 +271,9 @@ esc           stop the agent immediately
 ```
 miniagent.py          entry point, REPL, slash commands
 agent/
-  config.py           settings, arguments, the local and kaggle profiles
-  protocol.py         tool-call formats (spark, qwen), system prompt
-  kaggle.py           Qwen3.8 on a Kaggle TPU: launch state, proxy, readiness
+  config.py           settings, arguments, profiles (local + ~/.miniagent/profiles)
+  connectors/         what brings a backend up: lmstudio, llamacpp, kaggle
+  protocol.py         tool-call formats (spark, qwen, native), system prompt
   llm.py              OpenAI-compatible client, streaming, cancellation
   session.py          history, context cropping, pinned plan
   loop.py             the agent loop, a generator of events
@@ -399,13 +290,13 @@ agent/
 ui/
   ansi.py             colours, spinner, formatting
   keys.py             esc watcher
+  picker.py           arrow-key list for /model and /resume
   markdown.py         renders the model's markdown
   render.py           draws loop events
 hints/                one JSON file per tool
 tasks/                benchmark tasks, including ten hard ones
 verify/               independent checkers for those tasks
-tests/                171 tests
-kaggle-tpu-lab/       the model side on Kaggle (own README)
+tests/                243 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be

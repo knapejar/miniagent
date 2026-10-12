@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A list to choose from with the arrow keys - what /resume shows."""
+"""A list to choose from with the arrow keys - what /resume and /model show."""
 import contextlib
 import os
 import shutil
@@ -13,25 +13,27 @@ KEYS = {"\x1b[A": UP, "\x1bOA": UP, "\x00H": UP, "\xe0H": UP, "k": UP,
 ROWS = 12
 
 
-def choose(load, style, title):
-    """`load(everything)` returns [(text, value)], ctrl+a flips `everything`.
+def choose(load, style, title, toggle=None, empty="nothing to choose", at=0):
+    """`load(everything)` returns [(text, value)]; with toggle=(off label, on
+    label) ctrl+a flips `everything`. The cursor starts on row `at`.
     Returns the chosen value; None on esc or when stdin is not a terminal."""
     if not sys.stdin.isatty():
         return None
-    everything, at, drawn = False, 0, 0
+    everything, drawn = False, 0
     rows = load(everything)
     try:
         with _keys() as read:
             while True:
-                drawn = _draw(rows, at, drawn, style, "%s  %s  ·  ctrl+a %s  ·  ↑↓ enter esc" % (
-                    title, "all projects" if everything else "this project",
-                    "this project only" if everything else "all projects"))
+                header = title
+                if toggle:
+                    header += "  %s  ·  ctrl+a %s" % (toggle[everything], toggle[not everything])
+                drawn = _draw(rows, at, drawn, style, header + "  ·  ↑↓ enter esc", empty)
                 key = KEYS.get(read())
                 if key == UP:
                     at = max(0, at - 1)
                 elif key == DOWN:
                     at = min(len(rows) - 1, at + 1)
-                elif key == TOGGLE:
+                elif key == TOGGLE and toggle:
                     everything, at = not everything, 0
                     rows = load(everything)
                 elif key == ENTER and rows:
@@ -44,7 +46,7 @@ def choose(load, style, title):
         _draw([], 0, drawn, style, None)        # take the list off the screen
 
 
-def _draw(rows, at, drawn, style, header):
+def _draw(rows, at, drawn, style, header, empty=""):
     """Redraw in place over the `drawn` lines printed last time; returns the new count."""
     out = ("\x1b[%dA" % drawn if drawn else "") + "\r\x1b[J"
     if header is None:
@@ -58,7 +60,7 @@ def _draw(rows, at, drawn, style, header):
         text = text[:width]
         lines.append(style.cyan("› " + text) if i == at else "  " + text)
     if not rows:
-        lines.append("  " + style.dim("no saved sessions"))
+        lines.append("  " + style.dim(empty))
     sys.stdout.write(out + "\n".join(lines) + "\n")
     sys.stdout.flush()
     return len(lines)

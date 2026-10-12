@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """Qwen3.8-27B on a Kaggle TPU, served by kaggle-tpu-lab.
 
-The other half lives in kaggle-tpu-lab/ of this repository: `launch.py
+The other half is kaggle-tpu-lab, kept in the miniagent-deploy repository: `launch.py
 serve` pushes a Kaggle kernel that starts vLLM and opens public tunnels, and
 `launch.py proxy` gives this machine a stable http://127.0.0.1:8080/v1 that
 follows whichever tunnel is live and adds the API key itself. Pinggy tunnels
 rotate every hour, so the proxy is the endpoint to use, not a tunnel URL.
 
-This module is what `--kaggle` does before the first step:
+This connector (a profile with "connector": "kaggle") runs before the first step:
 
   1. reads ~/.kaggle-tpu-lab.json, which `launch.py serve` wrote: the kernel,
      its ntfy progress topic and the API key;
@@ -29,12 +29,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .secrets import register
+from ..secrets import register
 
 STATE_FILE = os.getenv("KAGGLE_TPU_LAB_STATE",
                        os.path.join(os.path.expanduser("~"), ".kaggle-tpu-lab.json"))
 NTFY = "https://ntfy.sh"
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROXY_START_WAIT = 150   # launch.py proxy resolves the tunnel over ntfy before it binds
 PROBE_TIMEOUT = 25
@@ -55,12 +55,13 @@ def load_state(path=None):
 
 def find_launcher(environ=None):
     """kaggle-tpu-lab's launch.py: $KAGGLE_TPU_LAB (the directory or the file), else
-    kaggle-tpu-lab/ in this repository, next to it, or in the current directory."""
+    the one in miniagent-deploy next to this repository, one next to it, or one
+    in the current directory."""
     environ = os.environ if environ is None else environ
     candidates = []
     if environ.get("KAGGLE_TPU_LAB"):
         candidates.append(environ["KAGGLE_TPU_LAB"])
-    candidates += [os.path.join(HERE, "kaggle-tpu-lab"),
+    candidates += [os.path.join(HERE, "..", "miniagent-deploy", "kaggle-tpu-lab"),
                    os.path.join(HERE, "..", "kaggle-tpu-lab"),
                    os.path.join(os.getcwd(), "kaggle-tpu-lab")]
     for path in candidates:
@@ -215,7 +216,7 @@ _proxy = None            # the proxy this process started, if any
 
 
 def setup(cfg, say=print, state_path=None):
-    """Prepare cfg for the Kaggle model. Safe to call again (/kaggle).
+    """Prepare cfg for the Kaggle model. Safe to call again (/model).
     Returns True when the model answered."""
     global _proxy
     state = load_state(state_path)
@@ -247,8 +248,8 @@ def setup(cfg, say=print, state_path=None):
         return False
     if phase == "starting":
         say("the Kaggle kernel is not live yet%s - `python launch.py status -f` shows it; "
-            "type /kaggle here once it is, or start with --wait"
-            % (" (last step: %s)" % event["phase"] if event.get("phase") else ""))
+            "type /model %s here once it is, or start with --wait"
+            % (" (last step: %s)" % event["phase"] if event.get("phase") else "", cfg.profile))
         return False
     if event.get("max_model_len"):
         _apply_limits(cfg, {"max_model_len": event["max_model_len"]})
@@ -289,6 +290,18 @@ def setup(cfg, say=print, state_path=None):
             return False
         say("waiting for the endpoint - %s" % error)
         time.sleep(WAIT_POLL)
+
+
+def status(cfg, state_path=None):
+    state = load_state(state_path)
+    if probe(cfg.url, cfg.api_key or state.get("api_key"), timeout=3)[0]:
+        return True, "ready"
+    if not state:
+        return False, "not launched - `python launch.py serve` in kaggle-tpu-lab"
+    return False, {"live": "kernel live, proxy starts on pick",
+                   "starting": "kernel still starting",
+                   "dead": "kernel ended - `python launch.py serve`"}.get(
+                       _kernel_state(state)[0], "kernel state unknown")
 
 
 def _kernel_state(state):

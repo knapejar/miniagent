@@ -1479,7 +1479,7 @@ class TestResume(unittest.TestCase):
                 mock.patch.object(picker, "_keys", lambda: contextlib.nullcontext(
                     lambda: next(keys))), \
                 contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(picker.choose(load, _Plain(), "resume"), 2)
+            self.assertEqual(picker.choose(load, _Plain(), "resume", toggle=("a", "b")), 2)
         self.assertEqual(asked, [False, True])
 
 

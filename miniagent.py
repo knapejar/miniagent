@@ -35,7 +35,7 @@ HELP = """  commands
     /history           the whole conversation, model answers and tool results
     /cwd [path]        show or change the working directory
     /effort <level>    default | none | low | medium | high | xhigh
-    /kaggle            re-check the Kaggle model and start its proxy (--kaggle)
+    /model [name]      pick the model: every profile and whether it is ready
     /approve <mode>    auto | all | none
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
@@ -128,10 +128,53 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
     return snapshot, watcher.typed(), memory
 
 
-def connect_kaggle(cfg, renderer):
-    """Point cfg at Qwen3.8 on the Kaggle TPU (agent/kaggle.py)."""
-    from agent import kaggle
-    return kaggle.setup(cfg, say=lambda text: print("  " + renderer.s.dim(text)))
+def connect(cfg, renderer):
+    """Bring the profile's backend up (agent/connectors) and say how it went."""
+    from agent import connectors
+    s = renderer.s
+    if connectors.connect(cfg, say=lambda text: print("  " + s.dim(text))):
+        print("  " + s.green("ready") + s.dim("  %s · %s   context %d   @ %s"
+                                              % (cfg.profile, cfg.model, cfg.ctx, cfg.url)))
+    else:
+        print("  " + s.yellow("not ready") + s.dim("  %s · %s - /model %s tries again"
+                                                   % (cfg.profile, cfg.model, cfg.profile)))
+    return cfg.ready
+
+
+def choose_model(cfg, session, renderer, name=""):
+    """/model: show every profile with its state, switch to the one picked and
+    bring it up - start LM Studio, load the model, whatever its connector does."""
+    from agent.config import load_profiles
+    from agent.connectors import overview, row_text
+    from ui.picker import choose
+    s = renderer.s
+    try:
+        names = load_profiles()
+        if not name:
+            print("  " + s.dim("asking %d profiles..." % len(names)))
+            rows = overview()
+            print("\x1b[1A\r\x1b[K", end="")        # the line above goes
+            if not sys.stdin.isatty():
+                for row in rows:
+                    print("    " + row_text(row, cfg.profile))
+                return
+            current = [i for i, r in enumerate(rows) if r[1] == cfg.profile]
+            name = choose(lambda _all: [(row_text(r, cfg.profile), r[1]) for r in rows], s,
+                          "model", empty="no profiles", at=current[0] if current else 0)
+            if not name:
+                return
+    except ValueError as e:                    # a broken profile file
+        print("  " + s.red(str(e)))
+        return
+    if name not in names:
+        print("  " + s.red("no profile %r - /model lists them" % name))
+        return
+    cfg.use_profile(name)
+    try:
+        connect(cfg, renderer)
+    except KeyboardInterrupt:
+        print("  " + s.yellow("interrupted") + s.dim(" - /model %s tries again" % name))
+    session.set_dialect(cfg.dialect)           # the connector may have swapped the model
 
 
 def resume(cfg, session, s):
@@ -146,7 +189,8 @@ def resume(cfg, session, s):
             (os.path.basename(f["cwd"]) + "  ") if everything else "", " ".join(f["title"].split())),
             f["path"]) for f in found]
 
-    path = choose(rows, s, "resume")
+    path = choose(rows, s, "resume", toggle=("this project", "all projects"),
+                  empty="no saved sessions")
     if not path:
         return
     try:
@@ -284,12 +328,8 @@ def handle_command(line, cfg, session, renderer, trace, last):
                            % (dropped, kept)))
     elif cmd == "/resume":
         resume(cfg, session, s)
-    elif cmd == "/kaggle":
-        if cfg.profile != "kaggle":
-            print("  " + s.dim("start miniagent with --kaggle to use the Kaggle model"))
-        elif connect_kaggle(cfg, renderer):
-            print("  " + s.green("ready") + s.dim("  %s   context %d   @ %s"
-                                                  % (cfg.model, cfg.ctx, cfg.url)))
+    elif cmd == "/model":
+        choose_model(cfg, session, renderer, arg)
     elif cmd == "/trace":
         print("  " + (trace.path or "tracing is off"))
     else:
@@ -300,18 +340,6 @@ def handle_command(line, cfg, session, renderer, trace, last):
 def main(argv=None):
     ansi.setup_stdio()
     cfg, task = parse_args(argv)
-
-    if cfg.profile == "kaggle":
-        try:
-            connect_kaggle(cfg, Renderer(cfg, Metrics()))
-        except KeyboardInterrupt:
-            print()
-            return 130
-    else:
-        from agent import lmstudio
-        say = Renderer(cfg, Metrics()).s.dim
-        lmstudio.setup(cfg, say=lambda text: print("  " + say(text)))
-
     tools = default_tools()
     session = Session(cfg, tools)
     client = LLMClient(cfg, tools)
@@ -323,6 +351,11 @@ def main(argv=None):
     os.chdir(cfg.workdir)
 
     if task:                                   # one-shot run
+        try:
+            connect(cfg, renderer)
+        except KeyboardInterrupt:
+            print()
+            return 130
         snapshot, _typed, memory = run_task(cfg, session, client, tools, trace,
                                             renderer, task)
         if memory:
@@ -333,6 +366,14 @@ def main(argv=None):
         return 0
 
     renderer.banner(session)
+    try:
+        if cfg.profile:
+            connect(cfg, renderer)
+            session.set_dialect(cfg.dialect)   # the connector may have swapped the model
+            print()
+    except KeyboardInterrupt:
+        print()
+        return 130
     last = None
     typed = ""
     memory = None
@@ -362,6 +403,11 @@ def main(argv=None):
             from agent.tools.shell import ShellTool
             print(renderer.s.grey(ShellTool().run_foreground(session, line[1:])))
             continue
+        if not cfg.profile:
+            print("  " + renderer.s.yellow("no model picked yet") + renderer.s.dim(" - pick one, then the task runs"))
+            choose_model(cfg, session, renderer)
+            if not cfg.profile:
+                continue
         last, typed, memory = run_task(cfg, session, client, tools, trace,
                                        renderer, line)
 

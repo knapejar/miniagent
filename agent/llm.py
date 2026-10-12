@@ -14,7 +14,7 @@ import urllib.request
 
 from .protocol import cut_after_call, format_tool_call
 
-# Statuses a tunnel or the kaggle-tpu-lab proxy answers with while the route to
+# Statuses a tunnel or a proxy answers with while the route to
 # the server is being re-established - worth another try, unlike a 400. 429 is
 # a hosted backend saying "at capacity, retry shortly", which is the same thing.
 RETRY_STATUS = (429, 502, 503, 504, 520, 522, 524, 530)
@@ -122,7 +122,7 @@ class LLMClient(object):
             body["tools"] = [{"type": "function", "function": t.spec()} for t in self.tools]
         if stream:
             body["stream_options"] = {"include_usage": True}
-        if getattr(self.cfg, "profile", "local") == "kaggle":
+        if getattr(self.cfg, "effort_in_template", False):
             # vLLM validates the top-level reasoning_effort against the OpenAI
             # values and Qwen3.8 reads its level from the chat template instead.
             if effort == "none":
@@ -181,12 +181,9 @@ class LLMClient(object):
         for attempt in range(retries + 1):
             request = urllib.request.Request(
                 self.cfg.url.rstrip("/") + "/chat/completions", data=data, method="POST",
-                headers={"Content-Type": "application/json",
-                         "Authorization": "Bearer " + (self.cfg.api_key or "none"),
-                         "ngrok-skip-browser-warning": "1",
-                         # Ignored by every other backend; wafer.ai refuses
-                         # without it unless the account allows retention.
-                         "Wafer-ZDR": "required"})
+                headers=dict(getattr(self.cfg, "headers", None) or {},
+                             **{"Content-Type": "application/json",
+                                "Authorization": "Bearer " + (self.cfg.api_key or "none")}))
             try:
                 return self._open(request, cancel)
             except urllib.error.HTTPError as e:

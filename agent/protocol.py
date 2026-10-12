@@ -11,7 +11,7 @@ parser and its grammar would push the model into JSON it was never trained on.
 Instead we render the tool specs into the system prompt exactly the way the
 model's own chat template does, and parse the reply ourselves.
 
-Qwen3.8 (served by vLLM from kaggle-tpu-lab) has a different native format, the
+Qwen3.8 (served by vLLM) has a different native format, the
 qwen3_coder XML:
 
     <tool_call>

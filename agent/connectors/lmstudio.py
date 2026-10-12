@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Bring LM Studio up for the local profile.
+"""Bring LM Studio up for the local profile - the default connector.
 
 When nothing answers on the configured URL, or the model is not loaded, this
 starts the LM Studio server and loads the model with the `lms` CLI. A model
 that is not downloaded is replaced by the first downloaded LLM, so the agent
-always has something to talk to.
+always has something to talk to. For a URL on another machine (a hosted API,
+LM Studio on a GPU box) it only checks that the server answers.
 """
 import json
 import os
@@ -13,7 +14,7 @@ import subprocess
 import urllib.request
 from urllib.parse import urlparse
 
-from .protocol import dialect_for
+from ..protocol import dialect_for
 
 LOAD_TIMEOUT = 300
 
@@ -31,8 +32,10 @@ def find_lms():
 
 def served_models(cfg, timeout=3):
     """Model ids the server offers, or None when it does not answer."""
-    request = urllib.request.Request(cfg.url.rstrip("/") + "/models",
-                                     headers={"Authorization": "Bearer " + (cfg.api_key or "none")})
+    request = urllib.request.Request(
+        cfg.url.rstrip("/") + "/models",
+        headers=dict(getattr(cfg, "headers", None) or {},
+                     Authorization="Bearer " + (cfg.api_key or "none")))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -53,6 +56,22 @@ def _json(lms, *args):
         return []
 
 
+def is_local(cfg):
+    return (urlparse(cfg.url).hostname or "").lower() in ("127.0.0.1", "localhost", "::1")
+
+
+def status(cfg):
+    env = cfg.options.get("api_key_env")
+    if not cfg.api_key and env:
+        return False, "no API key - set %s or ~/.miniagent/%s.key" % (env, cfg.provider)
+    served = served_models(cfg)
+    if served is not None and (not served or cfg.model in served):
+        return True, "ready"
+    if not is_local(cfg) or find_lms() is None:
+        return False, "no answer" if served is None else "%s is not served there" % cfg.model
+    return False, "starts LM Studio on pick" if served is None else "loads on pick"
+
+
 def setup(cfg, say=print):
     """Make cfg.model answer on cfg.url. Returns True when it does."""
     # Something already serves this URL and takes cfg.model (a llama-server, for
@@ -61,9 +80,8 @@ def setup(cfg, say=print):
     if served is not None and (not served or cfg.model in served):
         return True
 
-    host = (urlparse(cfg.url).hostname or "").lower()
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        return served_models(cfg) is not None
+    if not is_local(cfg):
+        return served is not None
     lms = find_lms()
     if lms is None:
         return served_models(cfg) is not None

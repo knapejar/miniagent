@@ -1,147 +1,115 @@
 # -*- coding: utf-8 -*-
-"""Configuration - one place for every default."""
+"""Configuration - one place for every default.
+
+A profile is one model on one backend. miniagent ships a single one, "local":
+Spark-X2.5-4B in LM Studio on this machine. Every other profile is your own, a
+JSON file per provider in ~/.miniagent/profiles/ - the file's name is the
+provider, its top-level keys are shared by all of its profiles:
+
+    ~/.miniagent/profiles/hosted.json
+    {
+      "url": "https://api.example.com/v1",
+      "api_key_env": "EXAMPLE_API_KEY",
+      "ctx": 131072,
+      "profiles": {
+        "big":   {"model": "some-model-70b"},
+        "small": {"model": "some-model-8b", "effort": "medium"}
+      }
+    }
+
+A profile's own keys win over the file's, the command line wins over both, and
+"<key>_env" names an environment variable that replaces <key> when it is set.
+The keys are those of DEFAULTS; a connector may read more (see agent/connectors).
+"""
 import argparse
+import glob
+import json
 import os
 
 from . import paths
 from .protocol import DIALECTS, dialect_for
+from .secrets import register
 
 EFFORTS = ("default", "none", "low", "medium", "high", "xhigh")
 
-# A profile is a set of defaults for one kind of backend. Anything given on the
-# command line (or to Config directly) wins over the profile.
-PROFILES = {
-    # A model on this machine, e.g. Spark-X2.5-4B in LM Studio.
-    "local": {
-        "url": lambda: os.getenv("MINIAGENT_URL", "http://127.0.0.1:1234/v1"),
-        "model": lambda: os.getenv("MINIAGENT_MODEL", "spark-x2.5-4b"),
-        "api_key": lambda: os.getenv("MINIAGENT_KEY", "lmstudio"),
-        "ctx": 65536,
-        "max_tokens": 8192,
-        # Spark-X2.5 official recommendation: temperature 1.0, top_p 0.95, top_k -1.
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": -1,
-        # LM Studio ignores chat_template_kwargs; the only working switch for
-        # reasoning is reasoning_effort. On large tasks the model loops forever
-        # inside <think>, so reasoning is low by default.
-        "effort": "low",
-        "retries": 0,
-        "outage_wait": 0,
-    },
-    # The same LM Studio, but on the GPU box WINGPU (desktop-h9tgll8), reached
-    # over Tailscale. It serves on 0.0.0.0:1234 and asks for no key.
-    "wingpu": {
-        "url": lambda: os.getenv("MINIAGENT_WINGPU_URL", "http://100.75.132.66:1234/v1"),
-        "model": lambda: os.getenv("MINIAGENT_WINGPU_MODEL", "spark-x2.5-4b-uncensored"),
-        "api_key": lambda: os.getenv("MINIAGENT_WINGPU_KEY", "lmstudio"),
-        "ctx": 65536,
-        "max_tokens": 8192,
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": -1,
-        "effort": "low",
-        # Tailscale re-resolves a route now and then; a couple of retries ride it out.
-        "retries": 2,
-        "outage_wait": 0,
-    },
-    # Ternary Bonsai 2 27B on the PrismML llama.cpp fork, the only runtime that
-    # loads its PTQ1_0 tensors - LM Studio cannot. agent/llamacpp.py starts it, from
-    # C:\Users\Jarda\llama-prism:
-    #   llama-server.exe -m <...>-PTQ1_0.gguf -ngl 99 -c 32768 --parallel 1
-    #                    -ctk q8_0 -ctv q8_0 -fa on --port 8080 -a bonsai2-27b
-    "bonsai": {
-        "url": lambda: os.getenv("MINIAGENT_BONSAI_URL", "http://127.0.0.1:8080/v1"),
-        "model": lambda: os.getenv("MINIAGENT_BONSAI_MODEL", "bonsai2-27b"),
-        "api_key": lambda: "",
-        # 32k is what fits in the 8 GB of a 4060 with a q8_0 KV cache; above it
-        # the cache spills into shared memory and prompt processing drops 6x.
-        "ctx": 32768,
-        "max_tokens": 8192,
-        # None = not sent, so llama-server applies the model's own defaults.
-        "temperature": None,
-        "top_p": None,
-        "top_k": None,
-        # llama-server has no reasoning_effort switch; the model thinks as it will.
-        "effort": "low",
-        "retries": 0,
-        "outage_wait": 0,
-    },
-    # Limite 1B Violetto: an unknown architecture to LM Studio, so it runs on its
-    # own llama.cpp build, started by agent/llamacpp.py. A math-only model with
-    # no tool training - here to try, not to work with.
-    "limite": {
-        "url": lambda: os.getenv("MINIAGENT_LIMITE_URL", "http://127.0.0.1:8081/v1"),
-        "model": lambda: os.getenv("MINIAGENT_LIMITE_MODEL", "limite-1b"),
-        "api_key": lambda: "",
-        "ctx": 32768,
-        "max_tokens": 8192,
-        # Model card: temperature 0.6, top_p 0.95.
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "top_k": None,
-        "effort": "low",
-        "retries": 0,
-        "outage_wait": 0,
-    },
-    # GLM-5.3 served by app.wafer.ai (OpenAI-compatible, zero data retention).
-    "wafer": {
-        "url": lambda: os.getenv("MINIAGENT_WAFER_URL", "https://pass.wafer.ai/v1"),
-        "model": lambda: os.getenv("MINIAGENT_WAFER_MODEL", "GLM-5.3"),
-        "api_key": lambda: os.getenv("MINIAGENT_WAFER_KEY", ""),
-        "ctx": 131072,
-        "max_tokens": 8192,
-        "temperature": None,
-        "top_p": None,
-        "top_k": None,
-        "effort": "low",
-        "retries": 2,
-        "outage_wait": 0,
-    },
-    # Qwen3.8-27B on a Kaggle TPU, started by kaggle-tpu-lab (`launch.py serve`)
-    # and reached through its local proxy (`launch.py proxy`). See agent/kaggle.py.
-    "kaggle": {
-        "url": lambda: os.getenv("MINIAGENT_KAGGLE_URL", "http://127.0.0.1:8080/v1"),
-        "model": lambda: os.getenv("MINIAGENT_KAGGLE_MODEL", "qwen3.8-27b"),
-        # The proxy puts the real key in itself; a direct tunnel URL needs the
-        # key from ~/.kaggle-tpu-lab.json, which agent/kaggle.py fills in.
-        "api_key": lambda: os.getenv("MINIAGENT_KAGGLE_KEY", ""),
-        # The server takes 262k, but vllm-tpu 0.28 has no prefix caching for
-        # this model, so every step re-reads the whole prompt: 131k keeps a step
-        # under ~10 s. The real limit from /v1/models caps it further.
-        "ctx": 131072,
-        "max_tokens": 16384,
-        # None = not sent, so vLLM applies the model's own generation_config.
-        "temperature": None,
-        "top_p": None,
-        "top_k": None,
-        # A 27B keeps its reasoning on track; xhigh is slow per step, medium is
-        # the balance for an agent. /effort changes it live.
-        "effort": "medium",
-        # Tunnels rotate and the proxy answers 502 while it re-resolves one.
-        "retries": 3,
-        # A crashed vLLM engine restarts in place in ~15-20 min; the agent waits for
-        # it instead of dying and keeps the conversation.
-        "outage_wait": 1800,
-    },
+DEFAULTS = {
+    # What brings the backend up before the first step: lmstudio (also any plain
+    # OpenAI-compatible URL, which it only checks), llamacpp or kaggle.
+    "connector": "lmstudio",
+    "url": "http://127.0.0.1:1234/v1",
+    "model": "",
+    "api_key": "",
+    "headers": {},                 # extra HTTP headers a provider asks for
+    "dialect": "auto",             # tool-call format, see protocol.py
+    "ctx": 65536,
+    "max_tokens": 8192,
+    "temperature": None,           # None = not sent, the server's own default
+    "top_p": None,
+    "top_k": None,
+    "effort": "low",
+    # Send the effort as chat_template_kwargs in Qwen3.8's levels instead of
+    # reasoning_effort - what vLLM serving Qwen3.8 needs, see llm.py.
+    "effort_in_template": False,
+    "retries": 0,                  # another try on a tunnel/proxy error
+    "outage_wait": 0,              # seconds to wait out a server outage
+}
+
+LOCAL = {
+    "url": "http://127.0.0.1:1234/v1", "url_env": "MINIAGENT_URL",
+    "model": "spark-x2.5-4b", "model_env": "MINIAGENT_MODEL",
+    "api_key": "lmstudio", "api_key_env": "MINIAGENT_KEY",
+    # Spark-X2.5 official recommendation: temperature 1.0, top_p 0.95, top_k -1.
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": -1,
+    # LM Studio ignores chat_template_kwargs; the only working switch for
+    # reasoning is reasoning_effort. On large tasks the model loops forever
+    # inside <think>, so reasoning is low by default.
+    "effort": "low",
 }
 
 
-def read_key(profile):
-    """A key kept in ~/.miniagent/<profile>.key, for backends that need one and
+def load_profiles():
+    """{name: fields} - the built-in local, then ~/.miniagent/profiles/*.json.
+    Each profile carries "provider", the name of the file it came from."""
+    found = {"local": dict(LOCAL, provider="lmstudio")}
+    for path in sorted(glob.glob(os.path.join(paths.profiles_dir(), "*.json"))):
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                group = json.load(fh)
+            shared = {k: v for k, v in group.items() if k != "profiles"}
+            shared["provider"] = os.path.splitext(os.path.basename(path))[0]
+            for name, fields in group.get("profiles", {}).items():
+                found[name] = dict(shared)
+                found[name].update(fields)
+        except (OSError, ValueError, AttributeError) as e:
+            raise ValueError("bad profile file %s: %s" % (path, e))
+    return found
+
+
+def resolve(fields):
+    """A profile's fields with every "<key>_env" that is set applied."""
+    out = dict(fields)
+    for key, env in fields.items():
+        if key.endswith("_env") and os.environ.get(env):
+            out[key[:-4]] = os.environ[env]
+    return out
+
+
+def read_key(name):
+    """A key kept in ~/.miniagent/<name>.key, for backends that need one and
     an environment variable that a new terminal would have to be opened for."""
     try:
         # utf-8-sig: a key file written by PowerShell carries a BOM, and a BOM
         # in an HTTP header is a UnicodeEncodeError, not a bad key.
-        with open(paths.key_file(profile), encoding="utf-8-sig") as fh:
+        with open(paths.key_file(name), encoding="utf-8-sig") as fh:
             return fh.read().strip()
     except OSError:
         return ""
 
 
-def default_profile():
-    """The profile used when the command line gives none: MINIAGENT_PROFILE,
-    else what `--profile <name> --set-default` wrote, else local."""
+def stored_default():
+    """MINIAGENT_PROFILE, else what `--profile <name> --set-default` wrote, else ""."""
     name = os.getenv("MINIAGENT_PROFILE")
     if not name:
         try:
@@ -149,69 +117,29 @@ def default_profile():
                 name = fh.read().strip()
         except OSError:
             name = ""
-    return name if name in PROFILES else "local"
+    return name if name in load_profiles() else ""
 
 
 def set_default_profile(name):
     path = paths.default_profile_file()
-    directory = os.path.dirname(path)
-    if not os.path.isdir(directory):
-        os.makedirs(directory)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(name + "\n")
     return path
 
 
-def profiles_text():
-    """What `--profile` without a name prints."""
-    current = default_profile()
-    lines = ["  profiles (--profile <name>, or --profile <name> --set-default)"]
-    for name in sorted(PROFILES):
-        base = PROFILES[name]
-        value = lambda key: base[key]() if callable(base[key]) else base[key]
-        lines.append("    %-8s %-14s %-34s effort %s%s"
-                     % (name, value("model"), value("url"), base["effort"],
-                        "   <- default" if name == current else ""))
-    lines.append("  default comes from MINIAGENT_PROFILE or %s"
-                 % paths.default_profile_file())
-    return "\n".join(lines)
-
-
 class Config(object):
-    """Everything that shapes a run. Built from command line arguments."""
+    """Everything that shapes a run. Built from command line arguments.
+
+    profile=None leaves the model unpicked: the REPL starts without one and
+    /model chooses it (use_profile)."""
 
     def __init__(self, **kw):
-        self.profile = kw.get("profile") or "local"
-        base = PROFILES[self.profile]
-
-        def pick(name):
-            if kw.get(name) is not None:
-                return kw[name]
-            value = base[name]
-            return value() if callable(value) else value
-
-        self.url = pick("url")
-        self.model = pick("model")
-        self.api_key = pick("api_key") or read_key(self.profile)
-        dialect = kw.get("dialect") or "auto"
-        if dialect == "auto":
-            dialect = "qwen" if self.profile == "kaggle" else dialect_for(self.model)
-        self.dialect = dialect                      # tool-call format, see protocol.py
-
         self.workdir = kw.get("workdir", ".")
-        self.ctx = pick("ctx")
         self.max_steps = kw.get("max_steps", 60)
-        self.max_tokens = pick("max_tokens")
-
-        self.temperature = pick("temperature")      # None = not sent to the server
-        self.top_p = pick("top_p")
-        self.top_k = pick("top_k")
-        self.effort = pick("effort")
         # Share of max_tokens the reasoning may take before the reply is cut and
         # asked for again with less thinking; 0 turns the cap off.
         self.think_cap = kw.get("think_cap", 0.6)
-        self.retries = pick("retries")
-        self.outage_wait = pick("outage_wait")     # seconds to wait out a server outage
 
         self.crop_at = kw.get("crop_at", 0.7)      # share of ctx that triggers cropping
         self.keep_tail = kw.get("keep_tail", 8)    # messages the crop keeps at the end
@@ -231,30 +159,66 @@ class Config(object):
         self.run_name = kw.get("run_name", None)
         self.timeout = kw.get("timeout", 900)
 
-        # kaggle profile only
+        # kaggle connector only
         self.spawn_proxy = kw.get("spawn_proxy", True)   # start launch.py proxy if needed
         self.wait = kw.get("wait", False)                # wait until the model answers
-        self.backend_note = ""                           # one banner line, set at startup
+        self.use_profile(kw.get("profile", "local"), kw)
+
+    def use_profile(self, name, given=None):
+        """Point at a profile's model; anything in `given` wins over the profile.
+        name=None means no model picked yet."""
+        given = given or {}
+        fields = resolve(load_profiles()[name]) if name else {}
+
+        def pick(key):
+            if given.get(key) is not None:
+                return given[key]
+            return fields.get(key, DEFAULTS[key])
+
+        self.profile = name
+        self.provider = fields.get("provider", "")
+        self.options = fields                  # what a connector reads beyond DEFAULTS
+        self.connector = pick("connector")
+        self.url = pick("url")
+        self.model = pick("model")
+        self.api_key = pick("api_key")
+        if not self.api_key and name:
+            # ~/.miniagent/<profile>.key, else one key for the provider's profiles
+            self.api_key = read_key(name) or read_key(self.provider)
+            register([self.api_key])
+        self.headers = pick("headers")
+        dialect = pick("dialect")
+        self.dialect = dialect_for(self.model) if dialect == "auto" else dialect
+        self.ctx = pick("ctx")
+        self.max_tokens = pick("max_tokens")
+        self.temperature = pick("temperature")
+        self.top_p = pick("top_p")
+        self.top_k = pick("top_k")
+        self.effort = pick("effort")
+        self.effort_in_template = pick("effort_in_template")
+        self.retries = pick("retries")
+        self.outage_wait = pick("outage_wait")
+        self.ready = False                     # set once the connector got an answer
+        self.backend_note = ""                 # one banner line, set by the connector
 
     def as_dict(self):
         return {k: v for k, v in vars(self).items()
-                if not k.startswith("_") and k != "api_key"}
+                if not k.startswith("_") and k not in ("api_key", "options", "headers")}
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="miniagent",
-        description="Agentic CLI for local models (Spark-X2.5 in LM Studio), or for "
-                    "Qwen3.8-27B on a Kaggle TPU with --kaggle.")
+        description="An agentic CLI for local models. Without --profile the "
+                    "interactive mode starts with no model; /model picks one.")
     p.add_argument("task", nargs="*", help="the task; omit it for interactive mode")
     p.add_argument("-f", "--task-file", help="read the task from a file")
     p.add_argument("-C", "--workdir", default=".", help="working directory for the agent")
 
     g = p.add_argument_group("model")
-    g.add_argument("--kaggle", action="store_true",
-                   help="Qwen3.8-27B served by kaggle-tpu-lab (same as --profile kaggle)")
     g.add_argument("--profile", nargs="?", const="", default=None, metavar="NAME",
-                   help="set of defaults for a backend; without a name, list them")
+                   help="the model to use (local, or one of ~/.miniagent/profiles); "
+                        "without a name, list them")
     g.add_argument("--set-default", action="store_true",
                    help="remember --profile as the default for next time")
     g.add_argument("--url", help="OpenAI-compatible endpoint")
@@ -262,8 +226,7 @@ def parse_args(argv=None):
     g.add_argument("--api-key")
     g.add_argument("--dialect", choices=("auto",) + DIALECTS, default="auto",
                    help="tool-call format: spark | qwen (default: from the model name)")
-    g.add_argument("--effort", choices=EFFORTS,
-                   help="reasoning effort (local: none, kaggle: medium)")
+    g.add_argument("--effort", choices=EFFORTS, help="reasoning effort")
     g.add_argument("--think-cap", type=float, metavar="SHARE",
                    help="cut a reply whose reasoning passes this share of "
                         "--max-tokens (default 0.6, 0 = off)")
@@ -273,7 +236,7 @@ def parse_args(argv=None):
     g.add_argument("--max-tokens", type=int)
     g.add_argument("--ctx", type=int)
 
-    g = p.add_argument_group("kaggle")
+    g = p.add_argument_group("kaggle connector")
     g.add_argument("--no-proxy", action="store_true",
                    help="do not start `launch.py proxy` when nothing answers on the URL")
     g.add_argument("--wait", action="store_true",
@@ -301,22 +264,33 @@ def parse_args(argv=None):
     p.add_argument("-v", "--version", action="version", version="miniagent 0.2.0")
 
     a = p.parse_args(argv)
-    if a.profile == "":                       # --profile with no name: just list them
-        p.exit(0, profiles_text() + "\n")
-    profile = "kaggle" if a.kaggle else (a.profile or default_profile())
-    if profile not in PROFILES:
-        p.error("unknown profile %r; --profile lists them" % profile)
-    if a.set_default:
-        print("  default profile: %s (%s)" % (profile, set_default_profile(profile)))
+    try:
+        profiles = load_profiles()
+        if a.profile == "":                   # --profile with no name: just list them
+            from .connectors import profiles_text
+            p.exit(0, profiles_text() + "\n")
+        default = stored_default()
+    except ValueError as e:
+        p.error(str(e))
     task = " ".join(a.task)
     if not task and a.task_file:
         with open(a.task_file, encoding="utf-8") as fh:
             task = fh.read().strip()
+    # Interactive with nothing chosen starts without a model. A one-shot task has
+    # nobody to ask, and --url/--model already say which model: both build on
+    # local, as they always did.
+    profile = a.profile or default or ("local" if task or a.url or a.model else None)
+    if profile is not None and profile not in profiles:
+        p.error("unknown profile %r; --profile lists them" % profile)
+    if a.set_default and profile:
+        print("  default profile: %s (%s)" % (profile, set_default_profile(profile)))
     given = {name: getattr(a, name) for name in
              ("url", "model", "api_key", "effort", "ctx", "max_tokens",
               "temperature", "top_p", "top_k", "think_cap",
               "approve") if getattr(a, name) is not None}
-    cfg = Config(profile=profile, dialect=a.dialect,
+    if a.dialect != "auto":
+        given["dialect"] = a.dialect
+    cfg = Config(profile=profile,
                  workdir=a.workdir, max_steps=a.max_steps,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
                  approve=a.approve or "none", stream=not a.no_stream, color=not a.no_color,

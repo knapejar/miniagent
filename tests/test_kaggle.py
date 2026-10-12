@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Qwen3.8 on a Kaggle TPU (kaggle-tpu-lab): the qwen tool-call dialect, the
-kaggle profile's request body, and the startup checks in agent/kaggle.py.
+kaggle profile's request body, and the startup checks in agent/connectors/kaggle.py.
 
 Run with:  python -m unittest discover -s tests -v"""
 import io
@@ -14,13 +14,39 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import kaggle, llm, web                                    # noqa: E402
+from agent import llm, paths, web                                     # noqa: E402
 from agent.config import Config, parse_args                           # noqa: E402
+from agent.connectors import kaggle                                   # noqa: E402
 from agent.llm import LLMClient, LLMError                             # noqa: E402
 from agent.protocol import (build_system, dialect_for, format_tool_call,   # noqa: E402
                             malformed, parse_tool_call, strip_think)
 from agent.session import Session                                     # noqa: E402
 from agent.tools import default_tools                                 # noqa: E402
+
+# The kaggle profile is private (miniagent-deploy/profiles/kaggle.json); the
+# tests get a copy in a throwaway MINIAGENT_HOME.
+KAGGLE = {"connector": "kaggle", "profiles": {"kaggle": {
+    "url": "http://127.0.0.1:8080/v1", "model": "qwen3.8-27b", "dialect": "qwen",
+    "effort_in_template": True, "effort": "medium", "ctx": 131072, "max_tokens": 16384,
+    "retries": 3, "outage_wait": 1800}}}
+_saved_home = []
+
+
+def setUpModule():
+    _saved_home.append(os.environ.get(paths.ENV_HOME))
+    home = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home, "profiles"))
+    with open(os.path.join(home, "profiles", "kaggle.json"), "w") as fh:
+        json.dump(KAGGLE, fh)
+    os.environ[paths.ENV_HOME] = home
+
+
+def tearDownModule():
+    saved = _saved_home.pop()
+    os.environ.pop(paths.ENV_HOME, None)
+    if saved is not None:
+        os.environ[paths.ENV_HOME] = saved
+
 
 QWEN_CALL = ("Let me write it.\n<tool_call>\n<function=write>\n<parameter=path>\n"
              "app.py\n</parameter>\n<parameter=text>\ndef f():\n    return 1\n\n"
@@ -128,10 +154,11 @@ class TestKaggleProfile(unittest.TestCase):
         self.assertNotIn("chat_template_kwargs", self.body(effort="default"))
 
     def test_command_line(self):
-        cfg, task = parse_args(["--kaggle", "--effort", "low", "--ctx", "32768", "do it"])
+        cfg, task = parse_args(["--profile", "kaggle", "--effort", "low", "--ctx", "32768",
+                                "do it"])
         self.assertEqual((cfg.profile, cfg.effort, cfg.ctx, task),
                          ("kaggle", "low", 32768, "do it"))
-        cfg, _ = parse_args([])
+        cfg, _ = parse_args(["do it"])
         self.assertEqual((cfg.profile, cfg.model), ("local", "spark-x2.5-4b"))
 
     def test_vllm_overflow_message(self):
