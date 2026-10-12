@@ -30,8 +30,9 @@ POWERSHELL_HINTS = re.compile(
 # running: wait on, move it to the background or kill it. The last is a final
 # warning - a command still running at STALL is killed. The first was 1 s: 41 of
 # 71 such questions in the traces were answered with a plain wait, so every test
-# run cost a whole extra turn.
-CHECKPOINTS = (10, 30, 180, 300)
+# run cost a whole extra turn. Of the waited commands 22 of 26 ended within 20 s
+# (test suites, 14-16 s) and only 10 within 10 s.
+CHECKPOINTS = (20, 60, 180, 300)
 STALL = 600
 
 CMD_SCRIPT = ('@echo off\r\n'

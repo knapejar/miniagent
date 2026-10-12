@@ -167,9 +167,9 @@ another port in that case (`-p 127.0.0.1:8888:8080` and
 | tool | what it does |
 |---|---|
 | `sh` | Runs a command. `cmd.exe` by default; PowerShell syntax is detected and routed there. Multi-line input runs as a script, and the working directory persists between calls. |
-| `read` | Reads a text file with line numbers, or a slice of one. |
+| `read` | Reads a text file with line numbers, a slice of one, or up to four files at once. A read that stops early ends with an outline of what it did not show - its `def`/`class` lines, or the headings of a Markdown file. |
 | `write` | Creates or overwrites a file. Python and JSON are syntax-checked immediately. |
-| `edit` | Replaces an exact string — the simplest reliable patch for a small model. |
+| `edit` | Replaces an exact string — the simplest reliable patch for a small model. Keeps the file's line endings and encoding; `undo=true` takes its last change back. |
 | `grep` | Regex search across files, with glob and subtree filters. |
 | `websearch` | Searches the web. One query per line runs them all in parallel. |
 | `browse` | Opens a page: `outline` for the heading tree and links, `text` with `part=N` to read it in pieces, `links` for every absolute URL, `find=REGEX` to locate something inside it. One URL per line opens several at once. |
@@ -183,9 +183,24 @@ then the page in addressable parts, or a regex straight to the line you want. Re
 links are resolved to absolute URLs, and `<main>`/`<article>` is preferred over site
 chrome, so Wikipedia arrives as prose and a GitHub issue as the issue.
 
-**Context managed by the agent.** At 70% of the window the middle is cut away; the
-system prompt, the original task and the plan always survive. The length estimate
-calibrates itself against the server's own token counts.
+**Context managed by the agent.** At 70% of the window room is made cheapest first:
+old reasoning, reads of a file that has changed since and long tool output are shrunk
+in place, and only when that is not enough is the middle cut away. The system prompt,
+the original task and the plan always survive. When a plan item turns DONE in a long
+run, what it took to get there is dropped, so the next item starts from the task, the
+plan and a list of the files already touched (`--checkpoint-at`). A reply that was all
+reasoning and no answer is not kept. The length estimate calibrates itself against the
+server's own token counts.
+
+**Orientation, and a check before done.** The system prompt shows the working
+directory, git branch, status and last commits, and the project's test command when
+its files tell it. An answer that comes after a code file changed but before the code
+ran again - or right after a failing run - is held back once, with the test command
+and `git diff --stat`.
+
+**Undo.** Every write and edit keeps what the file held before: `edit undo=true`
+takes one change back, `/undo` puts back every file the last task changed, and the
+first copy of each goes to `~/.miniagent/projects/<slug>/backups/`.
 
 **Recovery hints.** When a tool fails in a way that has a known fix, the agent is told
 the fix. `hints/` holds one JSON file per tool — `{"when": regex, "say": text}` — so
@@ -235,7 +250,7 @@ stops the agent mid-token.
 
 ```
 /help   /plan    /memory  /stats   /tools   /hints   /context   /cwd
-/effort /approve /steps   /clear   /trace   /model   /resume  /quit
+/effort /approve /steps   /clear   /trace   /model   /resume  /undo   /quit
 
 !<command>    run a shell command directly, without the model
 esc           stop the agent immediately
@@ -258,6 +273,10 @@ esc           stop the agent immediately
     --temperature F      default 1.0
     --approve MODE       auto | all | none (default none: no confirmations)
     --crop-at F          share of the context that triggers cropping
+    --keep-tail N        messages a crop leaves untouched at the end (default 12)
+    --checkpoint-at F    a plan item turning DONE past this share of the context
+                         drops what it took (default 0.3, 0 = never)
+    --think-boost        one effort level more on the first step and after a failing run
     --remind-every N     steps between goal reminders
     --no-stream          disable streaming
     --no-color           plain output
@@ -286,6 +305,7 @@ agent/
   metrics.py          tokens, tokens per second, timings
   trace.py            JSONL run trace
   paths.py            where state lives: ~/.miniagent/projects/<slug>/
+  workspace.py        what the agent is shown of the project: listing, git, test command
   tools/              sh, read, write, edit, grep, websearch, browse, plan, ask
 ui/
   ansi.py             colours, spinner, formatting
@@ -294,9 +314,9 @@ ui/
   markdown.py         renders the model's markdown
   render.py           draws loop events
 hints/                one JSON file per tool
-tasks/                benchmark tasks, including ten hard ones
-verify/               independent checkers for those tasks
-tests/                243 tests
+tasks/                benchmark tasks: ten hard ones, three that edit this repository
+verify/               bench.py and an independent checker per task
+tests/                287 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be
@@ -311,14 +331,17 @@ python -m unittest discover -s tests
 Same harness, same protocol, a different endpoint — so the difference is the model:
 
 ```bat
-python miniagent.py -f tasks/hard/h08_markdown.txt --run-name local_h08
-python miniagent.py -f tasks/hard/h08_markdown.txt --run-name cloud_h08 ^
-       --url https://api.anthropic.com/v1 --model claude-sonnet-5 --api-key %API_KEY%
+python verify/bench.py --label spark tasks/edit/*.txt tasks/hard/h04_spreadsheet.txt
+python verify/bench.py --label big --profile big tasks/edit/*.txt tasks/hard/h04_spreadsheet.txt
+python verify/bench.py --label before --rev 3f042c4 tasks/edit/*.txt   :: an older harness
 ```
 
-Compare the traces in `~/.miniagent/projects/<slug>/runs/` — steps, tokens, crops,
-loops — and above all the independent
-checkers in `verify/`. An agent's own claim of success is not evidence: during testing
+Each task runs in a fresh workspace under `~/.miniagent/bench/<label>/` and is scored
+by its checker in `verify/` (`SCORE: passed/total`), never by the agent's claim; a
+task file starting with `fixture: git <rev>` begins as that revision of this
+repository - code to change, with a test suite that has to stay green. Every run is
+appended to `~/.miniagent/bench/results.jsonl`, and its trace (steps, tokens, crops,
+loops) lands in `~/.miniagent/projects/<slug>/runs/`. An agent's own claim of success is not evidence: during testing
 one model wrote a test file with 108 asserts, never called a single test function,
 printed `ALL OK` and reported the task complete.
 
