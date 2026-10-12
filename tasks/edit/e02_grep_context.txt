@@ -1,0 +1,4 @@
+fixture: git 3f042c4
+The grep tool (agent/tools/search.py) should accept an optional `context` argument N that also shows N lines before and after every match, like grep -C. A matching line keeps the format path:LINE: text; a context line is written path-LINE- text (a dash instead of the colons). When two matches are close, a line is shown only once.
+
+Add the parameter to the tool's params so the model sees it, add a test for it in tests/test_agent.py next to the other grep tests, and make sure the whole test suite passes: python -m unittest discover -s tests

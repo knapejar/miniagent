@@ -1,0 +1,2 @@
+fixture: git 3f042c4
+In miniagent.py add a /version command: it prints the VERSION constant. Put its handler in handle_command next to the /trace command, and add a line for it to the HELP text right below /help. Then check that miniagent.py still compiles and that the test suite still passes (python -m unittest discover -s tests).

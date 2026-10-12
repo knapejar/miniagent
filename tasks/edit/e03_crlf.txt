@@ -1,0 +1,4 @@
+fixture: git 3f042c4
+Bug: editing a file that has Windows line endings (CRLF) with the edit tool converts the whole file to LF, so git shows every line as changed. The write tool does the same when it overwrites a CRLF file.
+
+Fix agent/tools/files.py so that edit and write keep the line endings the file already had (a new file stays LF). Add a test for it to tests/test_agent.py and make sure the whole test suite passes: python -m unittest discover -s tests

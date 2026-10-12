@@ -21,6 +21,7 @@ try:
     import md2html
 except Exception as e:                                    # noqa: BLE001
     print("FATAL: md2html.py se nepodarilo importovat: %s" % e)
+    print("SCORE: 0/1")
     sys.exit(2)
 
 render = getattr(md2html, "render", None)
@@ -137,6 +138,7 @@ for g, (p, t) in groups.items():
 passed = sum(1 for r in RESULTS if r[3])
 print("=" * 72)
 print("CELKEM: %d/%d (%.0f %%)" % (passed, len(RESULTS), 100.0 * passed / len(RESULTS)))
+print("SCORE: %d/%d" % (passed, len(RESULTS)))
 
 fails = [r for r in RESULTS if not r[3]]
 if fails:
