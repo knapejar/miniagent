@@ -247,12 +247,14 @@ def _param_value(value):
 def _merge(pairs):
     """A repeated key is several values, not the last one. The model expresses
     "search for these four things" as four <arg_key>query</arg_key> pairs, and
-    collapsing them into a dict silently threw three of them away."""
+    collapsing them into a dict silently threw three of them away. The same
+    value twice is one value: a `path` sent twice became "a.py\\na.py"."""
     args = {}
     for key, value in pairs:
-        key = key.strip()
-        args[key] = args[key] + "\n" + value if key in args else value
-    return args
+        values = args.setdefault(key.strip(), [])
+        if value not in values:
+            values.append(value)
+    return dict((key, "\n".join(values)) for key, values in args.items())
 
 
 MARKUP = ("<arg_key>", "<arg_value>", "</arg_key>", "</arg_value>", "<tool_call>",

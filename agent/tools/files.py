@@ -11,8 +11,10 @@ out why. So a miss that differs only in indentation is applied anyway, any
 other miss shows the closest text in the file, and every edit answers with the
 lines around it - the re-read is already in the answer.
 """
+import codecs
 import difflib
 import json
+import locale
 import os
 
 READ_DEFAULT_LINES = 200
@@ -49,10 +51,31 @@ def check(path, source):
 
 def validate(path):
     try:
-        with open(path, encoding="utf-8") as fh:
-            return check(path, fh.read())
+        return check(path, load(path)[0])
     except Exception:
         return ""
+
+
+def load(path):
+    """(text with \\n line ends, encoding, newline) of a file as it is on disk.
+
+    A file is written back the way it was read: an edit once turned a CRLF file
+    into LF, which git shows as every line changed, and a cp1250 file could not
+    be edited at all."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    first = "utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"
+    for encoding in (first, locale.getpreferredencoding(False), "latin-1"):
+        try:
+            return raw.decode(encoding).replace("\r\n", "\n"), encoding, newline
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+
+def save(path, text, encoding="utf-8", newline="\n", mode="wb"):
+    with open(path, mode) as fh:
+        fh.write(text.replace("\r\n", "\n").replace("\n", newline).encode(encoding))
 
 
 class _FileTool(object):
@@ -88,8 +111,7 @@ class ReadTool(_FileTool):
 
     def run(self, ctx, path=None, start=1, count=READ_DEFAULT_LINES, **_):
         try:
-            with open(self.resolve(ctx, path), encoding="utf-8", errors="replace") as fh:
-                lines = fh.read().splitlines()
+            lines = load(self.resolve(ctx, path))[0].splitlines()
         except Exception as e:
             return "error: %s" % e
         first, wanted = max(1, int(start)), int(count)
@@ -122,13 +144,14 @@ class WriteTool(_FileTool):
         try:
             target = self.resolve(ctx, path)
             size = len(text.encode("utf-8"))
+            existing = os.path.getsize(target) if os.path.exists(target) else 0
+            # an existing file keeps its line ends and encoding, a new one is UTF-8 + LF
+            _, encoding, newline = load(target) if existing else ("", "utf-8", "\n")
             if _yes(append):
-                with open(target, "a", encoding="utf-8", newline="\n") as fh:
-                    fh.write(text)
+                save(target, text, encoding, newline, "ab")
                 # No syntax check: a file written in parts is broken until the last one.
                 return "appended %d bytes to %s (now %d bytes)" % (
                     size, target, os.path.getsize(target))
-            existing = os.path.getsize(target) if os.path.exists(target) else 0
             if not text and existing:
                 return ("error: refusing to overwrite %s with empty content. If you meant "
                         "to clear it, delete it with sh first." % target)
@@ -141,8 +164,7 @@ class WriteTool(_FileTool):
             parent = os.path.dirname(target)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            with open(target, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
+            save(target, text, encoding, newline)
             return "wrote %d bytes to %s%s" % (size, target, validate(target))
         except Exception as e:
             return "error: %s" % e
@@ -165,8 +187,7 @@ class EditTool(_FileTool):
     def run(self, ctx, path=None, old="", new="", **_):
         try:
             target = self.resolve(ctx, path)
-            with open(target, encoding="utf-8") as fh:
-                source = fh.read()
+            source, encoding, newline = load(target)
             old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
             if old == new:
                 return "error: 'old' and 'new' are identical, nothing to do"
@@ -183,8 +204,7 @@ class EditTool(_FileTool):
             if broken and not check(target, source):
                 return ("error: edit NOT applied - the file would no longer parse:%s\n"
                         "It would have looked like this:\n%s" % (broken, lines))
-            with open(target, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(result)
+            save(target, result, encoding, newline)
             return "edited %s%s%s\n%s" % (target, note, broken, lines)
         except Exception as e:
             return "error: %s" % e

@@ -134,6 +134,7 @@ class Session(object):
         self.messages[0] = self._system()
         self.goal, self.anchor = state["goal"], state["anchor"]
         self.has_plan, self.plan_text = state["has_plan"], state["plan_text"]
+        self._pin_plan()
         if self.tool_role == "user":            # saved under a dialect that sent role=tool
             self.downgrade_tool_role()
 
@@ -144,9 +145,15 @@ class Session(object):
             self.messages[self.anchor] = {"role": "user", "content": text}
 
     def set_plan(self, text):
+        """The pinned copy at [2] is refreshed only when the history is rewritten
+        anyway (crop, resume). Rewriting it here broke the token prefix at [2], so
+        every plan update re-prefilled the whole run behind it - and until then
+        the model has the new plan in front of it, in its own plan call."""
         self.plan_text = text
+
+    def _pin_plan(self):
         if self.has_plan:
-            self.messages[2] = {"role": "user", "content": PLAN_HEADER + text}
+            self.messages[2] = {"role": "user", "content": PLAN_HEADER + (self.plan_text or "(empty)")}
 
     def add_assistant(self, text, reasoning=""):
         """Keep the reasoning next to the answer. OpenAI-compatible servers pass
@@ -233,6 +240,7 @@ class Session(object):
         self.messages[low:high] = keep
         if anchored:
             self.anchor = low + 1
+        self._pin_plan()
         self.cropped = True
         self.crops += 1
         return dropped

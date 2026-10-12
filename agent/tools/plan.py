@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """The plan - the agent's pinned memory.
 
-It is written into a message pinned right behind the task. Context cropping
-never touches it, so it survives runs of millions of tokens. Without it the
+A copy is pinned right behind the task and refreshed whenever the context is
+cropped, which never touches it, so it survives runs of millions of tokens. Without it the
 model has no record after a crop of which parts already worked, and breaks them
 with its next edit.
 """

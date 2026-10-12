@@ -348,9 +348,17 @@ class TestTools(unittest.TestCase):
     def test_grep_rejects_bad_regex(self):
         self.assertTrue(self.tools["grep"].run(self.session, pattern="([").startswith("error"))
 
-    def test_plan_tool_writes_pinned_slot(self):
+    def test_plan_reaches_the_pinned_slot_at_the_next_crop(self):
+        # not before: rewriting [2] on every update re-prefilled the whole run
         self.session.start("GOAL")
+        pinned = self.session.messages[2]["content"]
         self.tools["plan"].run(self.session, text="[x] done")
+        self.assertEqual(self.session.messages[2]["content"], pinned)
+        self.assertEqual(self.session.plan_text, "[x] done")
+        for i in range(12):
+            self.session.add_assistant("step %d" % i)
+            self.session.add_observation("out %d" % i)
+        self.session.crop()
         self.assertIn("[x] done", self.session.messages[2]["content"])
 
     def test_risky_command_needs_approval(self):
@@ -387,6 +395,13 @@ class TestGuards(unittest.TestCase):
         self.assertTrue(failed("exit=1  cwd=x\nboom"))
         self.assertTrue(failed("error: nope"))
         self.assertFalse(failed("exit=0  cwd=x\nfine"))
+
+    def test_a_corrected_edit_is_a_different_call(self):
+        # the key was the first 300 chars of the sorted args - all of a long `new`
+        from agent.loop import AgentLoop
+        new = "x" * 400
+        self.assertNotEqual(AgentLoop._key("edit", {"path": "a", "old": "WRONG", "new": new}),
+                            AgentLoop._key("edit", {"path": "a", "old": "right", "new": new}))
 
     def test_failure_memory_blocks_after_limit(self):
         from agent.guards import FailureMemory
@@ -733,6 +748,40 @@ class TestFileEditing(unittest.TestCase):
         self.assertIn("of 200 shown, continue with start=", out)
         self.assertGreater(len(out), READ_MAX_CHARS // 2)
         self.assertNotIn("chars cut", clip(out, self.tools["read"].max_chars))
+
+    def raw(self, name):
+        with open(os.path.join(self.workdir, name), "rb") as fh:
+            return fh.read()
+
+    def put(self, name, data):
+        with open(os.path.join(self.workdir, name), "wb") as fh:
+            fh.write(data)
+
+    def test_edit_keeps_crlf_line_ends(self):
+        self.put("w.txt", b"one\r\ntwo\r\nthree\r\n")
+        self.run_tool("edit", path="w.txt", old="two\nthree", new="2\n3")
+        self.assertEqual(self.raw("w.txt"), b"one\r\n2\r\n3\r\n")
+
+    def test_write_over_a_crlf_file_keeps_crlf_and_a_new_file_is_lf(self):
+        self.put("w.txt", b"x\r\n")
+        self.run_tool("write", path="w.txt", text="a\nb\n")
+        self.run_tool("write", path="w.txt", text="c\n", append="true")
+        self.assertEqual(self.raw("w.txt"), b"a\r\nb\r\nc\r\n")
+        self.run_tool("write", path="new.txt", text="a\nb\n")
+        self.assertEqual(self.raw("new.txt"), b"a\nb\n")
+
+    def test_a_file_that_is_not_utf8_is_edited_in_its_own_encoding(self):
+        # it used to fail with a UnicodeDecodeError; the bytes around the edit stay
+        data = u"žluťoučký kůň\nname = 1\n".encode("cp1250")
+        self.put("c.txt", data)
+        self.assertIn("name = 1", self.run_tool("read", path="c.txt"))
+        self.assertIn("edited", self.run_tool("edit", path="c.txt", old="name = 1", new="name = 2"))
+        self.assertEqual(self.raw("c.txt"), data.replace(b"name = 1", b"name = 2"))
+
+    def test_a_bom_survives_an_edit(self):
+        self.put("b.txt", b"\xef\xbb\xbfone\n")
+        self.run_tool("edit", path="b.txt", old="one", new="two")
+        self.assertEqual(self.raw("b.txt"), b"\xef\xbb\xbftwo\n")
 
     def test_crop_marker_lists_the_files_it_drops(self):
         cfg = Config(workdir=self.workdir, ctx=1000, keep_tail=2)
@@ -1502,6 +1551,13 @@ class TestRepeatedArgumentKeys(unittest.TestCase):
         name, args = parse_tool_call(call)
         self.assertEqual(name, "websearch")
         self.assertEqual(args["query"].splitlines(), ["one", "two", "three"])
+
+    def test_the_same_value_twice_is_one_value(self):
+        # a path sent twice became "a.py\na.py" and every write failed on it
+        call = ("<tool_call>write<arg_key>path</arg_key><arg_value>a.py</arg_value>"
+                "<arg_key>path</arg_key><arg_value>a.py</arg_value>"
+                "<arg_key>text</arg_key><arg_value>x</arg_value></tool_call>")
+        self.assertEqual(parse_tool_call(call)[1], {"path": "a.py", "text": "x"})
 
     def test_single_key_is_unchanged(self):
         self.assertEqual(

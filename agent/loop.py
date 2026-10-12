@@ -13,7 +13,7 @@ import time
 
 from . import paths
 from .llm import LLMError
-from .guards import FailureMemory, Progress, ResultRepeat, failed
+from .guards import FailureMemory, Progress, ResultRepeat, digest, failed
 from .hints import Hints
 from .jobs import JOB_WAIT
 from .metrics import Metrics
@@ -176,7 +176,9 @@ class AgentLoop(object):
 
     @staticmethod
     def _key(name, args):
-        return "%s|%s" % (name, json.dumps(args, sort_keys=True, default=str)[:300])
+        # A hash of all of it, not a prefix: sorted, an edit's long `new` came
+        # first, so a retry with a corrected `old` had the same key and was blocked.
+        return "%s|%s" % (name, digest(json.dumps(args, sort_keys=True, default=str)))
 
     def _deliver_jobs(self, step, wait=0.0):
         """Hand finished background work to the model as its own observation."""
