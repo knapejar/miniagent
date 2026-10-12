@@ -8,13 +8,22 @@ import re
 
 from common import Raises, check, forbids, load, report
 
-forbids("rules", "mydiff.py", r"^\s*(import\s+difflib\b|from\s+difflib\b)")
+forbids("rules", "mydiff.py", modules=("difflib",))
 m = load("mydiff")
 PatchError = getattr(m, "PatchError", None)
 
 
 def lines(value):
     return value.splitlines() if isinstance(value, str) else list(value)
+
+
+def patch(a, unified):
+    """apply_patch on a list of lines, or on the same lines as text when it
+    takes only text - the spec names text, its own test passes a list."""
+    try:
+        return m.apply_patch(a, unified)
+    except (AttributeError, TypeError):
+        return m.apply_patch("".join(x + "\n" for x in a), unified)
 
 
 def subsequence(sub, seq):
@@ -73,10 +82,10 @@ for n in range(20):
         elif len(b) > 1:
             del b[i]
     check("round trip", "pair %d" % n,
-          lambda a=a, b=b: lines(m.apply_patch(a, m.to_unified(a, b))) == b)
+          lambda a=a, b=b: lines(patch(a, m.to_unified(a, b))) == b)
 check("round trip", "as text", lambda: lines(m.apply_patch("a\nb\nc\n", m.to_unified(
     ["a", "b", "c"], ["a", "B", "c"]))) == ["a", "B", "c"])
 check("errors", "a patch for another text raises PatchError",
-      lambda: m.apply_patch(["q", "r", "s"], m.to_unified(["a", "b", "c"], ["a", "X", "c"])),
+      lambda: patch(["q", "r", "s"], m.to_unified(["a", "b", "c"], ["a", "X", "c"])),
       Raises(PatchError or Exception))
 report()

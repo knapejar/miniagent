@@ -4,9 +4,9 @@ run checks that may hang or raise, print `SCORE: passed/total` last.
 
     python verify/h04_verify.py <workspace>
 """
+import ast
 import importlib
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -15,6 +15,8 @@ WS = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
 sys.path.insert(0, WS)
 os.chdir(WS)
 sys.setrecursionlimit(5000)
+if hasattr(sys.stdout, "reconfigure"):          # a cp1252 console cannot print every label
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 RESULTS = []
 TIMEOUT = 5           # seconds per check; a backtracking engine may never return
@@ -44,11 +46,25 @@ def source(name):
         return ""
 
 
-def forbids(group, filename, pattern):
-    """The file must not match pattern (a forbidden import or call)."""
-    found = re.search(pattern, source(filename), re.M)
-    RESULTS.append((group, "no %s in %s" % (pattern, filename),
-                    "found %r" % found.group(0) if found else "", not found))
+def forbids(group, filename, modules=(), calls=()):
+    """The file imports none of `modules` and calls none of `calls` - read from
+    its syntax tree, so a comment that mentions eval() is not a call."""
+    try:
+        tree = ast.parse(source(filename))
+    except SyntaxError as e:
+        RESULTS.append((group, "%s parses" % filename, str(e), False))
+        return
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names if a.name.split(".")[0] in modules]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in modules:
+            found.append(node.module)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in calls:
+            found.append(node.func.id + "()")
+    RESULTS.append((group, "no %s in %s" % ("/".join(tuple(modules) + tuple(calls)), filename),
+                    "found %s" % ", ".join(found), not found))
 
 
 def check(group, label, fn, expect=True):

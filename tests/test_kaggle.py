@@ -102,7 +102,7 @@ class TestQwenDialect(unittest.TestCase):
         self.assertIn("<function=example_function_name>", prompt)
         self.assertIn('{"type":"function","function":{"name":"sh"', prompt)
         self.assertIn("AT MOST 5 lines", prompt)
-        self.assertLess(len(prompt) / 3.4, 1550)
+        self.assertLess(len(prompt) / 3.4, 1575)      # the spark budget + the format block
 
     def test_spark_prompt_is_unchanged(self):
         prompt = build_system(default_tools(), r"C:\ws")

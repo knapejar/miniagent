@@ -52,6 +52,8 @@ class Session(object):
         self.cropped = False           # flag that forces a goal reminder
         self.crops = 0
         self.touched = {}              # path -> {tool: count} of cropped steps
+        self.undo = {}                 # path -> what it held before each change (tools/files.py)
+        self.backup_dir = None         # where the task's first copies of changed files go
         # role="tool" needs a matching assistant tool_calls field, which we do
         # not send: the history carries the call as text. A server that checks
         # answers 400 "orphan_tool_message", so the native dialect starts where
@@ -85,6 +87,9 @@ class Session(object):
         valid and the new task starts without a full prefill.
         """
         self.goal = task
+        self.undo = {}
+        self.backup_dir = os.path.join(paths.project_dir(self.cwd), "backups",
+                                       time.strftime("%Y%m%d_%H%M%S"))
         self.messages.append({"role": "user", "content": task})
         self.anchor = len(self.messages) - 1
         if not self.has_plan:

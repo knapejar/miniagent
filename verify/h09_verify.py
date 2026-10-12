@@ -5,7 +5,7 @@ import datetime
 
 from common import Raises, check, forbids, load, report
 
-forbids("rules", "mydate.py", r"^\s*(import|from)\s+(datetime|time|calendar)\b")
+forbids("rules", "mydate.py", modules=("datetime", "time", "calendar"))
 m = load("mydate")
 Date = m.Date
 DateError = getattr(m, "DateError", None)

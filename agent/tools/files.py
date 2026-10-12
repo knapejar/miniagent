@@ -16,12 +16,24 @@ import difflib
 import json
 import locale
 import os
+import re
+
+from .. import paths
 
 READ_DEFAULT_LINES = 200
 # A read is never cut in the middle (the loop clips other tools at 3000 chars):
 # a hole in the code is what the model then edits from memory. Instead it stops
 # early on a line boundary and says where to continue.
 READ_MAX_CHARS = 8000
+READ_MAX_FILES = 4         # paths one read takes
+READ_MULTI_MIN = 2000      # chars each of several files gets at least
+OUTLINE_MAX_CHARS = 1600
+OUTLINE_LINE = 90
+DEFINITION = re.compile(
+    r"\s*(?:(?:async\s+def|def|class|function|func|fn|impl|struct|interface|enum|trait|module)\b"
+    r"|export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const)\b"
+    r"|(?:public|private|protected|internal|static)\s[^=;]*\()")
+HEADING = re.compile(r"#{1,6}\s")
 SNIPPET_CONTEXT = 3        # lines shown around an edit
 SNIPPET_MAX_LINES = 30
 CLOSEST_MAX_LINES = 40     # longest 'old' compared window by window
@@ -78,6 +90,38 @@ def save(path, text, encoding="utf-8", newline="\n", mode="wb"):
         fh.write(text.replace("\r\n", "\n").replace("\n", newline).encode(encoding))
 
 
+def remember(ctx, target):
+    """Keep what the file held before this change, so it can be taken back:
+    edit undo=true takes back one change, /undo all of the task's. The file as it
+    was before the task is also copied to disk - the model once overwrote a
+    module with a fragment and committed it."""
+    history = getattr(ctx, "undo", None)
+    target = os.path.abspath(target)
+    if history is None or os.path.normcase(target).startswith(os.path.normcase(paths.home())):
+        return                                    # the agent's own notes are not undone
+    data = None
+    if os.path.isfile(target):
+        with open(target, "rb") as fh:
+            data = fh.read()
+    stack = history.setdefault(target, [])
+    backups = getattr(ctx, "backup_dir", None)
+    if not stack and data is not None and backups:
+        os.makedirs(backups, exist_ok=True)
+        with open(os.path.join(backups, re.sub(r"[:\\/]+", "-", target).strip("-")), "wb") as fh:
+            fh.write(data)
+    stack.append(data)
+
+
+def restore(path, data):
+    """Put back what remember() kept; None means the file did not exist."""
+    if data is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
 class _FileTool(object):
     params = {}
     required = ()
@@ -102,14 +146,27 @@ class _FileTool(object):
 
 class ReadTool(_FileTool):
     name = "read"
-    description = "Read a text file with line numbers."
+    description = "Read text files with line numbers; one path per line reads several."
     params = {"path": {"type": "string"},
-              "start": {"type": "integer", "description": "1-based first line, default 1"},
+              "start": {"type": "integer", "description": "first line, default 1"},
               "count": {"type": "integer", "description": "number of lines, default 200"}}
     required = ("path",)
-    max_chars = READ_MAX_CHARS + 200      # the loop's clip limit for this tool
+    max_chars = READ_MAX_CHARS + OUTLINE_MAX_CHARS + 400    # the loop's clip limit for this tool
 
     def run(self, ctx, path=None, start=1, count=READ_DEFAULT_LINES, **_):
+        # Every file it wanted used to cost a turn of its own.
+        wanted = [p.strip() for p in str(path or "").splitlines() if p.strip()]
+        if len(wanted) <= 1:
+            return self.one(ctx, path, start, count, READ_MAX_CHARS)
+        budget = max(READ_MULTI_MIN, READ_MAX_CHARS // min(len(wanted), READ_MAX_FILES))
+        out = ["=== %s\n%s" % (p, self.one(ctx, p, start, count, budget))
+               for p in wanted[:READ_MAX_FILES]]
+        if len(wanted) > READ_MAX_FILES:
+            out.append("...[%d more files not read - at most %d per call]"
+                       % (len(wanted) - READ_MAX_FILES, READ_MAX_FILES))
+        return "\n\n".join(out)
+
+    def one(self, ctx, path, start, count, budget):
         try:
             lines = load(self.resolve(ctx, path))[0].splitlines()
         except Exception as e:
@@ -118,14 +175,33 @@ class ReadTool(_FileTool):
         shown, size = [], 0
         for line in lines[first - 1:first - 1 + wanted]:
             size += len(line) + 7
-            if shown and size > READ_MAX_CHARS:
+            if shown and size > budget:
                 break
-            shown.append(line[:READ_MAX_CHARS])
+            shown.append(line[:budget])
         last = first - 1 + len(shown)
-        more = "" if last >= len(lines) else \
-            "\n...[lines %d-%d of %d shown, continue with start=%d]" % (
-                first, last, len(lines), last + 1)
-        return (numbered(shown, first) or "(empty range)") + more
+        if first == 1 and last >= len(lines):
+            return numbered(shown, first) or "(empty file)"
+        more = "\n...[lines %d-%d of %d shown, continue with start=%d]" % (
+            first, last, len(lines), last + 1) if last < len(lines) else ""
+        return (numbered(shown, first) or "(empty range)") + more + outline(
+            path, lines, first, last)
+
+
+def outline(path, lines, first, last):
+    """Where the definitions are in the lines a read did not show: a model
+    paging through a file 200 lines at a time read one file six times in a row."""
+    pattern = HEADING if str(path).lower().endswith(".md") else DEFINITION
+    rows, size = [], 0
+    for number, line in enumerate(lines, 1):
+        if first <= number <= last or not pattern.match(line):
+            continue
+        row = "%5d\t%s" % (number, line.rstrip()[:OUTLINE_LINE])
+        size += len(row) + 1
+        if size > OUTLINE_MAX_CHARS:
+            rows.append("   ...")
+            break
+        rows.append(row)
+    return "\nOutline of the lines not shown:\n" + "\n".join(rows) if rows else ""
 
 
 class WriteTool(_FileTool):
@@ -148,6 +224,7 @@ class WriteTool(_FileTool):
             # an existing file keeps its line ends and encoding, a new one is UTF-8 + LF
             _, encoding, newline = load(target) if existing else ("", "utf-8", "\n")
             if _yes(append):
+                remember(ctx, target)
                 save(target, text, encoding, newline, "ab")
                 # No syntax check: a file written in parts is broken until the last one.
                 return "appended %d bytes to %s (now %d bytes)" % (
@@ -164,6 +241,7 @@ class WriteTool(_FileTool):
             parent = os.path.dirname(target)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            remember(ctx, target)
             save(target, text, encoding, newline)
             return "wrote %d bytes to %s%s" % (size, target, validate(target))
         except Exception as e:
@@ -172,21 +250,26 @@ class WriteTool(_FileTool):
 
 class EditTool(_FileTool):
     name = "edit"
-    description = "Replace the one exact occurrence of old with new in a file."
+    description = ("Replace the one exact occurrence of old with new in a file; "
+                   "undo=true takes its last change back.")
     params = {"path": {"type": "string"}, "old": {"type": "string"},
-              "new": {"type": "string"}}
+              "new": {"type": "string"}, "undo": {"type": "boolean"}}
     required = ("path", "old", "new")
 
     def summary(self, args):
         # Showing truncated old/new makes distinct edits look identical, which
         # hides thrashing. Show sizes and the first differing fragment instead.
+        if _yes(args.get("undo")):
+            return "%s  undo" % args.get("path", "?")
         old, new = str(args.get("old", "")), str(args.get("new", ""))
         head = old.strip().splitlines()[0][:40] if old.strip() else "(empty)"
         return "%s  %r  %d->%d chars" % (args.get("path", "?"), head, len(old), len(new))
 
-    def run(self, ctx, path=None, old="", new="", **_):
+    def run(self, ctx, path=None, old="", new="", undo=False, **_):
         try:
             target = self.resolve(ctx, path)
+            if _yes(undo):
+                return self.undo(ctx, target)
             source, encoding, newline = load(target)
             old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
             if old == new:
@@ -204,10 +287,23 @@ class EditTool(_FileTool):
             if broken and not check(target, source):
                 return ("error: edit NOT applied - the file would no longer parse:%s\n"
                         "It would have looked like this:\n%s" % (broken, lines))
+            remember(ctx, target)
             save(target, result, encoding, newline)
             return "edited %s%s%s\n%s" % (target, note, broken, lines)
         except Exception as e:
             return "error: %s" % e
+
+    @staticmethod
+    def undo(ctx, target):
+        stack = (getattr(ctx, "undo", None) or {}).get(os.path.abspath(target))
+        if not stack:
+            return "error: no change of %s to take back in this task" % target
+        data = stack.pop()
+        restore(os.path.abspath(target), data)
+        if data is None:
+            return "undone: %s did not exist before, it is removed" % target
+        return ("undone: %s is back to how it was before its last change (%d lines; %d more "
+                "changes can be taken back)" % (target, data.count(b"\n"), len(stack)))
 
 
 def _yes(value):

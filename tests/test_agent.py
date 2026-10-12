@@ -22,8 +22,9 @@ from agent import paths                                               # noqa: E4
 # Paid for in every turn of the model - a budget, not a style rule. Raised from
 # 1100 when websearch and browse gained multi-target and background: 26 tokens
 # that turn four sequential searches (25.7s) into one call (4.7s). Raised again
-# to 1350 for the project-state convention rule (agent/protocol.py).
-SYSTEM_PROMPT_TOKEN_BUDGET = 1350
+# to 1350 for the project-state convention rule (agent/protocol.py), and to 1375
+# for read taking several paths and edit undo=true: a turn each where they apply.
+SYSTEM_PROMPT_TOKEN_BUDGET = 1375
 
 
 class TestPaths(unittest.TestCase):

@@ -124,5 +124,112 @@ class TestCheckBeforeFinal(unittest.TestCase):
         self.assertTrue(any(e == "note" and "held back" in d["text"] for e, d in events))
 
 
+class TestReading(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.session = Session(Config(workdir=self.root), default_tools())
+        self.tools = dict((t.name, t) for t in default_tools())
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def read(self, **args):
+        return self.tools["read"].run(self.session, **args)
+
+    def test_a_cut_read_outlines_what_it_did_not_show(self):
+        body = "".join("def f%d():\n%s" % (i, "    x = 1\n" * 20) for i in range(30))
+        put(self.root, "big.py", body)
+        out = self.read(path="big.py")
+        self.assertIn("continue with start=201", out)
+        self.assertIn("Outline of the lines not shown:", out)
+        self.assertIn("\tdef f29():", out)
+        self.assertNotIn("\tdef f0():\n", out.split("Outline")[1])   # already shown above
+        self.assertLessEqual(len(out), self.tools["read"].max_chars)
+
+    def test_a_whole_read_has_no_outline(self):
+        put(self.root, "small.py", "def f():\n    return 1\n")
+        self.assertNotIn("Outline", self.read(path="small.py"))
+
+    def test_markdown_is_outlined_by_headings(self):
+        put(self.root, "doc.md", "".join("# Part %d\n%s" % (i, "text\n" * 50) for i in range(8)))
+        out = self.read(path="doc.md", count=20)
+        self.assertIn("\t# Part 7", out)
+
+    def test_several_paths_in_one_read(self):
+        put(self.root, "a.py", "A = 1\n")
+        put(self.root, "b.py", "B = 2\n")
+        out = self.read(path="a.py\nb.py\nmissing.py")
+        self.assertIn("=== a.py\n    1\tA = 1", out)
+        self.assertIn("=== b.py\n    1\tB = 2", out)
+        self.assertIn("=== missing.py\nerror:", out)
+        self.assertLessEqual(len(out), self.tools["read"].max_chars)
+
+
+class TestUndo(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self._home = os.environ.get("MINIAGENT_HOME")
+        os.environ["MINIAGENT_HOME"] = self.home
+        self.root = tempfile.mkdtemp()
+        self.session = Session(Config(workdir=self.root), default_tools())
+        self.session.start("GOAL")
+        self.tools = dict((t.name, t) for t in default_tools())
+
+    def tearDown(self):
+        if self._home is None:
+            os.environ.pop("MINIAGENT_HOME", None)
+        else:
+            os.environ["MINIAGENT_HOME"] = self._home
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def tool(self, name, **args):
+        return self.tools[name].run(self.session, **args)
+
+    def text(self, name):
+        with open(os.path.join(self.root, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_edit_undo_takes_back_one_change_at_a_time(self):
+        put(self.root, "a.py", "x = 1\n")
+        self.tool("edit", path="a.py", old="x = 1", new="x = 2")
+        self.tool("edit", path="a.py", old="x = 2", new="x = 3")
+        self.assertIn("undone", self.tool("edit", path="a.py", undo="true"))
+        self.assertEqual(self.text("a.py"), "x = 2\n")
+        self.tool("edit", path="a.py", undo="true")
+        self.assertEqual(self.text("a.py"), "x = 1\n")
+        self.assertTrue(self.tool("edit", path="a.py", undo="true").startswith("error"))
+
+    def test_undo_of_a_new_file_removes_it(self):
+        self.tool("write", path="new.py", text="y = 1\n")
+        self.assertIn("removed", self.tool("edit", path="new.py", undo="true"))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.py")))
+
+    def test_the_original_is_copied_to_disk_once(self):
+        put(self.root, "a.py", "x = 1\n")
+        self.tool("edit", path="a.py", old="x = 1", new="x = 2")
+        self.tool("write", path="a.py", text="x = 3\n")
+        copies = os.listdir(self.session.backup_dir)
+        self.assertEqual(len(copies), 1)
+        with open(os.path.join(self.session.backup_dir, copies[0]), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "x = 1\n")
+
+    def test_the_slash_command_puts_the_whole_task_back(self):
+        import contextlib
+        import io
+        import miniagent
+        put(self.root, "a.py", "x = 1\n")
+        self.tool("edit", path="a.py", old="x = 1", new="x = 2")
+        self.tool("write", path="b.py", text="new\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            miniagent.handle_command("/undo", self.session.cfg, self.session,
+                                     type("R", (), {"s": __import__("ui.ansi", fromlist=["x"]).Style(False)})(),
+                                     None, None)
+        self.assertEqual(self.text("a.py"), "x = 1\n")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "b.py")))
+        self.assertEqual(self.session.undo, {})
+
+
 if __name__ == "__main__":
     unittest.main()

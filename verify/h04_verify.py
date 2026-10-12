@@ -2,7 +2,7 @@
 """h04: a spreadsheet with formulas, ranges, dependencies and cycle detection."""
 from common import Raises, check, forbids, load, report
 
-forbids("rules", "sheet.py", r"(?<![\w.])(eval|exec|compile)\s*\(")
+forbids("rules", "sheet.py", calls=("eval", "exec", "compile"))
 m = load("sheet")
 CycleError = getattr(m, "CycleError", None)
 CellError = getattr(m, "CellError", None)

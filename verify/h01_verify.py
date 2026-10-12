@@ -4,7 +4,7 @@ import re
 
 from common import Raises, check, forbids, load, report
 
-forbids("rules", "myjson.py", r"^\s*(import\s+json\b|from\s+json\b)")
+forbids("rules", "myjson.py", modules=("json",))
 m = load("myjson")
 JsonError = getattr(m, "JsonError", None)
 check("rules", "JsonError is a ValueError",
@@ -17,8 +17,8 @@ for text, value in [("null", None), ("true", True), ("false", False), ("0", 0), 
 check("scalars", "an integer stays an int", lambda: type(m.loads("42")) is int)
 
 for text, value in [('""', ""), ('"a b"', "a b"), (r'"a\"b"', 'a"b'), (r'"\\"', "\\"),
-                    (r'"\/"', "/"), (r'"\n\t\r\b\f"', "\n\t\r\b\f"), (r'"A"', "A"),
-                    (r'"č"', u"č"), (u'"žluťoučký kůň"', u"žluťoučký kůň")]:
+                    (r'"\/"', "/"), (r'"\n\t\r\b\f"', "\n\t\r\b\f"), (r'"\u0041"', "A"),
+                    (r'"\u010d"', u"č"), (u'"žluťoučký kůň"', u"žluťoučký kůň")]:
     check("strings", "loads(%r)" % text, lambda t=text: m.loads(t), value)
 
 for text, value in [("[]", []), ("[1]", [1]), ("[1,2,3]", [1, 2, 3]),

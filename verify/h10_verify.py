@@ -12,8 +12,8 @@ from common import Raises, check, load, report
 
 m = load("scheduler")
 SchedError = getattr(m, "SchedError", None)
-CLASSES = [c for _, c in inspect.getmembers(m, inspect.isclass)
-           if hasattr(c, "add") and hasattr(c, "topo")]
+CLASSES = sorted((c for _, c in inspect.getmembers(m, inspect.isclass)
+                  if hasattr(c, "add") and hasattr(c, "topo")), key=lambda c: not hasattr(c, "run"))
 check("rules", "a class with add() and topo()", lambda: bool(CLASSES))
 Scheduler = CLASSES[0] if CLASSES else None
 
@@ -56,8 +56,9 @@ check("critical", "diamond", lambda: build(DIAMOND).critical_path()[0], 5)
 def schedule(tasks, workers):
     s = build(tasks)
     out = s.run(workers=workers)
-    events = out[0] if isinstance(out, tuple) and len(out) == 2 and \
-        isinstance(out[1], (int, float)) else out
+    events = out
+    if isinstance(out, tuple) and len(out) == 2:          # (events, makespan) or the reverse
+        events = out[1] if isinstance(out[0], (int, float)) else out[0]
     starts = dict((name, time) for time, name in events)
     durations = dict((t[0], t[2]) for t in tasks)
     return starts, durations, max(starts[n] + durations[n] for n in starts)

@@ -2,7 +2,7 @@
 """h03: a backtracking regex engine without the re module."""
 from common import Raises, check, forbids, load, report
 
-forbids("rules", "myre.py", r"^\s*(import\s+re\b|from\s+re\b|import\s+.*\bre\b)")
+forbids("rules", "myre.py", modules=("re",))
 m = load("myre")
 ReError = getattr(m, "ReError", None)
 check("rules", "ReError is a ValueError",

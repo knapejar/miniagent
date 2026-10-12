@@ -41,6 +41,7 @@ HELP = """  commands
     /clear [all]       drop the conversation; the plan survives unless 'all'
     /resume            continue a saved session (ctrl+a lists every project's)
     /edit <text>       replace the current task (e.g. after cancelling it)
+    /undo              put back every file the last task changed with write or edit
     /memory            notes the agent keeps for this project
     /trace             path to the JSONL trace
     /quit              exit
@@ -300,6 +301,18 @@ def handle_command(line, cfg, session, renderer, trace, last):
         else:
             session.set_goal(arg)
             print("  " + s.dim("task replaced (%d chars)" % len(arg)))
+    elif cmd == "/undo":
+        from agent.tools.files import restore
+        changed = [(path, stack[0]) for path, stack in session.undo.items() if stack]
+        if not changed:
+            print("  " + s.dim("nothing to undo - the last task changed no file with write or edit"))
+        for path, data in changed:
+            restore(path, data)
+            print("  " + ("removed  " if data is None else "restored ") + path)
+        if changed:
+            print("  " + s.dim("changes made through sh are not covered; first copies are in "
+                               + (session.backup_dir or "-")))
+        session.undo = {}
     elif cmd == "/cwd":
         if arg:
             import os
