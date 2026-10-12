@@ -30,7 +30,7 @@ import json
 import os
 import re
 
-from . import paths
+from . import paths, workspace
 
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
 ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
@@ -105,7 +105,7 @@ Rules:
   grep the old runs, before rediscovering something; write a note only for a fact
   worth reusing later (a host, a login, a working command) - create it if missing.
 
-Working directory: {cwd}{secrets}{memory}"""
+Working directory: {cwd}{workspace}{secrets}{memory}"""
 
 MEMORY_MAX_CHARS = 1500
 
@@ -166,7 +166,8 @@ def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names
         block = (QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS).format(
             tools=render_tools(tools, dialect))
     return SYSTEM_TEMPLATE.format(tools_block=block,
-                                  cwd=cwd, os_name=os_name, shell=shell, secrets=secrets,
+                                  cwd=cwd, workspace=workspace.snapshot(cwd),
+                                  os_name=os_name, shell=shell, secrets=secrets,
                                   state_dir=paths.project_dir(cwd),
                                   memory=_load_memory(cwd))
 

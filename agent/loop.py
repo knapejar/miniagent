@@ -9,9 +9,10 @@ Events: step, delta, usage, tool_call, tool_result, plan, crop, note, final,
         memory_save, end.
 """
 import json
+import re
 import time
 
-from . import paths
+from . import paths, workspace
 from .llm import LLMError
 from .guards import FailureMemory, Progress, ResultRepeat, digest, failed
 from .hints import Hints
@@ -66,6 +67,18 @@ next to the index and leave one line pointing at it. Tools: %s - nothing else
 exists here. Reply with the single word NOTHING only when every line you would
 write is already in the file above."""
 
+# Before an answer counts as final, the code it changed must have run after the
+# last change. One model reported a task done with 108 asserts it never called;
+# another committed an edit it had only compiled. Asked once per task.
+CHECK = ("[CHECK] Not done yet: %s. Run %s now and fix what fails. If it cannot "
+         "be run here, answer again and say so in one line.")
+RUNS_CODE = re.compile(r"(?i)(?:^|[\s;&|(])(python3?|py|pytest|node|npm|npx|yarn|pnpm|deno|bun"
+                       r"|cargo|go|make|mvn|gradle|dotnet|ruby|php|java|tsc)(?:\.exe)?(?:\s|$)")
+CODE_EXT = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt",
+            ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php", ".lua", ".swift", ".sh",
+            ".ps1", ".bat", ".cmd", ".asm")
+EXIT = re.compile(r"exit=(-?\d+)")
+
 MEMORY_NUDGE = """[MEMORY] That was prose, not a memory update, and nothing was
 saved. Call write on %s now with the full contents of the file, or reply with
 exactly NOTHING if there is truly nothing to add."""
@@ -102,6 +115,10 @@ class AgentLoop(object):
         self._empty = 0
         self._no_think = False
         self._pending_crop = 0
+        self._changed = []           # code files written since the code last ran
+        self._last_exit = None       # how the last run of the code ended
+        self._last_cmd = ""          # the last sh command, for a wait that finishes it
+        self._checked = False        # the CHECK is asked once per task
 
     # ------------------------------------------------------------- helpers
     def _log(self, event, **fields):
@@ -194,7 +211,41 @@ class AgentLoop(object):
         for block in blocks:
             self.session.add_observation(clip(block))
             self._log("job_done", step=step, job=block[:120])
+        for _job, label, result, _seconds in finished:
+            self._ran(label, result)
         return "%d background result(s) delivered" % len(finished)
+
+    def _track(self, name, args, observation):
+        """Which code files changed since the code last ran, and how it ended."""
+        if name in ("write", "edit") and not observation.startswith("error"):
+            path = str(args.get("path") or "")
+            if path.lower().endswith(CODE_EXT) and path not in self._changed:
+                self._changed.append(path)
+        elif name == "sh":
+            self._last_cmd = str(args.get("cmd") or "")
+            self._ran(self._last_cmd, observation)
+        elif name == "wait":
+            self._ran(self._last_cmd, observation)
+
+    def _ran(self, cmd, output):
+        found = EXIT.match(output.lstrip())
+        if found and RUNS_CODE.search(cmd):
+            self._changed, self._last_exit = [], int(found.group(1))
+
+    def _check(self):
+        """The CHECK for an answer that came too early, or ""."""
+        if self._checked:
+            return ""
+        if self._changed:
+            why = "you changed %s after the code last ran" % ", ".join(self._changed[:6])
+        elif self._last_exit:
+            why = "the last run of the code failed (exit=%d)" % self._last_exit
+        else:
+            return ""
+        self._checked = True
+        stat = workspace.diff_stat(self.session.cwd)
+        text = CHECK % (why, workspace.test_command(self.session.cwd) or "it or its tests")
+        return text + ("\nChanged so far (git diff --stat):\n" + stat if stat else "")
 
     def _loop_warning(self, signature):
         self._recent.append(signature)
@@ -346,6 +397,7 @@ class AgentLoop(object):
         self._recent, self._empty, self._pending_crop = [], 0, 0
         self._no_think = False
         self._since_plan = 0
+        self._changed, self._last_exit, self._last_cmd, self._checked = [], None, "", False
         self.hints.reset()
         self._log("task", task=task, model=self.cfg.model, config=self.cfg.as_dict())
 
@@ -433,6 +485,13 @@ class AgentLoop(object):
                     # it would throw away what it waited for.
                     yield "note", {"level": "info", "text": delivered}
                     continue
+                check = self._check()
+                if check:
+                    self._log("check", step=step, text=check[:300])
+                    yield "note", {"level": "info", "text": "answer held back: " +
+                                   check.split(": ", 1)[1].split(". Run")[0]}
+                    self.session.add_user(check)
+                    continue
                 self._log("final", step=step, text=body, metrics=self.metrics.snapshot())
                 yield "final", {"text": body}
                 # The memory pass is NOT run here. It would hold the keyboard and
@@ -483,6 +542,7 @@ class AgentLoop(object):
             observation = clip(redact(out, self.cfg.redact),
                                getattr(self.tools.get(name), "max_chars", OBS_MAX_CHARS))
             self.failures.record(key, failed(observation))
+            self._track(name, args, observation)
             yield "tool_result", {"name": name, "text": observation, "seconds": seconds,
                                   "error": observation.startswith("error:")}
             if name == "plan":
