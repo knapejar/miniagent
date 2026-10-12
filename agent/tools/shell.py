@@ -40,6 +40,9 @@ CMD_SCRIPT = ('@echo off\r\n'
               '>"%s" (echo %%__rc%%& cd)\r\n'
               'exit /b %%__rc%%\r\n')
 
+# SetShouldExit, not `exit`: with stdout going to a file, `exit` throws away the
+# objects the script printed without Write-Host (Get-Location, ... | Select-Object)
+# and the model got "(no output)" for files that were there.
 PS_SCRIPT = ('$ErrorActionPreference = "Continue"\n'
              '[Console]::OutputEncoding = [Text.Encoding]::UTF8\n'
              'Set-Location -LiteralPath %s\n'
@@ -48,7 +51,7 @@ PS_SCRIPT = ('$ErrorActionPreference = "Continue"\n'
              'elseif ($?) { 0 } else { 1 }\n'
              'Set-Content -LiteralPath %s -Value @($__rc, (Get-Location).Path) '
              '-Encoding utf8\n'
-             'exit $__rc\n')
+             '$host.SetShouldExit($__rc)\n')
 
 
 def looks_like_powershell(cmd):

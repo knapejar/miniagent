@@ -309,9 +309,15 @@ class TestTools(unittest.TestCase):
         self.assertIn("shell=powershell", out)
         self.assertIn("ok", out)
 
+    def test_powershell_objects_are_not_lost(self):
+        out = self.tools["sh"].run(self.session, cmd="Get-Location | Select-Object Path\n"
+                                                     "cmd /c exit 3", shell="powershell")
+        self.assertIn("exit=3", out)
+        self.assertIn(self.session.cwd, out)
+
     def test_file_roundtrip(self):
         self.tools["write"].run(self.session, path="t.py", text="print('a')\nprint(1+1)\n")
-        self.assertIn("    1| print('a')", self.tools["read"].run(self.session, path="t.py"))
+        self.assertIn("    1	print('a')", self.tools["read"].run(self.session, path="t.py"))
         self.assertIn("edited", self.tools["edit"].run(self.session, path="t.py",
                                                        old="1+1", new="2+2"))
         self.assertIn("2+2", self.tools["read"].run(self.session, path="t.py"))
@@ -650,6 +656,101 @@ class TestEmptyWriteGuard(unittest.TestCase):
         if os.path.exists(path):
             os.remove(path)
         self.assertIn("wrote 0 bytes", self.write.run(self.session, path="fresh.txt", text=""))
+
+
+class TestFileEditing(unittest.TestCase):
+    """What the traces showed the 4B model getting wrong: 'old' off by one space,
+    an edit that broke the file and stayed, a write that replaced a module with a
+    fragment, and reads cut in the middle."""
+
+    CODE = "class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        return 2\n"
+
+    def setUp(self):
+        self.workdir = os.path.join(os.environ.get("TEMP", "."), "miniagent_editing")
+        shutil.rmtree(self.workdir, ignore_errors=True)
+        os.makedirs(self.workdir)
+        self.session = Session(Config(workdir=self.workdir), default_tools())
+        self.tools = {t.name: t for t in default_tools()}
+        self.tools["write"].run(self.session, path="a.py", text=self.CODE)
+
+    def run_tool(self, name, **args):
+        return self.tools[name].run(self.session, **args)
+
+    def text(self, name="a.py"):
+        with open(os.path.join(self.workdir, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_edit_answers_with_the_changed_lines(self):
+        out = self.run_tool("edit", path="a.py", old="return 1", new="return 10")
+        self.assertIn("    3\t        return 10", out)
+
+    def test_ambiguous_edit_names_the_lines(self):
+        out = self.run_tool("edit", path="a.py", old="(self):", new="(self, x):")
+        self.assertIn("matches 2 places (lines 2, 5)", out)
+        self.assertEqual(self.text(), self.CODE)
+
+    def test_edit_off_by_indentation_is_applied_with_the_files_indentation(self):
+        out = self.run_tool("edit", path="a.py", old="     def g(self):\n         return 2",
+                            new="     def g(self):\n         return 3")
+        self.assertIn("ignoring indentation", out)
+        self.assertIn("    def g(self):\n        return 3\n", self.text())
+
+    def test_edit_starting_at_the_first_word(self):
+        out = self.run_tool("edit", path="a.py", old="def f(self):\n         return 1",
+                            new="def f(self):\n         x = 1\n         return x")
+        self.assertIn("ignoring indentation", out)
+        self.assertIn("    def f(self):\n        x = 1\n        return x\n", self.text())
+
+    def test_miss_shows_the_closest_lines(self):
+        out = self.run_tool("edit", path="a.py", old="def g(slf):\n    return 2", new="x")
+        self.assertTrue(out.startswith("error: 'old' not found in file"))
+        self.assertIn("lines 5-6", out)
+        self.assertIn("    5\t    def g(self):", out)
+
+    def test_edit_that_breaks_a_valid_file_is_not_applied(self):
+        out = self.run_tool("edit", path="a.py", old="def f(self):", new="def f(self:")
+        self.assertIn("NOT applied", out)
+        self.assertIn("SYNTAX ERROR", out)
+        self.assertEqual(self.text(), self.CODE)
+
+    def test_write_refuses_to_shrink_a_file_to_a_fragment(self):
+        self.run_tool("write", path="big.py", text="x = 1\n" * 300)
+        out = self.run_tool("write", path="big.py", text="x = 2\n")
+        self.assertTrue(out.startswith("error: refusing to shrink"))
+        self.assertEqual(self.text("big.py"), "x = 1\n" * 300)
+
+    def test_write_append_builds_a_file_in_parts(self):
+        self.run_tool("write", path="p.txt", text="one\n")
+        self.assertIn("now 8 bytes", self.run_tool("write", path="p.txt", text="two\n",
+                                                   append="true"))
+        self.assertEqual(self.text("p.txt"), "one\ntwo\n")
+
+    def test_long_read_stops_on_a_line_and_says_where_to_go_on(self):
+        from agent.tools.files import READ_MAX_CHARS
+        self.run_tool("write", path="long.txt", text=("y" * 99 + "\n") * 200)
+        out = self.run_tool("read", path="long.txt")
+        self.assertLessEqual(len(out), self.tools["read"].max_chars)
+        self.assertIn("of 200 shown, continue with start=", out)
+        self.assertGreater(len(out), READ_MAX_CHARS // 2)
+        self.assertNotIn("chars cut", clip(out, self.tools["read"].max_chars))
+
+    def test_crop_marker_lists_the_files_it_drops(self):
+        cfg = Config(workdir=self.workdir, ctx=1000, keep_tail=2)
+        s = Session(cfg, default_tools())
+        s.start("GOAL")
+        s.add_assistant(format_tool_call("read", {"path": "a.py"}))
+        s.add_observation("1\tclass A:")
+        s.add_assistant(format_tool_call("edit", {"path": "a.py", "old": "1", "new": "2"}))
+        s.add_observation("edited a.py")
+        s.add_assistant(format_tool_call("edit", {"path": "b.py", "old": "1", "new": "2"}))
+        s.add_observation("error: 'old' not found in file")
+        for i in range(4):
+            s.add_assistant("step %d" % i)
+            s.add_observation("out %d" % i)
+        s.crop()
+        marker = s.messages[3]["content"]
+        self.assertIn("a.py: edit 1x, read 1x", marker)
+        self.assertNotIn("b.py", marker)               # the failed edit changed nothing
 
 
 class TestMalformedCall(unittest.TestCase):

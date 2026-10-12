@@ -450,8 +450,9 @@ class AgentLoop(object):
                                "text": "tool call cut off at the token limit - not run"}
                 self.session.add_observation(
                     "[ERROR] Your tool call was cut off at the token limit, so it was NOT "
-                    "run. Make the arguments smaller: write a file in several parts, or "
-                    "shorten the content." + self.session.reminder(step, self.cfg.max_steps))
+                    "run. Make the arguments smaller: write the first part of the file, then add "
+                    "the rest with write append=true, or change it piece by piece with edit."
+                    + self.session.reminder(step, self.cfg.max_steps))
                 continue
 
             self._empty, self._no_think = 0, False
@@ -475,7 +476,10 @@ class AgentLoop(object):
 
             key = self._key(name, args)
             out, seconds = self._run_tool(name, args, key)
-            observation = clip(redact(out, self.cfg.redact))
+            # read stays whole up to its own budget; a hole in the middle of code is
+            # what the model then edits from memory
+            observation = clip(redact(out, self.cfg.redact),
+                               getattr(self.tools.get(name), "max_chars", OBS_MAX_CHARS))
             self.failures.record(key, failed(observation))
             yield "tool_result", {"name": name, "text": observation, "seconds": seconds,
                                   "error": observation.startswith("error:")}

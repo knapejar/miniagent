@@ -27,10 +27,11 @@ import time
 
 from . import paths
 from .jobs import JobRunner
-from .protocol import PLAN_HEADER, build_system, wrap_tool_response
+from .protocol import PLAN_HEADER, build_system, parse_tool_call, wrap_tool_response
 from .secrets import collect_env, register
 
 CHARS_PER_TOKEN = 3.4      # starting guess, calibrated against the server
+CROP_MAX_FILES = 25         # files listed in the crop marker
 
 
 class Session(object):
@@ -50,6 +51,7 @@ class Session(object):
         self.chars_per_token = CHARS_PER_TOKEN
         self.cropped = False           # flag that forces a goal reminder
         self.crops = 0
+        self.touched = {}              # path -> {tool: count} of cropped steps
         # role="tool" needs a matching assistant tool_calls field, which we do
         # not send: the history carries the call as text. A server that checks
         # answers 400 "orphan_tool_message", so the native dialect starts where
@@ -100,6 +102,7 @@ class Session(object):
         self.goal = ""
         self.anchor = 1
         self.cropped = False
+        self.touched = {}
         if getattr(self, "failures", None):
             self.failures.counts.clear()
         return dropped
@@ -205,8 +208,9 @@ class Session(object):
         current task and the most recent messages stay; everything between them
         becomes one marker.
 
-        TODO: summarise instead of dropping, and never summarise the sections
-        currently being worked on (last opened file / running command).
+        The marker lists the files those steps read and changed, so the model
+        comes out of a crop knowing which files it already touched and that
+        their content is no longer in front of it.
         """
         head = 3 if self.has_plan else 2
         tail = self.cfg.keep_tail
@@ -220,8 +224,8 @@ class Session(object):
         if anchored:
             cut = cut[:self.anchor - low] + cut[self.anchor - low + 1:]
         dropped = sum(_chars(m) for m in cut)
-        keep = [{"role": "user",
-                 "content": "[context cropped: %d earlier steps omitted]" % len(cut)}]
+        self._note_files(cut)
+        keep = [{"role": "user", "content": self._crop_marker(len(cut))}]
         if anchored:
             keep.append(self.messages[self.anchor])
         elif self.anchor >= high:                    # anchor still in the tail
@@ -232,6 +236,37 @@ class Session(object):
         self.cropped = True
         self.crops += 1
         return dropped
+
+    def _note_files(self, cut):
+        """Count the read/edit/write calls of the steps being cropped; an edit
+        or write whose answer was an error changed nothing and is left out."""
+        for i, message in enumerate(cut):
+            call = message["role"] == "assistant" and parse_tool_call(message.get("content") or "")
+            if not call or call[0] not in ("read", "edit", "write"):
+                continue
+            path = str((call[1] or {}).get("path") or "")
+            answer = (cut[i + 1].get("content") or "") if i + 1 < len(cut) else ""
+            answer = answer.replace("<tool_response>", "").lstrip()
+            if not path or (call[0] != "read" and answer.startswith("error")):
+                continue
+            counts = self.touched.setdefault(self._short(path), {})
+            counts[call[0]] = counts.get(call[0], 0) + 1
+
+    def _short(self, path):
+        try:
+            rel = os.path.relpath(os.path.join(self.cwd, path), self.cwd)
+        except ValueError:                        # another drive
+            return path
+        return path if rel.startswith("..") else rel
+
+    def _crop_marker(self, steps):
+        text = "[context cropped: %d earlier steps omitted]" % steps
+        if not self.touched:
+            return text
+        rows = ["  %s: %s" % (path, ", ".join("%s %dx" % kv for kv in sorted(counts.items())))
+                for path, counts in list(self.touched.items())[-CROP_MAX_FILES:]]
+        return (text + "\nFiles used in the omitted steps - their content is no longer in "
+                "view, read a file again before you edit it:\n" + "\n".join(rows))
 
     # ------------------------------------------------------------- reminder
     def reminder(self, step, max_steps):
