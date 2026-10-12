@@ -10,6 +10,7 @@ convention Claude Code uses, so the folder name still reads as a path:
         -> ~/.miniagent/projects/C--Users-Jarda-REPO-Moje-miniagent/
                memory/INDEX.md      notes the agent writes for its next run
                runs/*.jsonl         one trace per run
+               sessions/*.json      conversations /resume can pick up again
 
 Both halves sit side by side on purpose: the agent can grep its own history of
 this project the same way it greps anything else.
@@ -54,6 +55,10 @@ def memory_dir(cwd="."):
 
 def runs_dir(cwd="."):
     return os.path.join(project_dir(cwd), "runs")
+
+
+def sessions_dir(cwd="."):
+    return os.path.join(project_dir(cwd), "sessions")
 
 
 def memory_index(cwd="."):

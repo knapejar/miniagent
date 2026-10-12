@@ -8,6 +8,7 @@
 """
 import sys
 import threading
+import time
 import os
 
 from agent.config import EFFORTS, parse_args
@@ -38,6 +39,7 @@ HELP = """  commands
     /approve <mode>    auto | all | none
     /steps <n>         step limit per task
     /clear [all]       drop the conversation; the plan survives unless 'all'
+    /resume            continue a saved session (ctrl+a lists every project's)
     /edit <text>       replace the current task (e.g. after cancelling it)
     /memory            notes the agent keeps for this project
     /trace             path to the JSONL trace
@@ -97,15 +99,14 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
     loop = AgentLoop(cfg, session, client, tools, trace,
                      approve_fn=renderer.approval, cancel=cancel)
     renderer.metrics = loop.metrics
-    snapshot, memory = {}, None
+    snapshot, memory_due = {}, False
     watcher = CancelWatcher(cancel, session.background_key).start()
     try:
         for event, data in loop.run(task, on_delta=renderer.on_delta):
             renderer.handle(event, data)
             if event == "end":
                 snapshot = data.get("metrics") or {}
-                if data.get("memory_due") and not cancel.is_set():
-                    memory = MemoryJob(loop, renderer)
+                memory_due = data.get("memory_due") and not cancel.is_set()
     except KeyboardInterrupt:
         renderer._stop_spinner()
         print("\n  " + renderer.s.yellow("interrupted"))
@@ -118,6 +119,12 @@ def run_task(cfg, session, client, tools, trace, renderer, task):
         snapshot = loop.metrics.snapshot()
     finally:
         watcher.stop()
+    # Before the memory pass starts: it borrows session.messages for a while.
+    try:
+        session.save()
+    except OSError as e:
+        print("  " + renderer.s.yellow("session not saved: %s" % e))
+    memory = MemoryJob(loop, renderer) if memory_due else None
     return snapshot, watcher.typed(), memory
 
 
@@ -125,6 +132,33 @@ def connect_kaggle(cfg, renderer):
     """Point cfg at Qwen3.8 on the Kaggle TPU (agent/kaggle.py)."""
     from agent import kaggle
     return kaggle.setup(cfg, say=lambda text: print("  " + renderer.s.dim(text)))
+
+
+def resume(cfg, session, s):
+    """Pick a saved session and continue it where it was, directory included."""
+    from agent.session import saved_sessions
+    from ui.picker import choose
+
+    def rows(everything):
+        found = saved_sessions(None if everything else os.path.dirname(session.file))
+        return [("%s  %4d msgs  %s%s" % (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(f["time"])), f["messages"],
+            (os.path.basename(f["cwd"]) + "  ") if everything else "", " ".join(f["title"].split())),
+            f["path"]) for f in found]
+
+    path = choose(rows, s, "resume")
+    if not path:
+        return
+    try:
+        session.resume(path)
+    except (OSError, ValueError, KeyError) as e:
+        print("  " + s.red("cannot resume: %s" % e))
+        return
+    os.chdir(session.cwd)
+    cfg.workdir = session.cwd
+    print("  " + s.dim("resumed %d messages, task: " % len(session.messages))
+          + " ".join(session.goal.split())[:100])
+    print("  " + s.dim("cwd ") + session.cwd)
 
 
 def handle_command(line, cfg, session, renderer, trace, last):
@@ -248,6 +282,8 @@ def handle_command(line, cfg, session, renderer, trace, last):
         kept = "the plan is kept" if session.plan_text else "nothing kept"
         print("  " + s.dim("dropped %d messages; %s (/clear all drops the plan too)"
                            % (dropped, kept)))
+    elif cmd == "/resume":
+        resume(cfg, session, s)
     elif cmd == "/kaggle":
         if cfg.profile != "kaggle":
             print("  " + s.dim("start miniagent with --kaggle to use the Kaggle model"))

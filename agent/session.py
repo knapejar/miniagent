@@ -19,9 +19,13 @@ behind it would be prefilled again. Appending keeps the prefix intact and a new
 task costs only its own tokens. `anchor` is the index of the task being worked
 on now; cropping protects it wherever it sits.
 """
+import glob
+import json
 import os
 import threading
+import time
 
+from . import paths
 from .jobs import JobRunner
 from .protocol import PLAN_HEADER, build_system, wrap_tool_response
 from .secrets import collect_env, register
@@ -56,6 +60,10 @@ class Session(object):
         self.tool_role = "user" if self.dialect == "native" else "tool"
         self.jobs = JobRunner()
         self.background_key = threading.Event()   # ctrl+b, set by ui/keys.py
+        # Fixed here, not at save time: the agent's own `cd` moves self.cwd, and
+        # the session must keep landing in the project it was started in.
+        self.file = os.path.join(paths.sessions_dir(self.cwd),
+                                 time.strftime("%Y%m%d_%H%M%S") + ".json")
 
     # --------------------------------------------------------------- basics
     def start(self, task):
@@ -86,6 +94,39 @@ class Session(object):
         if getattr(self, "failures", None):
             self.failures.counts.clear()
         return dropped
+
+    def save(self):
+        """Write the conversation down so /resume can pick it up in a later run."""
+        if len(self.messages) < 2:
+            return
+        state = {"cwd": self.cwd, "goal": self.goal, "anchor": self.anchor,
+                 "has_plan": self.has_plan, "plan_text": self.plan_text,
+                 "messages": self.messages}
+        os.makedirs(os.path.dirname(self.file), exist_ok=True)
+        tmp = self.file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, self.file)              # a crash mid-write keeps the old copy
+
+    def resume(self, path):
+        """Continue a saved session: its conversation, plan and working directory.
+        The system prompt is rebuilt, so tools and project memory are today's."""
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        if not os.path.isdir(state["cwd"]):
+            raise OSError("the directory is gone: %s" % state["cwd"])
+        self.reset(keep_plan=False)
+        self.file = path
+        self.cwd = state["cwd"]
+        self.messages = state["messages"]
+        self.messages[0] = {"role": "system",
+                            "content": build_system(self.tools, self.cwd,
+                                                    secret_names=self.secret_names,
+                                                    dialect=self.dialect)}
+        self.goal, self.anchor = state["goal"], state["anchor"]
+        self.has_plan, self.plan_text = state["has_plan"], state["plan_text"]
+        if self.tool_role == "user":            # saved under a dialect that sent role=tool
+            self.downgrade_tool_role()
 
     def set_goal(self, text):
         """Replace the task being worked on, in place (`/edit`)."""
@@ -198,6 +239,25 @@ class Session(object):
         return ("\n\n[GOAL] %s\n[step %d/%d - keep going until the goal is fully done "
                 "and verified. Update the plan if anything changed status.]"
                 % (goal, step, max_steps))
+
+
+def saved_sessions(directory=None, limit=50):
+    """Saved sessions, newest first: those in `directory`, or every project's."""
+    pattern = os.path.join(directory or os.path.join(paths.home(), "projects", "*",
+                                                     "sessions"), "*.json")
+    # ponytail: parses each file whole; keep a small header if lists get slow
+    found = []
+    for path in sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)[:limit]:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            title = state["messages"][1]["content"]
+        except (OSError, ValueError, KeyError, IndexError):
+            continue
+        found.append({"path": path, "cwd": state.get("cwd", ""), "title": title,
+                      "messages": len(state["messages"]),
+                      "time": os.path.getmtime(path)})
+    return found
 
 
 def _chars(message):

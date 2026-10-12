@@ -1425,6 +1425,64 @@ class TestRepeatedArgumentKeys(unittest.TestCase):
                          ["https://a.example", "https://b.example"])
 
 
+class TestResume(unittest.TestCase):
+    """/resume continues a saved session, in the directory it was working in."""
+
+    def setUp(self):
+        import tempfile
+        self._home = os.environ.get(paths.ENV_HOME)
+        self.root = tempfile.mkdtemp()
+        os.environ[paths.ENV_HOME] = os.path.join(self.root, "home")
+        self.a, self.b = os.path.join(self.root, "a"), os.path.join(self.root, "b")
+        os.makedirs(self.a)
+        os.makedirs(self.b)
+
+    def tearDown(self):
+        if self._home is None:
+            os.environ.pop(paths.ENV_HOME, None)
+        else:
+            os.environ[paths.ENV_HOME] = self._home
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_saved_session_resumes_with_its_directory(self):
+        from agent.session import saved_sessions
+        old = Session(Config(workdir=self.b), default_tools())
+        old.start("TASK IN B")
+        old.set_plan("[x] step one")
+        old.add_assistant("done")
+        old.save()
+        here = Session(Config(workdir=self.a), default_tools())
+        self.assertEqual(saved_sessions(os.path.dirname(here.file)), [])
+        found = saved_sessions()                     # ctrl+a: every project
+        self.assertEqual([f["title"] for f in found], ["TASK IN B"])
+        here.resume(found[0]["path"])
+        self.assertEqual(here.cwd, self.b)
+        self.assertEqual(here.file, old.file)        # it keeps saving where it was
+        self.assertIn(self.b, here.messages[0]["content"])
+        self.assertIn("step one", here.messages[2]["content"])
+        self.assertEqual(here.messages[-1]["content"], "done")
+        self.assertEqual(here.goal, "TASK IN B")
+
+    def test_the_picker_switches_to_all_projects_on_ctrl_a(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from ui import picker
+        asked = []
+
+        def load(everything):
+            asked.append(everything)
+            return [("one", 1), ("two", 2)] if everything else [("only", 0)]
+
+        keys = iter(["\x01", "\x1b[B", "\r"])     # ctrl+a, down, enter
+        with mock.patch.object(picker.sys.stdin, "isatty", lambda: True), \
+                mock.patch.object(picker, "_keys", lambda: contextlib.nullcontext(
+                    lambda: next(keys))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(picker.choose(load, _Plain(), "resume"), 2)
+        self.assertEqual(asked, [False, True])
+
+
 class TestTypeAhead(unittest.TestCase):
     """The watcher owns the keyboard while the agent works. Keys that are not
     esc or ctrl+b used to be swallowed; they are kept for the next prompt now."""
