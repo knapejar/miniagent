@@ -140,6 +140,9 @@ class Config(object):
         # Share of max_tokens the reasoning may take before the reply is cut and
         # asked for again with less thinking; 0 turns the cap off.
         self.think_cap = kw.get("think_cap", 0.6)
+        # One effort level more where thinking pays: the first step, and the step
+        # after the code failed to run (loop.py).
+        self.think_boost = kw.get("think_boost", False)
 
         self.crop_at = kw.get("crop_at", 0.7)      # share of ctx that triggers cropping
         self.keep_tail = kw.get("keep_tail", 12)   # messages the crop keeps at the end
@@ -230,6 +233,8 @@ def parse_args(argv=None):
     g.add_argument("--dialect", choices=("auto",) + DIALECTS, default="auto",
                    help="tool-call format: spark | qwen (default: from the model name)")
     g.add_argument("--effort", choices=EFFORTS, help="reasoning effort")
+    g.add_argument("--think-boost", action="store_true",
+                   help="one effort level more on the first step and after a failing run")
     g.add_argument("--think-cap", type=float, metavar="SHARE",
                    help="cut a reply whose reasoning passes this share of "
                         "--max-tokens (default 0.6, 0 = off)")
@@ -292,7 +297,7 @@ def parse_args(argv=None):
         print("  default profile: %s (%s)" % (profile, set_default_profile(profile)))
     given = {name: getattr(a, name) for name in
              ("url", "model", "api_key", "effort", "ctx", "max_tokens",
-              "temperature", "top_p", "top_k", "think_cap",
+              "temperature", "top_p", "top_k", "think_cap", "think_boost",
               "approve") if getattr(a, name) is not None}
     if a.dialect != "auto":
         given["dialect"] = a.dialect

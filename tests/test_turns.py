@@ -213,6 +213,23 @@ class TestContext(unittest.TestCase):
         self.assertFalse(any("hmm" in (m.get("reasoning_content") or "") for m in session.messages))
 
 
+class TestThinkBoost(unittest.TestCase):
+    def run_loop(self, boost):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        client = Scripted(call("write", path="a.py", text="raise SystemExit(1)\n"),
+                          call("sh", cmd="python a.py"), call("plan", text="x"), "done", "done")
+        cfg = Config(workdir=root, max_steps=6, memory=False, effort="low", think_boost=boost)
+        list(AgentLoop(cfg, Session(cfg, default_tools()), client, default_tools()).run("GOAL"))
+        return client.efforts
+
+    def test_one_level_more_on_the_first_step_and_after_a_failing_run(self):
+        self.assertEqual(self.run_loop(True)[:4], ["medium", None, "medium", None])
+
+    def test_off_by_default(self):
+        self.assertEqual(set(self.run_loop(False)), {None})
+
+
 class TestReading(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

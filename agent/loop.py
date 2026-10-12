@@ -78,6 +78,7 @@ CODE_EXT = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", "
             ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php", ".lua", ".swift", ".sh",
             ".ps1", ".bat", ".cmd", ".asm")
 EXIT = re.compile(r"exit=(-?\d+)")
+LEVELS = ("none", "low", "medium", "high", "xhigh")
 # A plan line marked done; one more of them than before is a checkpoint.
 DONE = re.compile(r"(?im)^.*?(\bDONE\b|\[x\]|✓|✅)")
 
@@ -122,6 +123,7 @@ class AgentLoop(object):
         self._last_cmd = ""          # the last sh command, for a wait that finishes it
         self._checked = False        # the CHECK is asked once per task
         self._done = 0               # plan lines marked done so far
+        self._failed_run = False     # the last run of the code failed: think more next
 
     # ------------------------------------------------------------- helpers
     def _log(self, event, **fields):
@@ -234,6 +236,16 @@ class AgentLoop(object):
         found = EXIT.match(output.lstrip())
         if found and RUNS_CODE.search(cmd):
             self._changed, self._last_exit = [], int(found.group(1))
+            self._failed_run = self._last_exit != 0
+
+    def _boost(self, step):
+        """The effort for this step when think_boost raises it, else None."""
+        due = step == 1 or self._failed_run
+        self._failed_run = False
+        level = getattr(self.cfg, "effort", "default")
+        if not (getattr(self.cfg, "think_boost", False) and due) or level not in LEVELS[:-1]:
+            return None
+        return LEVELS[LEVELS.index(level) + 1]
 
     def _check(self):
         """The CHECK for an answer that came too early, or ""."""
@@ -402,6 +414,7 @@ class AgentLoop(object):
         self._since_plan = 0
         self._changed, self._last_exit, self._last_cmd, self._checked = [], None, "", False
         self._done = len(DONE.findall(self.session.plan_text))
+        self._failed_run = False
         self.hints.reset()
         self._log("task", task=task, model=self.cfg.model, config=self.cfg.as_dict())
 
@@ -418,7 +431,7 @@ class AgentLoop(object):
             while True:
                 try:
                     raw, usage = self._call_model(
-                        on_delta, "none" if self._no_think else None)
+                        on_delta, "none" if self._no_think else self._boost(step))
                     break
                 except LLMError as e:
                     limit = getattr(self.cfg, "outage_wait", 0) or 0
