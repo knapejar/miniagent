@@ -779,10 +779,11 @@ class TestFileEditing(unittest.TestCase):
         self.assertIn("edited", self.run_tool("edit", path="c.txt", old="name = 1", new="name = 2"))
         self.assertEqual(self.raw("c.txt"), data.replace(b"name = 1", b"name = 2"))
 
-    def test_a_bom_survives_an_edit(self):
+    def test_a_bom_survives_an_edit_and_an_append(self):
         self.put("b.txt", b"\xef\xbb\xbfone\n")
         self.run_tool("edit", path="b.txt", old="one", new="two")
-        self.assertEqual(self.raw("b.txt"), b"\xef\xbb\xbftwo\n")
+        self.run_tool("write", path="b.txt", text="three\n", append="true")
+        self.assertEqual(self.raw("b.txt"), b"\xef\xbb\xbftwo\nthree\n")
 
     def test_crop_marker_lists_the_files_it_drops(self):
         cfg = Config(workdir=self.workdir, ctx=1000, keep_tail=2)

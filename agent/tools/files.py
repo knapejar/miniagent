@@ -86,6 +86,8 @@ def load(path):
 
 
 def save(path, text, encoding="utf-8", newline="\n", mode="wb"):
+    if mode == "ab" and encoding == "utf-8-sig":
+        encoding = "utf-8"                        # the BOM belongs at the start only
     with open(path, mode) as fh:
         fh.write(text.replace("\r\n", "\n").replace("\n", newline).encode(encoding))
 
