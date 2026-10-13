@@ -1697,25 +1697,65 @@ class TestTypeAhead(unittest.TestCase):
         watcher = self.drive(["\r", "\n", "\t", "a"])
         self.assertEqual(watcher.typed(), "a")
 
-    def test_empty_push_back_is_a_success(self):
-        from ui.keys import push_back
-        self.assertTrue(push_back(""))          # nothing to hand over, nothing to echo
 
-    def test_push_back_reports_failure_instead_of_raising(self):
-        """The caller echoes the text itself when the terminal will not take it."""
-        from ui.keys import push_back
-        self.assertFalse(push_back("text"))     # pytest's stdin is not a console
+class TestPrompt(unittest.TestCase):
+    """input() sent a multi-line paste one line at a time, each its own task.
+    The prompt's editor keeps it as one unit until enter."""
 
-    @unittest.skipUnless(os.name == "nt", "windows console structures")
-    def test_the_console_records_match_the_win32_layout(self):
-        """A wrong size would make WriteConsoleInputW read past each record."""
-        import ctypes
-        from ui.keys import input_record_type
-        record = input_record_type()
-        self.assertEqual(ctypes.sizeof(record), 20)
-        buffer = (record * 2)()
-        buffer[0].Event.KeyEvent.uChar.UnicodeChar = "x"
-        self.assertEqual(buffer[0].Event.KeyEvent.uChar.UnicodeChar, "x")
+    def test_a_paste_is_one_unit_that_one_backspace_takes_out(self):
+        from ui.prompt import Line, Paste
+        line = Line("fix ")
+        self.assertIsNone(line.feed("a = 1\r\nb = 2\r\n"))     # the trailing break does not send it
+        self.assertIsInstance(line.units[-1], Paste)
+        self.assertTrue(line.units[-1].label.endswith(" +2 lines]"))
+        self.assertEqual(line.feed("\r"), "fix a = 1\nb = 2")
+        line = Line("x")
+        line.feed("one\rtwo")
+        line.feed("\x08")
+        self.assertEqual(line.feed("\r"), "x")
+
+    def test_keys_edit_the_line(self):
+        from ui.prompt import Line
+        line = Line()
+        for burst in ["a", "b", "c", "\x1b[D", "\x1b[D", "X", "\x1b[3~", "\x1b[F", "\x7f", "d"]:
+            line.feed(burst)
+        self.assertEqual(line.text(), "aXd")
+        self.assertEqual(Line().feed("ab\r"), "ab")               # a fast enter still sends
+        with self.assertRaises(KeyboardInterrupt):
+            Line("x").feed("\x03")
+
+    def test_up_brings_back_what_was_sent(self):
+        from unittest import mock
+        from ui import prompt
+        with mock.patch.object(prompt, "history", []):
+            prompt.Line().feed("first\r")
+            line = prompt.Line("draft")
+            line.feed("\x1b[A")
+            self.assertEqual(line.text(), "first")
+            line.feed("\x1b[B")
+            self.assertEqual(line.text(), "draft")
+
+    def test_a_paste_split_into_chunks_stays_one_paste(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from ui import prompt
+        bursts = [["l1\r", "l2\r", "l3"], ["\r"]]
+
+        def read():
+            return bursts[0].pop(0)
+
+        def ready(_timeout):
+            if not bursts[0]:
+                bursts.pop(0)
+                return False
+            return True
+        with mock.patch.object(prompt.sys.stdin, "isatty", lambda: True), \
+                mock.patch.object(prompt, "_reader", lambda: contextlib.nullcontext((read, ready))), \
+                mock.patch.object(prompt, "history", []), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(prompt.read_line(_Plain(), "> "), "l1\nl2\nl3")
+        self.assertIn("[Pasted text #", out.getvalue())
 
 
 class TestAsyncWebSwitch(unittest.TestCase):

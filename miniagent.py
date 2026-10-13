@@ -20,7 +20,8 @@ from agent.tools import default_tools
 from agent.tools.shell import kill_all
 from agent.trace import Trace
 from ui import ansi
-from ui.keys import CancelWatcher, push_back
+from ui.keys import CancelWatcher
+from ui.prompt import read_line
 from ui.render import Renderer
 
 VERSION = "0.2.0"
@@ -393,11 +394,8 @@ def main(argv=None):
     while True:
         try:
             # The memory pass may still be running; the prompt does not wait for
-            # it. Whatever was typed while the agent worked goes back into the
-            # terminal's input queue, so it arrives as an ordinary editable line.
-            echo = "" if push_back(typed) else typed
-            typed = ""
-            line = (echo + input(renderer.s.cyan("› ") + echo)).strip()
+            # it. Whatever was typed while the agent worked starts the line.
+            line, typed = read_line(renderer.s, "› ", typed).strip(), ""
         except (EOFError, KeyboardInterrupt):
             print()
             break

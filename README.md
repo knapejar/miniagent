@@ -254,6 +254,8 @@ stops the agent mid-token.
 
 !<command>    run a shell command directly, without the model
 esc           stop the agent immediately
+paste         a multi-line paste stays one [Pasted text #1 +12 lines] on the line;
+              one backspace takes it out, enter sends the text itself
 ```
 
 ## Options
@@ -310,13 +312,14 @@ agent/
 ui/
   ansi.py             colours, spinner, formatting
   keys.py             esc watcher
+  prompt.py           the prompt's line editor: pastes, history
   picker.py           arrow-key list for /model and /resume
   markdown.py         renders the model's markdown
   render.py           draws loop events
 hints/                one JSON file per tool
 tasks/                benchmark tasks: ten hard ones, three that edit this repository
 verify/               bench.py and an independent checker per task
-tests/                287 tests
+tests/                288 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be
