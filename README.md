@@ -115,7 +115,7 @@ profiles, and a profile's own keys win:
 | `effort_in_template` | `false` | send the effort as Qwen3.8 `chat_template_kwargs` (vLLM) |
 | `dialect` | `auto` | tool-call format: `spark` \| `qwen` \| `native`, by default from the model name |
 | `headers` | `{}` | extra HTTP headers the provider asks for |
-| `retries`, `outage_wait` | 0, 0 | retries on tunnel errors; seconds to wait out a server outage |
+| `retries`, `outage_wait` | 0, 0 | retries when the server cannot be reached, counted down on screen; seconds to wait out a server outage |
 | `<key>_env` | | an environment variable that replaces `<key>` when set |
 | `note` | | free text for you; miniagent ignores it |
 
@@ -253,7 +253,7 @@ stops the agent mid-token.
 /effort /approve /steps   /clear   /trace   /model   /resume  /undo   /quit
 
 !<command>    run a shell command directly, without the model
-esc           stop the agent immediately
+esc           stop the agent immediately, also while it waits for the server or to retry
 paste         a multi-line paste stays one [Pasted text #1 +12 lines] on the line;
               one backspace takes it out, enter sends the text itself
 ```
@@ -319,7 +319,7 @@ ui/
 hints/                one JSON file per tool
 tasks/                benchmark tasks: ten hard ones, three that edit this repository
 verify/               bench.py and an independent checker per task
-tests/                288 tests
+tests/                290 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be

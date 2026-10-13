@@ -4,6 +4,7 @@
 The Renderer is the only consumer of loop events. The loop itself prints
 nothing, so the UI can be replaced or switched off without touching the logic.
 """
+import math
 import os
 import sys
 import threading
@@ -71,9 +72,12 @@ class Renderer(object):
         self._reasoning = 0
         self._in_reasoning = False
         self._t0 = time.time()
+        self._retry_at = 0.0       # the client waits to try the server again until then
         self._md = MarkdownStream(self.s, self._emit)
 
     def _label(self):
+        if self._retry_at > time.time():
+            return "retrying in %ds   (esc to stop)" % math.ceil(self._retry_at - time.time())
         elapsed = time.time() - self._t0
         tps = self._tokens / elapsed if elapsed > 0 else 0.0
         extra = " · %s reasoning" % human_tokens(self._reasoning) if self._reasoning else ""
@@ -86,7 +90,13 @@ class Renderer(object):
         self.spinner.start()
 
     def on_delta(self, kind, piece):
-        """Called by the client for every chunk of the reply."""
+        """Called by the client for every chunk of the reply, and with
+        ("retry", (error, seconds)) when the server could not be reached."""
+        if kind == "retry":
+            error, wait = piece
+            self._emit(clear_line() + "  " + self.s.yellow("! " + error) + "\n")
+            self._retry_at = time.time() + wait
+            return
         self._tokens += 1
         if kind == "reasoning":
             self._reasoning += 1

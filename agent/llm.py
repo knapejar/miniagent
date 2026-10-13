@@ -7,6 +7,7 @@ No dependencies beyond the standard library.
 """
 import http.client
 import json
+import queue
 import threading
 import time
 import urllib.error
@@ -161,21 +162,45 @@ class LLMClient(object):
             raise box["e"]
         raise Cancelled()
 
-    def _watch(self, response, cancel):
-        """Close the socket when esc arrives, so a stream that has gone quiet
-        stops blocking the read instead of waiting for the next chunk."""
-        done = threading.Event()
-        if cancel is None:
-            return done
-        def run():
-            while not done.wait(0.1):
-                if cancel.is_set():
-                    response.close()
-                    return
-        threading.Thread(target=run, daemon=True).start()
-        return done
+    @staticmethod
+    def _lines(response, cancel):
+        """The response line by line, each read on request by a thread of its own,
+        which also closes it. Once the link is dead (wifi gone) a read blocks until
+        the timeout, and on Windows neither close() nor shutdown() from another
+        thread wakes it (measured) - waiting here instead lets esc and ctrl+c
+        through. Nothing is read ahead: a reply given up on is hung up on."""
+        wants, lines = queue.Queue(), queue.Queue()
 
-    def _request(self, messages, stream, cancel=None, effort=None):
+        def pump():
+            try:
+                with response:
+                    rows = iter(response)
+                    while wants.get():          # False: the reader is done
+                        lines.put(next(rows, None))
+            except BaseException as e:          # noqa: BLE001 - raised below, in the reader
+                lines.put(e)
+        threading.Thread(target=pump, daemon=True).start()
+        try:
+            wants.put(True)
+            while True:
+                try:
+                    raw = lines.get(timeout=0.1)
+                except queue.Empty:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    continue
+                if raw is None:
+                    return
+                if isinstance(raw, BaseException):
+                    raise raw
+                yield raw
+                wants.put(True)
+        finally:
+            wants.put(False)
+
+    def _request(self, messages, stream, cancel=None, effort=None, on_delta=None):
+        """Open the request. A connection that fails is tried again cfg.retries
+        times; on_delta("retry", (error, seconds)) hears of each wait."""
         data = json.dumps(self._body(messages, stream, effort)).encode("utf-8")
         retries = getattr(self.cfg, "retries", 0) or 0
         for attempt in range(retries + 1):
@@ -201,18 +226,22 @@ class LLMClient(object):
                     self.cfg.url, type(e).__name__, e), transient=True)
             if attempt == retries:
                 raise error
-            if cancel is not None and cancel.wait(RETRY_WAIT * (attempt + 1)):
-                raise error
+            wait = RETRY_WAIT * (attempt + 1)
+            if on_delta:
+                on_delta("retry", ("%s - retry %d/%d" % (error, attempt + 1, retries), wait))
+            if cancel is not None and cancel.wait(wait):
+                raise Cancelled()
             if cancel is None:
-                time.sleep(RETRY_WAIT * (attempt + 1))
+                time.sleep(wait)
 
     # ---------------------------------------------------------------- calls
     def chat(self, messages, on_delta=None, cancel=None, effort=None):
         """Return (text, Usage).
 
         `on_delta(kind, text)` receives chunks as they arrive, where kind is
-        "content" or "reasoning". `cancel` is a threading.Event; when it is set
-        the stream is abandoned and whatever arrived so far is returned.
+        "content" or "reasoning" - or "retry" with (error, seconds) before a
+        wait to try again. `cancel` is a threading.Event; when it is set the
+        stream is abandoned and whatever arrived so far is returned.
         `effort` overrides the configured reasoning effort for this one call.
         """
         if self.cfg.stream:
@@ -258,91 +287,87 @@ class LLMClient(object):
         cancelled = lambda: cancel is not None and cancel.is_set()
         try:
             cap = self.think_cap_chars if effort != "none" else 0
-            with self._request(messages, True, cancel, effort) as response:
-                watching = self._watch(response, cancel)
+            response = self._request(messages, True, cancel, effort, on_delta)
+            for raw in self._lines(response, cancel):
+                if cancel is not None and cancel.is_set():
+                    finish = "cancelled"
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
                 try:
-                    for raw in response:
-                        if cancel is not None and cancel.is_set():
-                            finish = "cancelled"
-                            break
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(payload)
-                        except ValueError:
-                            continue
-                        if isinstance(event.get("error"), dict):
-                            # vLLM reports a failure that happens after the 200 inside the stream
-                            message = str(event["error"].get("message", event["error"]))[:500]
-                            raise LLMError("server error mid-reply: %s" % message,
-                                           status=event["error"].get("code"),
-                                           transient="Engine" in message)
-                        if event.get("usage"):
-                            usage = event["usage"]
-                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
-                            completion_tokens = usage.get("completion_tokens", completion_tokens)
-                            reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
-                                "reasoning_tokens", reasoning_tokens)
-                        for choice in event.get("choices") or []:
-                            finish = choice.get("finish_reason") or finish
-                            delta = choice.get("delta") or {}
-                            piece = delta.get("content")
-                            thought = delta.get("reasoning_content") or delta.get("reasoning")
-                            for call in delta.get("tool_calls") or []:
-                                entry = calls.setdefault(call.get("index", 0),
-                                                         {"name": "", "arguments": ""})
-                                function = call.get("function") or {}
-                                entry["name"] = entry["name"] or function.get("name") or ""
-                                entry["arguments"] += function.get("arguments") or ""
-                                chunks += 1
-                                if ttft == 0.0:
-                                    ttft = time.time() - started
-                            if thought:
-                                reasoning_chars += len(thought)
-                                thoughts.append(thought)
-                                chunks += 1
-                                if ttft == 0.0:
-                                    ttft = time.time() - started
-                                if on_delta:
-                                    on_delta("reasoning", thought)
-                            if piece and call_end >= 0:
-                                # Past the call: normally just the end of the turn. The
-                                # model is let finish so the server still reports usage,
-                                # unless it starts writing the tool's answer itself.
-                                chunks += 1
-                                content += piece
-                            elif piece:
-                                chunks += 1
-                                if ttft == 0.0:
-                                    ttft = time.time() - started
-                                parts.append(piece)
-                                if not self.server_stop:
-                                    content += piece
-                                    if CALL_END in content[-len(piece) - len(CALL_END):]:
-                                        call_end = content.index(CALL_END) + len(CALL_END)
-                                        piece = piece[:len(piece) - (len(content) - call_end)]
-                                if on_delta and piece:
-                                    on_delta("content", piece)
-                        if call_end >= 0 and len(content) - call_end > OVERRUN_CHARS:
-                            finish = "stop"
-                            break
-                        if cap and not parts and reasoning_chars > cap:
-                            # Still inside <think> with the budget nearly gone: let it
-                            # run and the whole reply comes back empty. Cut here so the
-                            # loop can ask again with the thinking turned down, instead
-                            # of waiting minutes for nothing.
-                            finish = "think_cap"
-                            break
-                finally:
-                    watching.set()
+                    event = json.loads(payload)
+                except ValueError:
+                    continue
+                if isinstance(event.get("error"), dict):
+                    # vLLM reports a failure that happens after the 200 inside the stream
+                    message = str(event["error"].get("message", event["error"]))[:500]
+                    raise LLMError("server error mid-reply: %s" % message,
+                                   status=event["error"].get("code"),
+                                   transient="Engine" in message)
+                if event.get("usage"):
+                    usage = event["usage"]
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get("completion_tokens", completion_tokens)
+                    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
+                        "reasoning_tokens", reasoning_tokens)
+                for choice in event.get("choices") or []:
+                    finish = choice.get("finish_reason") or finish
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    thought = delta.get("reasoning_content") or delta.get("reasoning")
+                    for call in delta.get("tool_calls") or []:
+                        entry = calls.setdefault(call.get("index", 0),
+                                                 {"name": "", "arguments": ""})
+                        function = call.get("function") or {}
+                        entry["name"] = entry["name"] or function.get("name") or ""
+                        entry["arguments"] += function.get("arguments") or ""
+                        chunks += 1
+                        if ttft == 0.0:
+                            ttft = time.time() - started
+                    if thought:
+                        reasoning_chars += len(thought)
+                        thoughts.append(thought)
+                        chunks += 1
+                        if ttft == 0.0:
+                            ttft = time.time() - started
+                        if on_delta:
+                            on_delta("reasoning", thought)
+                    if piece and call_end >= 0:
+                        # Past the call: normally just the end of the turn. The
+                        # model is let finish so the server still reports usage,
+                        # unless it starts writing the tool's answer itself.
+                        chunks += 1
+                        content += piece
+                    elif piece:
+                        chunks += 1
+                        if ttft == 0.0:
+                            ttft = time.time() - started
+                        parts.append(piece)
+                        if not self.server_stop:
+                            content += piece
+                            if CALL_END in content[-len(piece) - len(CALL_END):]:
+                                call_end = content.index(CALL_END) + len(CALL_END)
+                                piece = piece[:len(piece) - (len(content) - call_end)]
+                        if on_delta and piece:
+                            on_delta("content", piece)
+                if call_end >= 0 and len(content) - call_end > OVERRUN_CHARS:
+                    finish = "stop"
+                    break
+                if cap and not parts and reasoning_chars > cap:
+                    # Still inside <think> with the budget nearly gone: let it
+                    # run and the whole reply comes back empty. Cut here so the
+                    # loop can ask again with the thinking turned down, instead
+                    # of waiting minutes for nothing.
+                    finish = "think_cap"
+                    break
         except Cancelled:
             finish = "cancelled"
         except (OSError, ValueError, http.client.HTTPException) as e:
-            if cancelled():          # our own watcher closed the socket
+            if cancelled():          # esc came while the error was on its way
                 finish = "cancelled"
             else:
                 # the tunnel or the server went away mid-reply (engine crash, tunnel drop)
