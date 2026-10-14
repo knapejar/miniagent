@@ -272,6 +272,28 @@ def parse_args(argv=None):
     g.add_argument("--no-memory", action="store_true",
                    help="skip the memory pass that runs after the answer")
     g.add_argument("--run-name", help="name of the trace file")
+    g = p.add_argument_group("headless (the same flags as Claude Code's print mode)")
+    g.add_argument("-p", "--print", action="store_true",
+                   help="run without the interactive UI and print the result")
+    g.add_argument("--output-format", choices=("text", "json", "stream-json"), default="text")
+    g.add_argument("--input-format", choices=("text", "stream-json"), default="text",
+                   help="stream-json: one user message per stdin line, the process "
+                        "keeps the conversation until stdin closes")
+    g.add_argument("--include-partial-messages", action="store_true",
+                   help="stream text and thinking deltas as stream_event lines")
+    g.add_argument("--verbose", action="store_true", help="accepted for compatibility")
+    g.add_argument("--session-id", metavar="UUID", help="id to save this conversation under")
+    g.add_argument("--resume", "-r", metavar="ID", help="continue a saved conversation by id")
+    g.add_argument("--append-system-prompt", metavar="TEXT", default="",
+                   help="added to the end of the system prompt")
+    g.add_argument("--mcp-config", action="append", metavar="JSON|FILE",
+                   help="MCP servers ({\"mcpServers\": {...}}); may be repeated")
+    g.add_argument("--strict-mcp-config", action="store_true",
+                   help="accepted for compatibility (no other MCP config is read)")
+    g.add_argument("--dangerously-skip-permissions", action="store_true",
+                   help="run every tool without asking (same as --approve none)")
+    g.add_argument("--disallowedTools", "--disallowed-tools", nargs="*", default=[],
+                   metavar="TOOL", help="tools the model is not offered")
     p.add_argument("-v", "--version", action="version", version="miniagent 0.2.0")
 
     a = p.parse_args(argv)
@@ -290,23 +312,31 @@ def parse_args(argv=None):
     # Interactive with nothing chosen starts without a model. A one-shot task has
     # nobody to ask, and --url/--model already say which model: both build on
     # local, as they always did.
-    profile = a.profile or default or ("local" if task or a.url or a.model else None)
+    profile = a.profile or default or ("local" if task or a.url or a.model or a.print else None)
     if profile is not None and profile not in profiles:
         p.error("unknown profile %r; --profile lists them" % profile)
     if a.set_default and profile:
         print("  default profile: %s (%s)" % (profile, set_default_profile(profile)))
     given = {name: getattr(a, name) for name in
              ("url", "model", "api_key", "effort", "ctx", "max_tokens",
-              "temperature", "top_p", "top_k", "think_cap", "think_boost",
-              "approve") if getattr(a, name) is not None}
+              "temperature", "top_p", "top_k", "think_cap", "think_boost")
+             if getattr(a, name) is not None}
     if a.dialect != "auto":
         given["dialect"] = a.dialect
     cfg = Config(profile=profile,
                  workdir=a.workdir, max_steps=a.max_steps,
                  crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
                  checkpoint_at=a.checkpoint_at,
-                 approve=a.approve or "none", stream=not a.no_stream, color=not a.no_color,
+                 approve="none" if a.dangerously_skip_permissions else (a.approve or "none"),
+                 stream=not a.no_stream, color=not a.no_color,
                  show_reasoning=not a.no_reasoning, redact=not a.no_redact,
                  async_web=a.async_web, memory=not a.no_memory, run_name=a.run_name,
                  spawn_proxy=not a.no_proxy, wait=a.wait, **given)
+    cfg.append_system = a.append_system_prompt
+    cfg.headless = None
+    if a.print:
+        cfg.headless = {"output_format": a.output_format, "input_format": a.input_format,
+                        "partial": a.include_partial_messages, "session_id": a.session_id,
+                        "resume": a.resume, "mcp_config": a.mcp_config or [],
+                        "disallowed": a.disallowedTools}
     return cfg, task

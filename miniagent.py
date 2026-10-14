@@ -354,6 +354,9 @@ def handle_command(line, cfg, session, renderer, trace, last):
 def main(argv=None):
     ansi.setup_stdio()
     cfg, task = parse_args(argv)
+    if cfg.headless is not None:               # -p: driven by a program, not a person
+        from agent.headless import main as headless
+        return headless(cfg, task)
     tools = default_tools()
     session = Session(cfg, tools)
     client = LLMClient(cfg, tools)

@@ -73,7 +73,8 @@ class Session(object):
 
     def _system(self):
         return {"role": "system", "content": build_system(
-            self.tools, self.cwd, secret_names=self.secret_names, dialect=self.dialect)}
+            self.tools, self.cwd, secret_names=self.secret_names, dialect=self.dialect,
+            append=getattr(self.cfg, "append_system", ""))}
 
     def set_dialect(self, dialect):
         """Another model took over (/model): its tool-call format goes into the

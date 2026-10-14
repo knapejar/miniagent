@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Run commands, in cmd.exe or PowerShell.
+"""Run commands, in cmd.exe or PowerShell - or in bash outside Windows.
 
 The model constantly mixes the two shells: it writes `$env:X = "y"; cmd`,
 `Get-Process | Where-Object {...}` or `| Select-String` and then sends it to
@@ -9,6 +9,9 @@ failures that no amount of prompting fixed.
 """
 import os
 import re
+import shlex
+import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -56,6 +59,15 @@ PS_SCRIPT = ('$ErrorActionPreference = "Continue"\n'
              '-Encoding utf8\n'
              '$host.SetShouldExit($__rc)\n')
 
+# Outside Windows there is one shell. Same contract as the two above: the exit
+# code and the final directory land in the state file.
+SH_SCRIPT = ('cd %s || exit 1\n'
+             '%s\n'
+             '__rc=$?\n'
+             'printf "%%s\\n%%s\\n" "$__rc" "$(pwd)" > %s\n'
+             'exit $__rc\n')
+WINDOWS = os.name == "nt"
+
 
 def looks_like_powershell(cmd):
     """True when the command uses syntax cmd.exe cannot parse."""
@@ -68,7 +80,9 @@ class ShellTool(object):
     name = "sh"
     description = ("Run a command. cmd.exe by default; PowerShell syntax is routed there "
                    "automatically. Multi-line input runs as a script, the working directory "
-                   "persists, and %% means a literal percent in cmd.")
+                   "persists, and %% means a literal percent in cmd." if WINDOWS else
+                   "Run a command in bash. Multi-line input runs as a script and the "
+                   "working directory persists.")
     params = {"cmd": {"type": "string"},
               "shell": {"type": "string", "description": "cmd or powershell, default: auto"}}
     required = ("cmd",)
@@ -81,7 +95,7 @@ class ShellTool(object):
 
     def summary(self, args):
         shell = self._pick(args.get("cmd", ""), args.get("shell"))
-        prefix = "" if shell == "cmd" else "[ps] "
+        prefix = "[ps] " if shell == "powershell" else ""
         return prefix + str(args.get("cmd", "")).replace("\n", " ; ")[:100]
 
     def needs_approval(self, args):
@@ -89,6 +103,8 @@ class ShellTool(object):
 
     @staticmethod
     def _pick(cmd, requested):
+        if not WINDOWS:
+            return "sh"
         if requested:
             return "powershell" if str(requested).lower().startswith(("p", "ps")) else "cmd"
         return "powershell" if looks_like_powershell(cmd) else "cmd"
@@ -100,7 +116,12 @@ class ShellTool(object):
         tmp = tempfile.mkdtemp(prefix="miniagent_")
         state = os.path.join(tmp, "state.txt")
 
-        if dialect == "powershell":
+        if dialect == "sh":
+            script_path = os.path.join(tmp, "run.sh")
+            body = SH_SCRIPT % (shlex.quote(ctx.cwd), cmd, shlex.quote(state))
+            argv = [shutil.which("bash") or "/bin/sh", script_path]
+            newline = "\n"
+        elif dialect == "powershell":
             script_path = os.path.join(tmp, "run.ps1")
             body = PS_SCRIPT % (_ps_quote(ctx.cwd), cmd, _ps_quote(state))
             argv = ["powershell", "-NoProfile", "-NonInteractive",
@@ -118,8 +139,10 @@ class ShellTool(object):
         output = os.path.join(tmp, "output.txt")
         with open(output, "wb") as sink:
             try:
+                # Its own process group, so a kill takes the children with it.
                 proc = subprocess.Popen(argv, stdout=sink, stderr=subprocess.STDOUT,
-                                        stdin=subprocess.DEVNULL, cwd=ctx.cwd)
+                                        stdin=subprocess.DEVNULL, cwd=ctx.cwd,
+                                        start_new_session=not WINDOWS)
             except FileNotFoundError as e:
                 return "error: cannot start %s (%s)" % (dialect, e)
         job = Running(_registry(ctx), cmd, dialect, proc, output, state)
@@ -255,7 +278,7 @@ def finish(ctx, job):
             except OSError:
                 raw = b""
             out = raw.decode("utf-8", "replace").strip() or "(no output)"
-            label = "" if job.dialect == "cmd" else "  shell=powershell"
+            label = "  shell=powershell" if job.dialect == "powershell" else ""
             job.done = "exit=%d  (%.1fs)%s  cwd=%s\n%s" % (
                 job.proc.returncode, job.elapsed(), label, ctx.cwd, out)
         _registry(ctx).pop(job.id, None)
@@ -278,6 +301,11 @@ def kill(ctx, job):
         if os.name == "nt":               # cmd.exe/powershell would leave children running
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(job.proc.pid)],
                            capture_output=True)
+        else:
+            try:
+                os.killpg(job.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
         try:
             job.proc.kill()
         except OSError:

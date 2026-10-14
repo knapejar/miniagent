@@ -28,6 +28,7 @@ the system prompt the way Qwen's template does, and the parser reads both.
 """
 import json
 import os
+import platform
 import re
 
 from . import paths, workspace
@@ -150,11 +151,15 @@ def dialect_for(model):
     return "spark" if "spark" in name else "native"
 
 
-def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names=(),
-                 dialect="spark"):
+def build_system(tools, cwd, os_name=None, shell=None, secret_names=(),
+                 dialect="spark", append=""):
+    windows = os.name == "nt"
+    os_name = os_name or ("Windows 11" if windows else platform.system() or "Linux")
+    shell = shell or ("cmd.exe" if windows else "bash")
     secrets = ""
     if secret_names:
-        secrets = ("\nSecrets available as environment variables, referenced as %NAME% in sh. "
+        secrets = ("\nSecrets available as environment variables, referenced as %s in sh. "
+                   % ("%NAME%" if windows else "$NAME") +
                    "Their values are never shown to you and must never be typed out: "
                    + ", ".join(sorted(secret_names)))
     if dialect == "native":
@@ -165,11 +170,13 @@ def build_system(tools, cwd, os_name="Windows 11", shell="cmd.exe", secret_names
     else:
         block = (QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS).format(
             tools=render_tools(tools, dialect))
-    return SYSTEM_TEMPLATE.format(tools_block=block,
+    text = SYSTEM_TEMPLATE.format(tools_block=block,
                                   cwd=cwd, workspace=workspace.snapshot(cwd),
                                   os_name=os_name, shell=shell, secrets=secrets,
                                   state_dir=paths.project_dir(cwd),
                                   memory=_load_memory(cwd))
+    # --append-system-prompt: the caller's own instructions go last.
+    return text + ("\n\n" + append.strip() if append and append.strip() else "")
 
 
 def strip_think(text):

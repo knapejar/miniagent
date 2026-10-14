@@ -44,7 +44,8 @@ Issue #2378, opened by wszbdy on 7 September 2026.
 
 ## Requirements
 
-- **Windows 11** (Windows 10 works too; the shell tool targets `cmd.exe` and PowerShell)
+- **Windows 11** (Windows 10 works too; the shell tool targets `cmd.exe` and PowerShell).
+  Linux and macOS work as well - there the shell tool runs bash.
 - **Python 3.8+** — no third-party packages, standard library only
 - A local model server. [LM Studio](https://lmstudio.ai/) is the shortest path.
 - Optional: **Docker**, for a local SearXNG that makes web search reliable
@@ -258,6 +259,57 @@ paste         a multi-line paste stays one [Pasted text #1 +12 lines] on the lin
               one backspace takes it out, enter sends the text itself
 ```
 
+## Headless: driven by another program
+
+`-p` runs miniagent without the interactive UI, with the same flags and the same
+JSON stream as Claude Code's print mode - so a program that already drives
+`claude -p` drives miniagent without changes:
+
+```bat
+python miniagent.py -p "summarize README.md"                      :: just the answer
+python miniagent.py -p "summarize README.md" --output-format json :: one result object
+python miniagent.py -p --input-format stream-json --output-format stream-json ^
+       --include-partial-messages --session-id 6f0c...  --profile big
+```
+
+With `--input-format stream-json` the process stays up and takes one message per
+stdin line until stdin closes; tasks run one after another in one conversation:
+
+```json
+{"type": "user", "message": {"role": "user", "content": "fix the failing test"}}
+{"type": "control_request", "request_id": "r1", "request": {"subtype": "interrupt"}}
+{"type": "control_request", "request_id": "r2", "request": {"subtype": "get_context_usage"}}
+```
+
+`interrupt` stops the running task the way esc does. Every stdout line is one
+event: `system`/`init` (session id, model, tools, MCP servers), `stream_event`
+(text and thinking deltas, tool_use starts - with `--include-partial-messages`),
+`assistant` (text and `tool_use` blocks), `user` (`tool_result` blocks),
+`system`/`compact_boundary` when the context was cropped, and a `result` that
+closes each task with its answer, duration and token counts. A content of
+`/compact` crops the conversation on demand.
+
+The conversation is saved under its id in `~/.miniagent/projects/<slug>/sessions/`;
+`--resume <id>` continues it in a later process, and an unknown id fails with
+`No conversation found with session ID`.
+
+| flag | what |
+|---|---|
+| `-p`, `--print` | headless; the task comes from the arguments, stdin or the stream |
+| `--output-format` | `text` (default) \| `json` \| `stream-json` |
+| `--input-format` | `text` (default) \| `stream-json` |
+| `--include-partial-messages` | stream deltas as `stream_event` lines |
+| `--session-id`, `--resume` | name a new conversation, continue a saved one |
+| `--append-system-prompt` | your instructions after the built-in system prompt |
+| `--mcp-config` | MCP servers, `{"mcpServers": {...}}` inline or a file; repeatable |
+| `--disallowedTools` | tools the model is not offered |
+| `--dangerously-skip-permissions` | never ask (the default in headless mode anyway) |
+| `--verbose`, `--strict-mcp-config` | accepted, nothing to change |
+
+**MCP servers.** stdio servers (`command`, `args`, `env`) and HTTP ones (`type:
+"http"`, `url`, `headers`) are started next to the agent; each of their tools is
+offered as `mcp__<server>__<tool>`. `--mcp-config` is read in headless mode.
+
 ## Options
 
 ```
@@ -293,6 +345,8 @@ paste         a multi-line paste stays one [Pasted text #1 +12 lines] on the lin
 miniagent.py          entry point, REPL, slash commands
 agent/
   config.py           settings, arguments, profiles (local + ~/.miniagent/profiles)
+  headless.py         -p: the Claude Code-compatible print mode and JSON stream
+  mcp.py              MCP client: servers' tools as mcp__<server>__<tool>
   connectors/         what brings a backend up: lmstudio, llamacpp, kaggle
   protocol.py         tool-call formats (spark, qwen, native), system prompt
   llm.py              OpenAI-compatible client, streaming, cancellation
@@ -319,7 +373,7 @@ ui/
 hints/                one JSON file per tool
 tasks/                benchmark tasks: ten hard ones, three that edit this repository
 verify/               bench.py and an independent checker per task
-tests/                290 tests
+tests/                299 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be

@@ -294,6 +294,7 @@ class TestTools(unittest.TestCase):
         self.assertIn("exit=0", out)
         self.assertIn("hello", out)
 
+    @unittest.skipUnless(os.name == "nt", "cmd.exe and PowerShell")
     def test_shell_propagates_exit_code(self):
         self.assertIn("exit=3", self.tools["sh"].run(self.session, cmd="exit /b 3"))
 
@@ -301,15 +302,18 @@ class TestTools(unittest.TestCase):
         self.tools["sh"].run(self.session, cmd="mkdir sub 2>nul\ncd sub\necho inside")
         self.assertTrue(self.session.cwd.lower().endswith("sub"))
 
+    @unittest.skipUnless(os.name == "nt", "cmd.exe and PowerShell")
     def test_shell_literal_percent(self):
         out = self.tools["sh"].run(self.session, cmd='python -c "print(\'%%d\' %% 7)"')
         self.assertIn("7", out)
 
+    @unittest.skipUnless(os.name == "nt", "cmd.exe and PowerShell")
     def test_powershell_is_routed_automatically(self):
         out = self.tools["sh"].run(self.session, cmd='$env:MINI_T = "ok"; Write-Host $env:MINI_T')
         self.assertIn("shell=powershell", out)
         self.assertIn("ok", out)
 
+    @unittest.skipUnless(os.name == "nt", "cmd.exe and PowerShell")
     def test_powershell_objects_are_not_lost(self):
         out = self.tools["sh"].run(self.session, cmd="Get-Location | Select-Object Path\n"
                                                      "cmd /c exit 3", shell="powershell")
@@ -468,7 +472,7 @@ class TestSecretEnv(unittest.TestCase):
     def test_names_reach_the_system_prompt(self):
         prompt = build_system(default_tools(), r"C:\ws", secret_names=["GH_TOKEN"])
         self.assertIn("GH_TOKEN", prompt)
-        self.assertIn("%NAME%", prompt)
+        self.assertIn("%NAME%" if os.name == "nt" else "$NAME", prompt)
 
 
 class TestAskTool(unittest.TestCase):
