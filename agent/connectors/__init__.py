@@ -7,6 +7,7 @@ A profile names one with "connector" (default lmstudio). Each module has
     status(cfg)      (ready, note) without starting anything, for /model
 """
 import importlib
+import threading
 
 from ..jobs import parallel
 
@@ -41,11 +42,33 @@ def status(cfg):
 def overview():
     """[(provider, name, model, url, ready, note)] for every profile, sorted
     by provider; the servers are asked in parallel."""
+    cfgs = _configs()
+    return _rows(cfgs, parallel(cfgs, status))
+
+
+def overview_live():
+    """overview() without the wait, for the /model picker: (rows, busy).
+    rows() is overview() so far - a server not answered yet says "asking..." -
+    and busy() is true while one is still out. The order does not change."""
+    cfgs = _configs()
+    states = [None] * len(cfgs)
+
+    def ask(i):
+        states[i] = status(cfgs[i])
+    for i in range(len(cfgs)):
+        # daemon: a server that hangs to its timeout must not hold up quitting
+        threading.Thread(target=ask, args=(i,), daemon=True).start()
+    return (lambda: _rows(cfgs, [s or (False, "asking...") for s in states]),
+            lambda: None in states)
+
+
+def _configs():
     from ..config import Config, load_profiles
-    profiles = load_profiles()
-    cfgs = [Config(profile=name) for name in profiles]
-    rows = [(c.provider, c.profile, c.model, c.url) + s
-            for c, s in zip(cfgs, parallel(cfgs, status))]
+    return [Config(profile=name) for name in load_profiles()]
+
+
+def _rows(cfgs, states):
+    rows = [(c.provider, c.profile, c.model, c.url) + s for c, s in zip(cfgs, states)]
     return sorted(rows, key=lambda r: (r[0] != "lmstudio", r[0], r[1]))
 
 

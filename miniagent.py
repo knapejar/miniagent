@@ -147,22 +147,22 @@ def choose_model(cfg, session, renderer, name=""):
     """/model: show every profile with its state, switch to the one picked and
     bring it up - start LM Studio, load the model, whatever its connector does."""
     from agent.config import load_profiles
-    from agent.connectors import overview, row_text
+    from agent.connectors import overview, overview_live, row_text
     from ui.picker import choose
     s = renderer.s
     try:
         names = load_profiles()
         if not name:
-            print("  " + s.dim("asking %d profiles..." % len(names)))
-            rows = overview()
-            print("\x1b[1A\r\x1b[K", end="")        # the line above goes
             if not sys.stdin.isatty():
-                for row in rows:
+                for row in overview():
                     print("    " + row_text(row, cfg.profile))
                 return
-            current = [i for i, r in enumerate(rows) if r[1] == cfg.profile]
-            name = choose(lambda _all: [(row_text(r, cfg.profile), r[1]) for r in rows], s,
-                          "model", empty="no profiles", at=current[0] if current else 0)
+            # The list shows at once; each server's state fills in as it answers.
+            rows, busy = overview_live()
+            current = [i for i, r in enumerate(rows()) if r[1] == cfg.profile]
+            name = choose(lambda _all: [(row_text(r, cfg.profile), r[1]) for r in rows()], s,
+                          "model", empty="no profiles", at=current[0] if current else 0,
+                          busy=busy)
             if not name:
                 return
     except ValueError as e:                    # a broken profile file

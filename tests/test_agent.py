@@ -1653,6 +1653,27 @@ class TestResume(unittest.TestCase):
             self.assertEqual(picker.choose(load, _Plain(), "resume", toggle=("a", "b")), 2)
         self.assertEqual(asked, [False, True])
 
+    def test_the_picker_reloads_while_busy_and_once_after(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from ui import picker
+        busy, loads, reads = iter([True, True, False]), [], []
+
+        def load(_all):
+            loads.append(1)
+            return [("row", 7)]
+
+        def read(timeout=None):
+            reads.append(timeout)
+            return None if timeout else "\r"          # nothing typed while it waits
+        with mock.patch.object(picker.sys.stdin, "isatty", lambda: True), \
+                mock.patch.object(picker, "_keys", lambda: contextlib.nullcontext(read)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(picker.choose(load, _Plain(), "model", busy=lambda: next(busy)), 7)
+        self.assertEqual(reads, [0.1, 0.1, None])     # blocks only once nothing is out
+        self.assertEqual(len(loads), 4)               # up front, each round, and after the last answer
+
 
 class TestTypeAhead(unittest.TestCase):
     """The watcher owns the keyboard while the agent works. Keys that are not

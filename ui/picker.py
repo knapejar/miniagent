@@ -4,6 +4,7 @@ import contextlib
 import os
 import shutil
 import sys
+import time
 
 UP, DOWN, TOGGLE, ENTER, CANCEL = "up", "down", "toggle", "enter", "cancel"
 KEYS = {"\x1b[A": UP, "\x1bOA": UP, "\x00H": UP, "\xe0H": UP, "k": UP,
@@ -13,9 +14,11 @@ KEYS = {"\x1b[A": UP, "\x1bOA": UP, "\x00H": UP, "\xe0H": UP, "k": UP,
 ROWS = 12
 
 
-def choose(load, style, title, toggle=None, empty="nothing to choose", at=0):
+def choose(load, style, title, toggle=None, empty="nothing to choose", at=0, busy=None):
     """`load(everything)` returns [(text, value)]; with toggle=(off label, on
-    label) ctrl+a flips `everything`. The cursor starts on row `at`.
+    label) ctrl+a flips `everything`. The cursor starts on row `at`. While
+    `busy()` is true the rows are still filling in: they are loaded again
+    and redrawn every 0.1 s.
     Returns the chosen value; None on esc or when stdin is not a terminal."""
     if not sys.stdin.isatty():
         return None
@@ -24,11 +27,14 @@ def choose(load, style, title, toggle=None, empty="nothing to choose", at=0):
     try:
         with _keys() as read:
             while True:
+                waiting = busy is not None and busy()   # before load, or the last answer is missed
+                if busy is not None:
+                    rows = load(everything)
                 header = title
                 if toggle:
                     header += "  %s  ·  ctrl+a %s" % (toggle[everything], toggle[not everything])
                 drawn = _draw(rows, at, drawn, style, header + "  ·  ↑↓ enter esc", empty)
-                key = KEYS.get(read())
+                key = KEYS.get(read(0.1) if waiting else read())
                 if key == UP:
                     at = max(0, at - 1)
                 elif key == DOWN:
@@ -68,21 +74,34 @@ def _draw(rows, at, drawn, style, header, empty=""):
 
 @contextlib.contextmanager
 def _keys():
-    """A reader of single keypresses; an arrow comes back as one string."""
+    """A reader of single keypresses; an arrow comes back as one string.
+    read(timeout) gives None when no key came within timeout seconds."""
     if os.name == "nt":
         import msvcrt
 
-        def read():
+        def read(timeout=None):
+            if timeout is not None:
+                end = time.monotonic() + timeout
+                while not msvcrt.kbhit():
+                    if time.monotonic() >= end:
+                        return None
+                    time.sleep(0.01)
             key = msvcrt.getwch()
             return key + msvcrt.getwch() if key in ("\x00", "\xe0") else key
         yield read
         return
+    import select
     import termios
     import tty
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+
+    def read(timeout=None):
+        if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+            return None
+        return os.read(fd, 16).decode("utf-8", "ignore")
     try:
-        yield lambda: os.read(fd, 16).decode("utf-8", "ignore")
+        yield read
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
