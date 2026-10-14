@@ -115,6 +115,8 @@ profiles, and a profile's own keys win:
 | `effort` | `low` | `default` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` |
 | `effort_in_template` | `false` | send the effort as Qwen3.8 `chat_template_kwargs` (vLLM) |
 | `dialect` | `auto` | tool-call format: `spark` \| `qwen` \| `native`, by default from the model name |
+| `multi_call` | `auto` | tool calls one reply may carry: 8 in the `native` dialect, 1 for `spark` and `qwen` |
+| `crop_at` | 0.7 | share of `ctx` that triggers cropping; a paid API may want it lower |
 | `headers` | `{}` | extra HTTP headers the provider asks for |
 | `retries`, `outage_wait` | 0, 0 | retries when the server cannot be reached, counted down on screen; seconds to wait out a server outage |
 | `<key>_env` | | an environment variable that replaces `<key>` when set |
@@ -208,6 +210,17 @@ the fix. `hints/` holds one JSON file per tool — `{"when": regex, "say": text}
 teaching it a new recovery is one entry rather than a code change. `MINIAGENT_HINTS`
 merges in a directory of your own.
 
+**Several calls per step, where the model can.** Every step sends the whole
+conversation again, so a model that makes one call per step pays for the history
+once per call - one hosted run spent 10M prompt tokens on 206 single calls. In the
+`native` dialect a reply may carry up to `multi_call` calls (8 by default): the
+system prompt asks the model to batch independent calls, they run in order and
+their results go back together in one message. Spark and Qwen, whose format
+miniagent writes into the prompt, keep one call per step and the prompt they were
+tuned on. `--max-task-tokens` caps the prompt tokens of one task: past it the run
+answers with what it has instead of spending on. Cached prompt tokens, when the
+server reports them, are counted in the trace and the headless `result`.
+
 **Guards for long runs.** An empty or truncated reply is never mistaken for a finished
 task. A call that fails three times the same way is blocked. Progress is measured as
 novelty, so browsing eleven different pages is left alone while three calls that bring
@@ -237,7 +250,8 @@ is printed over the line you are typing on - the result lands above the next
 prompt as one collapsed line, and `/memory` shows what it wrote. Submitting the
 next task cuts the pass short if it is still going. Its own messages are dropped
 from the history afterwards. It costs one model call per finished task, and
-`--no-memory` turns it off.
+`--no-memory` turns it off, and also leaves the memory and the pointer to old
+runs out of the system prompt - for a host program that keeps its own.
 
 **Rendered answers.** Bold, italic, headings, lists, quotes, code fences, aligned
 tables and highlighted links, streamed as they arrive.
@@ -322,6 +336,8 @@ offered as `mcp__<server>__<tool>`. `--mcp-config` is read in headless mode.
     --ctx N              context window (default 65536)
     --max-steps N        step limit per task (default 60)
     --max-tokens N       generation limit per step (default 8192)
+    --multi-call N       tool calls one reply may carry (default 8 native, 1 spark/qwen)
+    --max-task-tokens N  prompt tokens one task may spend before it answers (0 = no limit)
     --dialect NAME       auto | spark | qwen (tool-call format)
     --effort LEVEL       default | none | low | medium | high | xhigh
     --temperature F      default 1.0
@@ -373,7 +389,7 @@ ui/
 hints/                one JSON file per tool
 tasks/                benchmark tasks: ten hard ones, three that edit this repository
 verify/               bench.py and an independent checker per task
-tests/                299 tests
+tests/                313 tests
 ```
 
 The loop is a generator of events and prints nothing itself, so the interface can be

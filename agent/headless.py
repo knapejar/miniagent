@@ -281,22 +281,28 @@ class Headless(object):
                          approve_fn=None, cancel=cancel)
         step = Step(self.out, self.opts["partial"])
         final, reason, error, memory_due = "", "final", None, False
-        tokens = {"input_tokens": 0, "output_tokens": 0}
+        tokens = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         tool_id = None
         try:
             for event, data in loop.run(text, on_delta=step.on_delta):
                 if event == "step":
                     step.start()
+                    # Saved as it goes, not only at the end: a process killed
+                    # mid-task (a stop that did not land, a restart) still leaves a
+                    # conversation that --resume finds.
+                    self.save()
                 elif event == "usage":
                     usage = data["usage"]
                     tokens["input_tokens"] += usage.prompt_tokens or 0
                     tokens["output_tokens"] += usage.completion_tokens or 0
+                    tokens["cache_read_input_tokens"] += getattr(usage, "cached_tokens", 0) or 0
                 elif event == "tool_call":
                     tool_id = "toolu_" + uuid.uuid4().hex[:24]
-                    step.tool_start(tool_id, data["name"])
-                    step.finish()
-                    said = self.session.messages[-1].get("content") or ""
-                    prose = said.split("<tool_call>", 1)[0].strip()
+                    if step.open:
+                        step.tool_start(tool_id, data["name"])
+                        step.finish()
+                    # several calls of one reply: the prose goes with the first
+                    prose = data.get("prose", "")
                     blocks = [{"type": "text", "text": prose}] if prose else []
                     blocks.append({"type": "tool_use", "id": tool_id, "name": data["name"],
                                    "input": data["args"]})
@@ -331,15 +337,18 @@ class Headless(object):
         finally:
             step.finish()
             self.cancel = None
-        try:
-            self.session.save()
-        except OSError as e:
-            say("session not saved: %s" % e)
+        self.save()
         is_error = reason == "error"
         self.result(started, final if not is_error else (error or "error"), is_error,
                     reason, tokens, loop.metrics.steps)
         if memory_due:
             self.memory(loop)
+
+    def save(self):
+        try:
+            self.session.save()
+        except OSError as e:
+            say("session not saved: %s" % e)
 
     def assistant(self, blocks):
         self.out.emit({"type": "assistant", "session_id": self.session_id,

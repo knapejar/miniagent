@@ -18,7 +18,8 @@ from .guards import FailureMemory, Progress, ResultRepeat, digest, failed
 from .hints import Hints
 from .jobs import JOB_WAIT
 from .metrics import Metrics
-from .protocol import example_call, extract_think, malformed, parse_tool_call, strip_think
+from .protocol import (example_call, extract_think, malformed, parse_tool_call,
+                       parse_tool_calls, strip_think)
 from .secrets import redact
 from .tools.shell import auto_background
 
@@ -394,6 +395,10 @@ class AgentLoop(object):
         yield "end", {"reason": "forced", "metrics": self.metrics.snapshot(),
                       "memory_due": bool(getattr(self.cfg, "memory", True))}
 
+    def _over_budget(self):
+        budget = getattr(self.cfg, "max_task_tokens", 0) or 0
+        return budget and self.metrics.prompt_tokens >= budget
+
     def _last_observation(self):
         for message in reversed(self.session.messages):
             if message["role"] in ("tool", "user") and message is not self.session.messages[0]:
@@ -456,6 +461,8 @@ class AgentLoop(object):
                 yield "crop", {"chars": self._pending_crop, "n": self.metrics.crops}
                 self._pending_crop = 0
             yield "usage", {"usage": usage}
+            self._log("usage", step=step, pt=usage.prompt_tokens,
+                      cached=getattr(usage, "cached_tokens", 0), ct=usage.completion_tokens)
 
             if self._cancelled():
                 self._log("cancelled", step=step)
@@ -463,7 +470,8 @@ class AgentLoop(object):
                 return
 
             body = strip_think(raw)
-            call = parse_tool_call(body)
+            calls = parse_tool_calls(body, getattr(self.cfg, "multi_call", 1) or 1)
+            call = calls[0] if calls else None
             reasoning = "\n".join(t for t in (getattr(usage, "reasoning", ""),
                                               extract_think(raw)) if t)
             # An empty reply or a cut-off at the token limit is NOT a finished
@@ -522,7 +530,26 @@ class AgentLoop(object):
                               "memory_due": bool(getattr(self.cfg, "memory", True))}
                 return
 
-            if usage.finish_reason == "length":
+            if self._over_budget():
+                # A paid API bills the whole context on every step; a run that
+                # did not finish within its budget is not going to in the next
+                # hundred steps either. Answer from what is known.
+                self._log("budget", step=step, prompt_tokens=self.metrics.prompt_tokens)
+                for event in self._force_answer(
+                        step, on_delta, "token budget of %d prompt tokens reached"
+                        % self.cfg.max_task_tokens):
+                    yield event
+                return
+
+            cut_note = ""
+            if usage.finish_reason == "length" and len(calls) > 1:
+                # The last of several calls was cut off: the ones before it are
+                # whole, so they run, and the model hears the last one did not.
+                self._log("truncated_call", step=step, tool=calls[-1][0])
+                calls = calls[:-1]
+                cut_note = ("\n\n[ERROR] Your last tool call was cut off at the token limit "
+                            "and was NOT run - make it again, smaller.")
+            elif usage.finish_reason == "length":
                 # Cut off mid-call: the arguments are incomplete, so running it
                 # would act on a fragment - which is how a write once truncated a
                 # file to zero bytes.
@@ -537,9 +564,8 @@ class AgentLoop(object):
                 continue
 
             self._empty, self._no_think = 0, False
-            name, args = call
-            if malformed(args):
-                self._log("malformed_call", step=step, tool=name)
+            if len(calls) == 1 and malformed(calls[0][1]):
+                self._log("malformed_call", step=step, tool=calls[0][0])
                 yield "note", {"level": "warn",
                                "text": "malformed tool call (nested markup) - not run"}
                 self.session.add_observation(
@@ -549,49 +575,66 @@ class AgentLoop(object):
                     + " and its values are plain text."
                     + self.session.reminder(step, self.cfg.max_steps))
                 continue
-            if name != "wait":
+            if any(name != "wait" for name, _ in calls):
                 for text in auto_background(self.session):
                     self._log("auto_background", step=step, text=text[:200])
                     yield "note", {"level": "info", "text": "undecided command: " + text[:140]}
-            yield "tool_call", {"name": name, "args": args, "tool": self.tools.get(name)}
 
-            key = self._key(name, args)
-            out, seconds = self._run_tool(name, args, key)
-            # read stays whole up to its own budget; a hole in the middle of code is
-            # what the model then edits from memory
-            observation = clip(redact(out, self.cfg.redact),
-                               getattr(self.tools.get(name), "max_chars", OBS_MAX_CHARS))
-            self.failures.record(key, failed(observation))
-            self._track(name, args, observation)
-            yield "tool_result", {"name": name, "text": observation, "seconds": seconds,
-                                  "error": observation.startswith("error:")}
-            checkpoint = False
-            if name == "plan":
-                self._since_plan = 0
-                yield "plan", {"text": self.session.plan_text}
-                self._log("plan", step=step, text=self.session.plan_text)
-                done = len(DONE.findall(self.session.plan_text))
-                share = getattr(self.cfg, "checkpoint_at", 0)
-                checkpoint = done > self._done and share and \
-                    self.session.estimated_tokens() > self.cfg.ctx * share
-                self._done = max(self._done, done)
-            else:
-                self._since_plan += 1
+            prose = body.split("<tool_call>", 1)[0].strip()
+            observations, warning, checkpoint, keys = [], "", False, []
+            for index, (name, args) in enumerate(calls):
+                if index and self._cancelled():
+                    observations.append("error: not run - the run was stopped")
+                    break
+                if malformed(args):
+                    self._log("malformed_call", step=step, tool=name)
+                    observations.append("error: this call was malformed and was NOT run: an "
+                                        "argument value still contained tool-call markup.")
+                    continue
+                yield "tool_call", {"name": name, "args": args, "tool": self.tools.get(name),
+                                    "index": index, "count": len(calls),
+                                    "prose": prose if index == 0 else ""}
+                key = self._key(name, args)
+                keys.append(key)
+                out, seconds = self._run_tool(name, args, key)
+                # read stays whole up to its own budget; a hole in the middle of code
+                # is what the model then edits from memory
+                observation = clip(redact(out, self.cfg.redact),
+                                   getattr(self.tools.get(name), "max_chars", OBS_MAX_CHARS))
+                self.failures.record(key, failed(observation))
+                self._track(name, args, observation)
+                yield "tool_result", {"name": name, "text": observation, "seconds": seconds,
+                                      "error": observation.startswith("error:")}
+                observations.append(observation)
+                if name == "plan":
+                    self._since_plan = -1
+                    yield "plan", {"text": self.session.plan_text}
+                    self._log("plan", step=step, text=self.session.plan_text)
+                    done = len(DONE.findall(self.session.plan_text))
+                    share = getattr(self.cfg, "checkpoint_at", 0)
+                    checkpoint = checkpoint or (done > self._done and share and
+                                                self.session.estimated_tokens()
+                                                > self.cfg.ctx * share)
+                    self._done = max(self._done, done)
 
-            if name == "ask":
-                self._log("asked", step=step, question=observation)
-                yield "final", {"text": observation}
-                yield "end", {"reason": "asked", "metrics": self.metrics.snapshot()}
-                return
+                if name == "ask":
+                    self._log("asked", step=step, question=observation)
+                    yield "final", {"text": observation}
+                    yield "end", {"reason": "asked", "metrics": self.metrics.snapshot()}
+                    return
 
-            warning = (self._loop_warning(key) or self.progress.push(name, args, observation)
-                       or self.repeats.push(observation)
-                       or self.hints.match(name, observation))
+                warning = warning or (self.progress.push(name, args, observation)
+                                      or self.repeats.push(observation)
+                                      or self.hints.match(name, observation))
+                self._log("step", step=step, tool=name, args=args, obs=observation[:2000],
+                          pt=usage.prompt_tokens, ct=usage.completion_tokens,
+                          tps=round(usage.tps, 1), cum=self.metrics.total_tokens,
+                          warn=warning.strip()[:120] or None,
+                          **({"call": "%d/%d" % (index + 1, len(calls))} if len(calls) > 1
+                             else {}))
+            self._since_plan += 1
+            warning = self._loop_warning("+".join(keys)) or warning
 
-            self._log("step", step=step, tool=name, args=args, obs=observation[:2000],
-                      pt=usage.prompt_tokens, ct=usage.completion_tokens,
-                      tps=round(usage.tps, 1), cum=self.metrics.total_tokens,
-                      warn=warning.strip()[:120] or None)
             if self._since_plan >= PLAN_NUDGE_AFTER:
                 warning += PLAN_NUDGE % self._since_plan
                 self._since_plan = 0
@@ -603,7 +646,8 @@ class AgentLoop(object):
             reminder = self.session.reminder(step, self.cfg.max_steps)
             if reminder:
                 self._log("goal_reminded", step=step)
-            self.session.add_observation(observation + warning + reminder)
+            observations[-1] += cut_note + warning + reminder
+            self.session.add_observations(observations)
             if checkpoint:
                 freed = self.session.checkpoint()
                 if freed:

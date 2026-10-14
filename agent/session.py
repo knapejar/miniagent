@@ -27,7 +27,8 @@ import time
 
 from . import paths
 from .jobs import JobRunner
-from .protocol import PLAN_HEADER, build_system, parse_tool_call, wrap_tool_response
+from .protocol import (PLAN_HEADER, build_system, parse_tool_call, parse_tool_calls,
+                       wrap_tool_response)
 from .secrets import collect_env, register
 
 CHARS_PER_TOKEN = 3.4      # starting guess, calibrated against the server
@@ -74,7 +75,9 @@ class Session(object):
     def _system(self):
         return {"role": "system", "content": build_system(
             self.tools, self.cwd, secret_names=self.secret_names, dialect=self.dialect,
-            append=getattr(self.cfg, "append_system", ""))}
+            append=getattr(self.cfg, "append_system", ""),
+            multi_call=getattr(self.cfg, "multi_call", 1) or 1,
+            memory=getattr(self.cfg, "memory", True))}
 
     def set_dialect(self, dialect):
         """Another model took over (/model): its tool-call format goes into the
@@ -195,6 +198,17 @@ class Session(object):
             message["tool_call_id"] = "c%d" % len(self.messages)
         self.messages.append(message)
 
+    def add_observations(self, texts):
+        """The results of several calls made in one reply, in their order. As a
+        user message they travel together, one <tool_response> each; as role
+        "tool" each is a message of its own."""
+        if len(texts) == 1 or self.tool_role == "tool":
+            for text in texts:
+                self.add_observation(text)
+            return
+        self.messages.append({"role": self.tool_role,
+                              "content": "\n".join(wrap_tool_response(t) for t in texts)})
+
     def downgrade_tool_role(self):
         """Some servers reject role='tool' without a structured tool_calls field."""
         self.tool_role = "user"
@@ -248,11 +262,16 @@ class Session(object):
 
     def _elide(self, low, high):
         """Shrink, in place, what in messages[low:high] is no longer worth its room."""
-        calls = {}
+        calls, several = {}, set()
+        limit = getattr(self.cfg, "multi_call", 1) or 1
         for i, message in enumerate(self.messages):
-            call = message["role"] == "assistant" and parse_tool_call(message.get("content") or "")
-            if call:
-                calls[i] = call
+            if message["role"] != "assistant":
+                continue
+            found = parse_tool_calls(message.get("content") or "", limit)
+            if found:
+                calls[i] = found[0]
+            if len(found) > 1:
+                several.add(i)
         freed = 0
         for i in range(low, high):
             message = self.messages[i]
@@ -264,6 +283,15 @@ class Session(object):
             if not call or i == self.anchor:
                 continue
             text = message.get("content") or ""
+            if i - 1 in several:
+                # several results in one message: each is shrunk on its own
+                parts = text.split("</tool_response>")
+                short = "</tool_response>".join(
+                    _shrink(part) for part in parts)
+                if len(short) < len(text):
+                    freed += len(text) - len(short)
+                    message["content"] = short
+                continue
             wrapped = text.startswith("<tool_response>")
             inner = text[len("<tool_response>"):-len("</tool_response>")] if wrapped else text
             path = str((call[1] or {}).get("path") or "")
@@ -314,17 +342,23 @@ class Session(object):
     def _note_files(self, cut):
         """Count the read/edit/write calls of the steps being cropped; an edit
         or write whose answer was an error changed nothing and is left out."""
+        limit = getattr(self.cfg, "multi_call", 1) or 1
         for i, message in enumerate(cut):
-            call = message["role"] == "assistant" and parse_tool_call(message.get("content") or "")
-            if not call or call[0] not in ("read", "edit", "write"):
+            if message["role"] != "assistant":
                 continue
-            path = str((call[1] or {}).get("path") or "")
+            calls = parse_tool_calls(message.get("content") or "", limit)
             answer = (cut[i + 1].get("content") or "") if i + 1 < len(cut) else ""
-            answer = answer.replace("<tool_response>", "").lstrip()
-            if not path or (call[0] != "read" and answer.startswith("error")):
-                continue
-            counts = self.touched.setdefault(self._short(path), {})
-            counts[call[0]] = counts.get(call[0], 0) + 1
+            answers = answer.split("</tool_response>") if len(calls) > 1 else [answer]
+            for k, call in enumerate(calls):
+                if call[0] not in ("read", "edit", "write"):
+                    continue
+                path = str((call[1] or {}).get("path") or "")
+                said = (answers[k] if k < len(answers) else "").replace(
+                    "<tool_response>", "").lstrip()
+                if not path or (call[0] != "read" and said.startswith("error")):
+                    continue
+                counts = self.touched.setdefault(self._short(path), {})
+                counts[call[0]] = counts.get(call[0], 0) + 1
 
     def _short(self, path):
         try:
@@ -373,6 +407,14 @@ def saved_sessions(directory=None, limit=50):
                       "messages": len(state["messages"]),
                       "time": os.path.getmtime(path)})
     return found
+
+
+def _shrink(part):
+    """One <tool_response>...  piece of a multi-result message, cut to ELIDE_KEEP."""
+    head, tag, inner = part.rpartition("<tool_response>")
+    if not tag or len(inner) <= ELIDE_KEEP * 2:
+        return part
+    return head + tag + inner[:ELIDE_KEEP] + DROPPED % (len(inner) - ELIDE_KEEP)
 
 
 def _chars(message):

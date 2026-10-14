@@ -46,7 +46,7 @@ class LLMError(RuntimeError):
 
 class Usage(object):
     def __init__(self, prompt_tokens=0, completion_tokens=0, reasoning_tokens=0,
-                 finish_reason=None, ttft=0.0, elapsed=0.0, reasoning=""):
+                 finish_reason=None, ttft=0.0, elapsed=0.0, reasoning="", cached_tokens=0):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.reasoning_tokens = reasoning_tokens
@@ -54,21 +54,40 @@ class Usage(object):
         self.ttft = ttft              # time to first token
         self.elapsed = elapsed
         self.reasoning = reasoning    # the reasoning text itself, kept for the history
+        self.cached_tokens = cached_tokens   # prompt tokens the server served from its cache
 
     @property
     def tps(self):
         return self.completion_tokens / self.elapsed if self.elapsed > 0 else 0.0
 
 
-def calls_to_text(calls, dialect="qwen"):
+def cached_of(usage):
+    """Prompt tokens served from the server's prefix cache: OpenAI's
+    prompt_tokens_details.cached_tokens, or DeepSeek's prompt_cache_hit_tokens."""
+    details = usage.get("prompt_tokens_details") or {}
+    return details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0
+
+
+def calls_to_text(calls, dialect="qwen", limit=1):
     """vLLM started with --enable-auto-tool-choice parses the model's tool call
     out of the answer even when the request lists no tools, and sends it as
-    structured `tool_calls` with the text removed. Turn the first call back into
-    the markup protocol.py reads. Returns (text, complete): arguments that are
-    not valid JSON mean the call was cut off, so it is left unclosed."""
+    structured `tool_calls` with the text removed. Turn up to `limit` calls back
+    into the markup protocol.py reads. Returns (text, complete): arguments that
+    are not valid JSON mean the call was cut off, so it is left unclosed and
+    nothing after it is kept."""
     if not calls:
         return "", True
-    call = calls[min(calls)] if isinstance(calls, dict) else calls[0]
+    ordered = [calls[k] for k in sorted(calls)] if isinstance(calls, dict) else list(calls)
+    texts = []
+    for call in ordered[:max(1, limit)]:
+        text, complete = _call_to_text(call, dialect)
+        texts.append(text)
+        if not complete:
+            return "\n".join(texts), False
+    return "\n".join(texts), True
+
+
+def _call_to_text(call, dialect):
     function = call.get("function") or call
     name = (function.get("name") or "").strip()
     raw = function.get("arguments") or "{}"
@@ -88,6 +107,11 @@ class LLMClient(object):
         self.cfg = cfg
         self.tools = list(tools)      # only sent in the "native" dialect
         self.tool_role = "tool"       # probed at runtime: does the server accept it?
+
+    @property
+    def multi(self):
+        """How many tool calls one reply may carry (config multi_call)."""
+        return max(1, int(getattr(self.cfg, "multi_call", 1) or 1))
 
     # ---------------------------------------------------------- request body
     @property
@@ -258,12 +282,12 @@ class LLMClient(object):
         thought = message.get("reasoning_content") or message.get("reasoning") or ""
         finish = choice.get("finish_reason")
         if message.get("tool_calls") and "<tool_call>" not in text:
-            call_text, complete = calls_to_text(message["tool_calls"], self._dialect)
+            call_text, complete = calls_to_text(message["tool_calls"], self._dialect, self.multi)
             text = (text.rstrip() + "\n" if text.strip() else "") + call_text
             if not complete:
                 finish = "length"
         if not self.server_stop:
-            text = cut_after_call(text)
+            text = cut_after_call(text, self.multi)
         if on_delta and thought:
             on_delta("reasoning", thought)
         if on_delta and text:
@@ -271,15 +295,17 @@ class LLMClient(object):
         usage = data.get("usage") or {}
         details = usage.get("completion_tokens_details") or {}
         elapsed = time.time() - started
-        return self._close(text, finish), Usage(
+        return self._close(text, finish, self.multi), Usage(
             usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
-            details.get("reasoning_tokens", 0), finish, elapsed, elapsed, thought)
+            details.get("reasoning_tokens", 0), finish, elapsed, elapsed, thought,
+            cached_of(usage))
 
     def _chat_stream(self, messages, on_delta, cancel=None, effort=None):
         started = time.time()
         ttft = 0.0
         parts, thoughts, reasoning_chars, chunks = [], [], 0, 0
-        prompt_tokens = completion_tokens = reasoning_tokens = 0
+        prompt_tokens = completion_tokens = reasoning_tokens = cached_tokens = 0
+        ends = 0               # calls closed so far in `content`
         finish = None
         calls = {}             # index -> {"name", "arguments"} from structured tool_calls
         content = ""           # the answer so far, kept only for the client-side stop
@@ -314,6 +340,7 @@ class LLMClient(object):
                     completion_tokens = usage.get("completion_tokens", completion_tokens)
                     reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
                         "reasoning_tokens", reasoning_tokens)
+                    cached_tokens = cached_of(usage) or cached_tokens
                 for choice in event.get("choices") or []:
                     finish = choice.get("finish_reason") or finish
                     delta = choice.get("delta") or {}
@@ -350,7 +377,10 @@ class LLMClient(object):
                         if not self.server_stop:
                             content += piece
                             if CALL_END in content[-len(piece) - len(CALL_END):]:
-                                call_end = content.index(CALL_END) + len(CALL_END)
+                                ends = content.count(CALL_END)
+                            if ends >= self.multi:
+                                # the last call allowed is closed: stop right after it
+                                call_end = len(cut_after_call(content, self.multi))
                                 piece = piece[:len(piece) - (len(content) - call_end)]
                         if on_delta and piece:
                             on_delta("content", piece)
@@ -375,7 +405,7 @@ class LLMClient(object):
                            transient=True)
         elapsed = time.time() - started
         if calls and CALL_END not in "".join(parts):
-            call_text, complete = calls_to_text(calls, self._dialect)
+            call_text, complete = calls_to_text(calls, self._dialect, self.multi)
             if parts and "".join(parts).strip():
                 call_text = "\n" + call_text
             parts.append(call_text)
@@ -387,19 +417,19 @@ class LLMClient(object):
             completion_tokens = chunks
         if not reasoning_tokens and reasoning_chars:
             reasoning_tokens = max(1, reasoning_chars // 4)
-        return self._close("".join(parts), finish), Usage(
+        return self._close("".join(parts), finish, self.multi), Usage(
             prompt_tokens, completion_tokens, reasoning_tokens, finish, ttft, elapsed,
-            "".join(thoughts))
+            "".join(thoughts), cached_tokens)
 
     @staticmethod
-    def _close(text, finish=None):
+    def _close(text, finish=None, limit=1):
         """The stop sequence eats the closing tag, so put it back - but only when
         generation actually stopped there. On finish_reason "length" the call was
         cut mid-argument, and closing it would turn a truncated call into one that
         parses cleanly with its last argument silently missing."""
-        text = cut_after_call(text)
+        text = cut_after_call(text, limit)
         if finish == "length":
             return text
-        if "<tool_call>" in text and "</tool_call>" not in text:
+        if text.count("<tool_call>") > text.count("</tool_call>"):
             return text + "</tool_call>"
         return text

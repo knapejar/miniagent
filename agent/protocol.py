@@ -91,7 +91,7 @@ SYSTEM_TEMPLATE = """You are an autonomous agent driving a {os_name} machine thr
 {tools_block}
 
 Rules:
-- Emit exactly ONE <tool_call> per message, then stop and wait for the <tool_response>.
+{calls_rule}
 - Never invent tool output. Decide only from what the response actually says.
 - Keep output small: grep to find the place, then read the whole block you edit.
 - Verify your work with a tool before claiming success.
@@ -99,14 +99,28 @@ Rules:
 - When the task is finished, reply with a plain answer of AT MOST 5 lines and no
   tool_call. No status tables, no checklists, no restating what you did.
 - If you are blocked by something you cannot do yourself, call ask instead of
-  retrying a command that already failed.
+  retrying a command that already failed.{state}
+
+Working directory: {cwd}{workspace}{secrets}{memory}"""
+
+ONE_CALL = ("- Emit exactly ONE <tool_call> per message, then stop and wait for the "
+            "<tool_response>.")
+# For a model that can make several calls at once. Every message sends the whole
+# conversation again, so a run of one-call steps pays for the history once per
+# call: GLM-5.3 spent 10M prompt tokens on 206 single calls of one task.
+MULTI_CALL = """- Every message re-sends the whole conversation, so batch your tool calls:
+  when calls do not depend on each other's results (reading several files,
+  several greps, a status check and a diff), make them all in ONE message - up
+  to %d calls. They run in order and all their results come back together.
+  Chain shell commands with && in one sh call. Make a single call only when
+  the next one depends on what it returns."""
+
+STATE = """
 - Your state for this project lives in {state_dir}: memory/INDEX.md (one line per
   note, nest a subfolder with its own INDEX.md per topic once one file is not
   enough) and runs/*.jsonl (the trace of every past run here). Read a note, or
   grep the old runs, before rediscovering something; write a note only for a fact
-  worth reusing later (a host, a login, a working command) - create it if missing.
-
-Working directory: {cwd}{workspace}{secrets}{memory}"""
+  worth reusing later (a host, a login, a working command) - create it if missing."""
 
 MEMORY_MAX_CHARS = 1500
 
@@ -152,7 +166,10 @@ def dialect_for(model):
 
 
 def build_system(tools, cwd, os_name=None, shell=None, secret_names=(),
-                 dialect="spark", append=""):
+                 dialect="spark", append="", multi_call=1, memory=True):
+    """`memory=False` leaves out the project's memory and the pointer to
+    miniagent's own state: a host program that keeps the history and the notes
+    itself (--no-memory) does not want the model grepping old traces instead."""
     windows = os.name == "nt"
     os_name = os_name or ("Windows 11" if windows else platform.system() or "Linux")
     shell = shell or ("cmd.exe" if windows else "bash")
@@ -170,11 +187,12 @@ def build_system(tools, cwd, os_name=None, shell=None, secret_names=(),
     else:
         block = (QWEN_TOOLS if dialect == "qwen" else SPARK_TOOLS).format(
             tools=render_tools(tools, dialect))
-    text = SYSTEM_TEMPLATE.format(tools_block=block,
-                                  cwd=cwd, workspace=workspace.snapshot(cwd),
-                                  os_name=os_name, shell=shell, secrets=secrets,
-                                  state_dir=paths.project_dir(cwd),
-                                  memory=_load_memory(cwd))
+    text = SYSTEM_TEMPLATE.format(
+        tools_block=block, cwd=cwd, workspace=workspace.snapshot(cwd),
+        os_name=os_name, shell=shell, secrets=secrets,
+        calls_rule=MULTI_CALL % multi_call if multi_call > 1 else ONE_CALL,
+        state=STATE.format(state_dir=paths.project_dir(cwd)) if memory else "",
+        memory=_load_memory(cwd) if memory else "")
     # --append-system-prompt: the caller's own instructions go last.
     return text + ("\n\n" + append.strip() if append and append.strip() else "")
 
@@ -207,7 +225,26 @@ def parse_tool_call(text):
     match = TOOL_CALL_RE.search(text)
     if not match:
         return None
-    body = match.group(1)
+    return _parse_body(match.group(1))
+
+
+def parse_tool_calls(text, limit=1):
+    """Every call in a reply, up to `limit`, as [(name, args)]. With limit 1 it
+    is [parse_tool_call(text)] - the one-call protocol is left exactly as it was."""
+    if limit <= 1:
+        call = parse_tool_call(text)
+        return [call] if call else []
+    calls = []
+    for match in TOOL_CALL_RE.finditer(text):
+        call = _parse_body(match.group(1))
+        if call:
+            calls.append(call)
+        if len(calls) >= limit:
+            break
+    return calls
+
+
+def _parse_body(body):
     function = FUNCTION_RE.search(body)
     if function:
         pairs = [(key, _param_value(value))
@@ -304,10 +341,15 @@ def example_call(dialect="spark"):
     return "<tool_call>NAME<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>"
 
 
-def cut_after_call(text):
-    """Drop whatever follows the first complete call: a model that keeps writing
-    after </tool_call> is inventing the tool's answer."""
-    end = text.find("</tool_call>")
+def cut_after_call(text, limit=1):
+    """Drop whatever follows the `limit`-th complete call: a model that keeps
+    writing after </tool_call> is inventing the tool's answer."""
+    end = -1
+    for _ in range(max(1, limit)):
+        found = text.find("</tool_call>", end + 1)
+        if found < 0:
+            break
+        end = found
     return text if end < 0 else text[:end + len("</tool_call>")]
 
 

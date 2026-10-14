@@ -52,7 +52,19 @@ DEFAULTS = {
     "effort_in_template": False,
     "retries": 0,                  # another try on a tunnel/proxy error
     "outage_wait": 0,              # seconds to wait out a server outage
+    # Tool calls one reply may carry. "auto": several (MULTI_CALL) where the
+    # server parses the calls itself (the native dialect - hosted and larger
+    # models), one where miniagent writes the format into the prompt (spark,
+    # qwen): a 4B model asked to batch loses the format, and its prompt stays
+    # exactly the one it was tuned on.
+    "multi_call": "auto",
+    # Share of ctx that triggers cropping; a paid API pays for every token of
+    # context on every step, so its profile may crop much earlier.
+    "crop_at": None,
 }
+
+MULTI_CALL = 8
+CROP_AT = 0.7
 
 LOCAL = {
     "url": "http://127.0.0.1:1234/v1", "url_env": "MINIAGENT_URL",
@@ -144,12 +156,17 @@ class Config(object):
         # after the code failed to run (loop.py).
         self.think_boost = kw.get("think_boost", False)
 
-        self.crop_at = kw.get("crop_at", 0.7)      # share of ctx that triggers cropping
+        self.crop_at = kw.get("crop_at") or CROP_AT   # share of ctx that triggers cropping
         self.keep_tail = kw.get("keep_tail", 12)   # messages the crop keeps at the end
         # A plan item turning DONE starts the next one in a clean context, once the
         # run has grown past this share of ctx; 0 turns it off (loop.py).
         self.checkpoint_at = kw.get("checkpoint_at", 0.3)
         self.remind_every = kw.get("remind_every", 6)
+        # Prompt tokens one task may spend before it is made to answer with what
+        # it has; 0 = no limit. A stuck run on a paid API otherwise burns the
+        # whole credit (MINIAGENT_MAX_TASK_TOKENS sets it too).
+        self.max_task_tokens = kw.get("max_task_tokens") or \
+            int(os.environ.get("MINIAGENT_MAX_TASK_TOKENS") or 0)
 
         self.approve = kw.get("approve", "none")   # auto | all | none
         self.stream = kw.get("stream", True)
@@ -202,6 +219,12 @@ class Config(object):
         self.top_k = pick("top_k")
         self.effort = pick("effort")
         self.effort_in_template = pick("effort_in_template")
+        multi = pick("multi_call")
+        if multi == "auto":
+            multi = MULTI_CALL if self.dialect == "native" else 1
+        self.multi_call = max(1, int(multi))
+        # a profile without its own crop_at gets the default back after /model
+        self.crop_at = float(pick("crop_at") if pick("crop_at") is not None else CROP_AT)
         self.retries = pick("retries")
         self.outage_wait = pick("outage_wait")
         self.ready = False                     # set once the connector got an answer
@@ -243,6 +266,9 @@ def parse_args(argv=None):
     g.add_argument("--top-k", type=int)
     g.add_argument("--max-tokens", type=int)
     g.add_argument("--ctx", type=int)
+    g.add_argument("--multi-call", type=int, metavar="N",
+                   help="tool calls one reply may carry (default: 8 in the native "
+                        "dialect, 1 for spark and qwen)")
 
     g = p.add_argument_group("kaggle connector")
     g.add_argument("--no-proxy", action="store_true",
@@ -252,7 +278,12 @@ def parse_args(argv=None):
 
     g = p.add_argument_group("loop")
     g.add_argument("--max-steps", type=int, default=60)
-    g.add_argument("--crop-at", type=float, default=0.7)
+    g.add_argument("--crop-at", type=float, default=None,
+                   help="share of the context that triggers cropping (default 0.7, "
+                        "or the profile's crop_at)")
+    g.add_argument("--max-task-tokens", type=int, default=None, metavar="N",
+                   help="prompt tokens a task may spend before it has to answer "
+                        "(default 0 = no limit)")
     g.add_argument("--keep-tail", type=int, default=12)
     g.add_argument("--checkpoint-at", type=float, default=0.3, metavar="SHARE",
                    help="when a plan item turns DONE past this share of the context, "
@@ -321,13 +352,14 @@ def parse_args(argv=None):
         print("  default profile: %s (%s)" % (profile, set_default_profile(profile)))
     given = {name: getattr(a, name) for name in
              ("url", "model", "api_key", "effort", "ctx", "max_tokens",
-              "temperature", "top_p", "top_k", "think_cap", "think_boost")
+              "temperature", "top_p", "top_k", "think_cap", "think_boost",
+              "multi_call", "crop_at", "max_task_tokens")
              if getattr(a, name) is not None}
     if a.dialect != "auto":
         given["dialect"] = a.dialect
     cfg = Config(profile=profile,
                  workdir=a.workdir, max_steps=a.max_steps,
-                 crop_at=a.crop_at, keep_tail=a.keep_tail, remind_every=a.remind_every,
+                 keep_tail=a.keep_tail, remind_every=a.remind_every,
                  checkpoint_at=a.checkpoint_at,
                  approve="none" if a.dangerously_skip_permissions else (a.approve or "none"),
                  stream=not a.no_stream, color=not a.no_color,
