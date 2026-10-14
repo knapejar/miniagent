@@ -286,6 +286,8 @@ def parse_args(argv=None):
     g.add_argument("--resume", "-r", metavar="ID", help="continue a saved conversation by id")
     g.add_argument("--append-system-prompt", metavar="TEXT", default="",
                    help="added to the end of the system prompt")
+    g.add_argument("--append-system-prompt-file", metavar="FILE",
+                   help="the same, read from a file")
     g.add_argument("--mcp-config", action="append", metavar="JSON|FILE",
                    help="MCP servers ({\"mcpServers\": {...}}); may be repeated")
     g.add_argument("--strict-mcp-config", action="store_true",
@@ -333,6 +335,9 @@ def parse_args(argv=None):
                  async_web=a.async_web, memory=not a.no_memory, run_name=a.run_name,
                  spawn_proxy=not a.no_proxy, wait=a.wait, **given)
     cfg.append_system = a.append_system_prompt
+    if a.append_system_prompt_file:
+        with open(a.append_system_prompt_file, encoding="utf-8-sig") as fh:
+            cfg.append_system = (cfg.append_system + "\n\n" + fh.read()).strip()
     cfg.headless = None
     if a.print:
         cfg.headless = {"output_format": a.output_format, "input_format": a.input_format,

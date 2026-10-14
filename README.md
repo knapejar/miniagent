@@ -300,7 +300,7 @@ The conversation is saved under its id in `~/.miniagent/projects/<slug>/sessions
 | `--input-format` | `text` (default) \| `stream-json` |
 | `--include-partial-messages` | stream deltas as `stream_event` lines |
 | `--session-id`, `--resume` | name a new conversation, continue a saved one |
-| `--append-system-prompt` | your instructions after the built-in system prompt |
+| `--append-system-prompt`, `--append-system-prompt-file` | your instructions after the built-in system prompt |
 | `--mcp-config` | MCP servers, `{"mcpServers": {...}}` inline or a file; repeatable |
 | `--disallowedTools` | tools the model is not offered |
 | `--dangerously-skip-permissions` | never ask (the default in headless mode anyway) |

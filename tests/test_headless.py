@@ -162,8 +162,12 @@ class TestHeadless(unittest.TestCase):
     def test_a_turn_with_a_tool_call(self):
         cmd = "echo hello-from-sh"
         self.model.replies = [tool_reply("sh", {"cmd": cmd}), "All done, it said hello."]
+        rules = os.path.join(self.home, "rules.md")
+        with open(rules, "w", encoding="utf-8") as fh:
+            fh.write("FILE RULE 7")
         proc = self.start("--session-id", "11111111-2222-3333-4444-555555555555",
-                          "--append-system-prompt", "EXTRA RULE 42")
+                          "--append-system-prompt", "EXTRA RULE 42",
+                          "--append-system-prompt-file", rules)
         events = self.ask(proc, "say hello")
         proc.stdin.close()
         proc.wait(timeout=20)
@@ -192,6 +196,7 @@ class TestHeadless(unittest.TestCase):
         self.assertEqual(first["headers"].get("X-Test"), "yes")
         self.assertEqual(first["headers"].get("Authorization"), "Bearer secret-key")
         self.assertIn("EXTRA RULE 42", first["body"]["messages"][0]["content"])
+        self.assertIn("FILE RULE 7", first["body"]["messages"][0]["content"])
         saved = os.listdir(os.path.join(self.home, "projects", os.listdir(
             os.path.join(self.home, "projects"))[0], "sessions"))
         self.assertIn("11111111-2222-3333-4444-555555555555.json", saved)
